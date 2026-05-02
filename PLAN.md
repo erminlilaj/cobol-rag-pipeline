@@ -56,14 +56,14 @@ Status labels:
 | --- | --- | --- |
 | Step 1: Local setup | Done | `.venv/bin/python --version` and dependencies installed |
 | Step 2: Configuration | Done | `.venv/bin/cobol-rag config` prints active config |
-| Step 3: LlamaIndex setup in code | Planned | not wired into index manager yet |
+| Step 3: LlamaIndex setup in code | Done | `.venv/bin/cobol-rag index-info` opens the configured Chroma collection |
 | Step 4: Normalized document contract | Planned | not implemented yet |
 | Step 5: Loader adapters | Next | next command will be `cobol-rag inspect ...` |
 | Step 6: Easy add/remove/update workflow | Planned | not implemented yet |
 | Step 7: Planned CLI | In Progress | `cobol-rag --help` and `cobol-rag config` work |
 | Phase 1: Scaffold | Done | `.venv/bin/cobol-rag --help` and `.venv/bin/cobol-rag config` work |
 | Phase 2: Loader system | Next | not implemented yet |
-| Phase 3: Chroma index manager | Planned | not implemented yet |
+| Phase 3: Chroma index manager | In Progress | setup/open/info works; ingest/delete/list still pending |
 | Phase 4: Manifest sync | Planned | not implemented yet |
 | Phase 5: Remove/reset | Planned | not implemented yet |
 | Phase 6: Retrieval debug | Planned | not implemented yet |
@@ -212,13 +212,13 @@ COBOL_RAG_LLM_MODEL=llama3.1:8b cobol-rag chat
 
 ## Step 3: LlamaIndex Setup In Code
 
-Status: `Planned`
+Status: `Done`
 
 Use LlamaIndex integrations explicitly:
 
 ```python
 import chromadb
-from llama_index.core import Settings, StorageContext, VectorStoreIndex
+from llama_index.core import Settings, VectorStoreIndex
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.chroma import ChromaVectorStore
@@ -237,14 +237,25 @@ Settings.embed_model = OllamaEmbedding(
 db = chromadb.PersistentClient(path=config.paths.chroma_dir)
 collection = db.get_or_create_collection(config.index.collection)
 vector_store = ChromaVectorStore(chroma_collection=collection)
-storage_context = StorageContext.from_defaults(vector_store=vector_store)
 index = VectorStoreIndex.from_vector_store(
     vector_store,
-    storage_context=storage_context,
+    embed_model=Settings.embed_model,
 )
 ```
 
 For ingestion, create `Document` objects with stable `id_` values and metadata, then insert or refresh them through the index.
+
+Implemented in:
+
+```bash
+src/cobol_rag/index.py
+```
+
+Verification:
+
+```bash
+cobol-rag index-info
+```
 
 ## Step 4: Normalized Document Contract
 
@@ -469,7 +480,7 @@ Documentation criterion:
 
 ### Phase 3: Chroma Index Manager
 
-Status: `Planned`
+Status: `In Progress`
 
 Implement:
 
@@ -479,11 +490,17 @@ src/cobol_rag/index.py
 
 Responsibilities:
 
-- open a persistent Chroma collection
-- configure LlamaIndex `Settings.llm` and `Settings.embed_model`
+- open a persistent Chroma collection: done
+- configure LlamaIndex `Settings.llm` and `Settings.embed_model`: done
 - insert documents with stable IDs
 - delete documents by metadata or document ID
 - expose `get_index()`, `upsert_documents()`, `delete_where()`, and `list_sources()`
+
+Current partial verification:
+
+```bash
+cobol-rag index-info
+```
 
 Exit criterion:
 

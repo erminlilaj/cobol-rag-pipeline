@@ -7,6 +7,7 @@ from rich.console import Console
 from rich.table import Table
 
 from cobol_rag.config import load_config
+from cobol_rag.index import collection_count, open_index
 
 app = typer.Typer(
     help="Flexible local RAG pipeline for COBOL analysis artifacts.",
@@ -46,6 +47,30 @@ def config(
     table.add_row("index", "collection", settings.index.collection)
     table.add_row("retrieval", "top_k", str(settings.retrieval.top_k))
     table.add_row("answers", "require_citations", str(settings.answers.require_citations))
+    console.print(table)
+
+
+@app.command("index-info")
+def index_info(
+    path: Path = typer.Option(
+        Path("config/default.yaml"),
+        "--config",
+        "-c",
+        help="Path to the YAML config file.",
+    ),
+) -> None:
+    """Open the configured LlamaIndex/Chroma index and print a summary."""
+    settings = load_config(path)
+    resources = open_index(settings)
+
+    table = Table(title="COBOL RAG Index")
+    table.add_column("Setting")
+    table.add_column("Value")
+    table.add_row("chroma_dir", str(settings.paths.chroma_dir))
+    table.add_row("collection", settings.index.collection)
+    table.add_row("documents", str(collection_count(resources)))
+    table.add_row("llm", settings.llm.model)
+    table.add_row("embedding", settings.embedding.model)
     console.print(table)
 
 

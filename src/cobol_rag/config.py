@@ -15,6 +15,12 @@ class PathConfig:
     archive_dir: Path = Path("data/archive")
     manifest_dir: Path = Path("data/manifests")
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "chroma_dir", Path(self.chroma_dir))
+        object.__setattr__(self, "inbox_dir", Path(self.inbox_dir))
+        object.__setattr__(self, "archive_dir", Path(self.archive_dir))
+        object.__setattr__(self, "manifest_dir", Path(self.manifest_dir))
+
 
 @dataclass(frozen=True)
 class LlmConfig:

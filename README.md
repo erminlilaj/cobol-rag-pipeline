@@ -117,6 +117,14 @@ Print the active config:
 cobol-rag config
 ```
 
+Open the configured LlamaIndex/Chroma index without ingesting data:
+
+```bash
+cobol-rag index-info
+```
+
+This creates `.chroma/` if needed, opens the configured collection, and prints the current LLM, embedding model, and document count.
+
 During early development, before installing the package as editable, use:
 
 ```bash
@@ -134,4 +142,3 @@ Preferred pattern:
 3. Update `PLAN.md` if the sequence or safety rule changes.
 4. Run the narrowest useful verification command.
 5. Only then move to the next slice.
-

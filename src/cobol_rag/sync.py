@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from cobol_rag.config import AppConfig
+from cobol_rag.index import open_index, upsert_document
 from cobol_rag.loaders import LoadedDocument, load_path
 
 
@@ -23,6 +24,7 @@ class SyncItem:
     source_path: str
     source_format: str
     content_hash: str
+    loaded_document: LoadedDocument = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,14 @@ def build_sync_plan(config: AppConfig, dry_run: bool = True) -> SyncPlan:
     )
 
 
+def apply_sync_plan(config: AppConfig, plan: SyncPlan) -> None:
+    resources = open_index(config)
+    for item in plan.items:
+        if item.action in {"add", "update"}:
+            upsert_document(resources, item.loaded_document.document)
+    write_manifest(plan.manifest_path, plan)
+
+
 def get_manifest_path(config: AppConfig) -> Path:
     return config.paths.manifest_dir / f"{config.index.collection}.json"
 
@@ -80,6 +90,25 @@ def read_manifest(path: Path) -> dict[str, ManifestEntry]:
             content_hash=entry["content_hash"],
         )
     return manifest
+
+
+def write_manifest(path: Path, plan: SyncPlan) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "collection": plan.collection,
+        "sources": {
+            item.source_id: {
+                "source_id": item.source_id,
+                "source_path": item.source_path,
+                "source_format": item.source_format,
+                "content_hash": item.content_hash,
+            }
+            for item in sorted(plan.items, key=lambda item: item.source_id)
+        },
+    }
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2, sort_keys=True)
+        file.write("\n")
 
 
 def _plan_item(
@@ -107,4 +136,5 @@ def _plan_item(
         source_path=source_path,
         source_format=source_format,
         content_hash=content_hash,
+        loaded_document=document,
     )

@@ -9,7 +9,7 @@ from rich.table import Table
 from cobol_rag.config import load_config
 from cobol_rag.index import collection_count, open_index
 from cobol_rag.loaders import LoaderError, load_path
-from cobol_rag.sync import SyncPlan, build_sync_plan
+from cobol_rag.sync import SyncPlan, apply_sync_plan, build_sync_plan
 
 app = typer.Typer(
     help="Flexible local RAG pipeline for COBOL analysis artifacts.",
@@ -148,13 +148,10 @@ def sync(
     ),
 ) -> None:
     """Plan inbox synchronization using general loaders."""
-    if not dry_run:
-        raise typer.BadParameter(
-            "--apply is not implemented yet; use --dry-run for this safe step."
-        )
-
     settings = load_config(path)
     plan = build_sync_plan(settings, dry_run=dry_run)
+    if not dry_run:
+        apply_sync_plan(settings, plan)
     _print_sync_plan(plan)
 
 
@@ -179,8 +176,8 @@ def _print_sync_plan(plan: SyncPlan) -> None:
     summary.add_row("would_add", str(plan.count("add")))
     summary.add_row("would_update", str(plan.count("update")))
     summary.add_row("would_skip", str(plan.count("skip")))
-    summary.add_row("indexing", "no")
-    summary.add_row("manifest_write", "no")
+    summary.add_row("indexing", "no" if plan.dry_run else "yes")
+    summary.add_row("manifest_write", "no" if plan.dry_run else "yes")
     console.print(summary)
 
     detail = Table(title="Sync Items")

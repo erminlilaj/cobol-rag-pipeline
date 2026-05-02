@@ -1,0 +1,17 @@
+{
+  "collection": "cobol-dev",
+  "sources": {
+    "generic_json:data/inbox/example.json:0": {
+      "content_hash": "253ac4359940f132612b2acae3a0013990163faeb784d17510ac32049fa20509",
+      "source_format": "generic_json",
+      "source_id": "generic_json:data/inbox/example.json:0",
+      "source_path": "data/inbox/example.json"
+    },
+    "plain_text:data/inbox/example.txt": {
+      "content_hash": "40317d0f96aad39adad79760a69243c72b7d1595311a4014d3feef2bf048e0c8",
+      "source_format": "plain_text",
+      "source_id": "plain_text:data/inbox/example.txt",
+      "source_path": "data/inbox/example.txt"
+    }
+  }
+}

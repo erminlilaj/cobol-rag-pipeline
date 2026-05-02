@@ -59,13 +59,13 @@ Status labels:
 | Step 3: LlamaIndex setup in code | Done | `.venv/bin/cobol-rag index-info` opens the configured Chroma collection |
 | Step 4: Normalized document contract | Done | `cobol-rag inspect` shows normalized metadata without indexing |
 | Step 5: Loader adapters | Done | general JSON and text loaders work; specific formats deferred |
-| Step 6: Easy add/remove/update workflow | In Progress | `sync --dry-run` plans add/update/skip without writing |
+| Step 6: Easy add/remove/update workflow | Done | `sync --dry-run`, `sync --apply`, then `sync --dry-run` proves add/update/skip |
 | Step 7: Planned CLI | In Progress | `cobol-rag --help` and `cobol-rag config` work |
 | Phase 1: Scaffold | Done | `.venv/bin/cobol-rag --help` and `.venv/bin/cobol-rag config` work |
 | Phase 2: Loader system | Done | general loader registry, JSON loader, text loader, and inspect command work |
-| Phase 3: Chroma index manager | In Progress | setup/open/info works; ingest/delete/list still pending |
-| Phase 4: Manifest sync | In Progress | dry-run planning works; apply/write path still pending |
-| Phase 5: Remove/reset | Planned | not implemented yet |
+| Phase 3: Chroma index manager | In Progress | setup/open/info and document upsert work; list/delete helpers still pending |
+| Phase 4: Manifest sync | Done | apply writes Chroma and manifest; follow-up dry-run reports skips |
+| Phase 5: Remove/reset | Next | not implemented yet |
 | Phase 6: Retrieval debug | Planned | not implemented yet |
 | Phase 7: One-shot query | Planned | not implemented yet |
 | Phase 8: Chat RAG | Planned | not implemented yet |
@@ -321,7 +321,7 @@ cobol-rag inspect data/inbox/example.txt --loader plain_text
 
 ## Step 6: Easy Add/Remove/Update Workflow
 
-Status: `In Progress`
+Status: `Done`
 
 Preferred workflow:
 
@@ -329,9 +329,11 @@ Preferred workflow:
 cp -r /path/to/new/output data/inbox/
 cobol-rag inspect data/inbox/
 cobol-rag sync --dry-run
+cobol-rag sync --apply
+cobol-rag sync --dry-run
 ```
 
-Current safe implementation:
+Implemented behavior:
 
 - `sync --dry-run` scans `data/inbox/`
 - uses only the general loader registry
@@ -340,17 +342,10 @@ Current safe implementation:
 - reports what would be added, updated, or skipped
 - does not write to Chroma
 - does not write the manifest
-- rejects `--apply` until real indexing is implemented
-
-Later, `sync --apply` should:
-
-- scan `data/inbox/`
-- detect supported files and folders
-- compute content hashes
-- insert new documents
-- update changed documents
+- `sync --apply` inserts new documents into Chroma
+- `sync --apply` refreshes changed documents by deleting the old `source_id` records before inserting the fresh document
 - leave unchanged documents alone
-- write a local manifest to `data/manifests/<collection>.json`
+- write a local manifest to `data/manifests/<collection>.json` after successful indexing
 - print a summary of added, updated, skipped, and failed items
 
 Removal options:
@@ -532,7 +527,7 @@ Documentation criterion:
 
 ### Phase 4: Manifest-Based Sync
 
-Status: `In Progress`
+Status: `Done`
 
 Implement:
 
@@ -556,22 +551,19 @@ Manifest example:
 }
 ```
 
-Current exit criterion:
+Exit criterion:
 
 ```bash
 cobol-rag sync --dry-run
-```
-
-prints add/update/skip counts and clearly says `indexing: no` and `manifest_write: no`.
-
-Later exit criterion:
-
-```bash
 cobol-rag sync --apply
 cobol-rag sync --dry-run
 ```
 
-The second command reports everything as skipped/unchanged.
+The first command previews add/update/skip counts and clearly says `indexing: no` and `manifest_write: no`.
+
+The apply command writes Chroma and the manifest.
+
+The final dry-run reports everything as skipped/unchanged.
 
 Documentation criterion:
 

@@ -6,6 +6,7 @@ import chromadb
 from chromadb.api import ClientAPI
 from chromadb.api.models.Collection import Collection
 from llama_index.core import Settings, VectorStoreIndex
+from llama_index.core.schema import Document
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.chroma import ChromaVectorStore
@@ -78,3 +79,15 @@ def open_index(config: AppConfig) -> IndexResources:
 
 def collection_count(resources: IndexResources) -> int:
     return resources.chroma_collection.count()
+
+
+def delete_source(resources: IndexResources, source_id: str) -> None:
+    """Delete all Chroma records for a normalized source id if present."""
+    resources.chroma_collection.delete(where={"source_id": source_id})
+
+
+def upsert_document(resources: IndexResources, document: Document) -> None:
+    """Refresh one normalized document in the vector index."""
+    source_id = str(document.metadata["source_id"])
+    delete_source(resources, source_id)
+    resources.index.insert(document)

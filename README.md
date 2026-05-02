@@ -147,7 +147,7 @@ cobol-rag sync --dry-run
 
 `sync --dry-run` scans `data/inbox/`, loads supported files with the general loader registry, computes each document `content_hash`, reads the collection manifest from `data/manifests/<collection>.json` if it exists, and prints what would be added, updated, or skipped.
 
-Current safety rule: `sync --dry-run` does not write to Chroma and does not write the manifest. The `--apply` mode is intentionally blocked until the dry-run output is trustworthy.
+Safety rule: `sync --dry-run` does not write to Chroma and does not write the manifest. `sync --apply` is the explicit write command.
 
 ## Sync Workflow
 
@@ -156,6 +156,8 @@ The intended day-to-day workflow is:
 ```bash
 cp /path/to/output.json data/inbox/
 cobol-rag inspect data/inbox/output.json
+cobol-rag sync --dry-run
+cobol-rag sync --apply
 cobol-rag sync --dry-run
 ```
 
@@ -166,6 +168,8 @@ Read the sync output before applying future indexing behavior:
 - `would_skip`: the same `source_id` and `content_hash` already exist in the manifest.
 - `indexing: no`: no vector database write happened.
 - `manifest_write: no`: no manifest update happened.
+- `indexing: yes`: `sync --apply` wrote add/update documents to Chroma.
+- `manifest_write: yes`: `sync --apply` wrote the manifest after successful indexing.
 
 Manifest files will live in `data/manifests/` and are keyed by collection name. For example, the default collection will use:
 
@@ -173,7 +177,14 @@ Manifest files will live in `data/manifests/` and are keyed by collection name. 
 data/manifests/cobol-dev.json
 ```
 
-Future adjustment point: when real indexing is added, keep `--dry-run` as the default safe preview and require an explicit `--apply` for writes.
+`sync --apply` writes in this order:
+
+1. Open the configured Chroma collection.
+2. For each `add` or `update`, delete existing Chroma records with the same `source_id`.
+3. Insert the fresh LlamaIndex `Document`.
+4. Write `data/manifests/<collection>.json`.
+
+Future adjustment point: keep `--dry-run` as the default safe preview. Any destructive behavior, such as removing documents no longer present in `data/inbox/`, should get its own dry-run output before writes are allowed.
 
 During early development, before installing the package as editable, use:
 

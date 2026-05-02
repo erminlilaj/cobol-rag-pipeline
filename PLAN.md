@@ -157,7 +157,7 @@ Install Ollama separately, then pull initial local models:
 
 ```bash
 ollama serve
-ollama pull granite-code:8b
+ollama pull granite-code:8b-instruct
 ollama pull mxbai-embed-large
 ```
 
@@ -675,7 +675,7 @@ returns an answer with sources.
 Runtime note:
 
 ```text
-granite-code:8b failed through the API until the config pinned context_window to 4096, matching the working Ollama CLI context.
+granite-code:8b-instruct failed through the API until the config pinned context_window to 4096, matching the working Ollama CLI context.
 ```
 
 Resolution applied:

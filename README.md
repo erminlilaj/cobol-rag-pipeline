@@ -75,7 +75,7 @@ Current default LLM:
 
 ```yaml
 llm:
-  model: "granite-code:8b"
+  model: "granite-code:8b-instruct"
 ```
 
 Future adjustment point: change `llm.model` in config or override it with `COBOL_RAG_LLM_MODEL`.
@@ -277,7 +277,7 @@ cobol-rag query "What is in the JSON document?" --top-k 2
 
 The answer is generated from retrieved context only. The CLI always prints a `Sources` table after the answer so you can check which indexed documents supported it.
 
-If retrieval works but `query` fails, check the configured local LLM. The default config pins `context_window: 4096` for `granite-code:8b`, matching the normal Ollama CLI context size and avoiding oversized API context requests.
+If retrieval works but `query` fails, check the configured local LLM. The default config pins `context_window: 4096` for `granite-code:8b-instruct`, matching the normal Ollama CLI context size and avoiding oversized API context requests.
 
 Current answer shape:
 

@@ -25,7 +25,7 @@ class PathConfig:
 @dataclass(frozen=True)
 class LlmConfig:
     provider: str = "ollama"
-    model: str = "granite-code:8b"
+    model: str = "granite-code:8b-instruct"
     base_url: str = "http://localhost:11434"
     context_window: int = 4096
     request_timeout: int = 300

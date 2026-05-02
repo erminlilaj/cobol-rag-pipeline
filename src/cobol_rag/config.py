@@ -27,6 +27,7 @@ class LlmConfig:
     provider: str = "ollama"
     model: str = "granite-code:8b"
     base_url: str = "http://localhost:11434"
+    context_window: int = 4096
     request_timeout: int = 300
     temperature: float = 0.1
 
@@ -105,6 +106,8 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
 
     if top_k := os.getenv("COBOL_RAG_TOP_K"):
         _set_nested(result, ("retrieval", "top_k"), int(top_k))
+    if context_window := os.getenv("COBOL_RAG_LLM_CONTEXT_WINDOW"):
+        _set_nested(result, ("llm", "context_window"), int(context_window))
     return result
 
 

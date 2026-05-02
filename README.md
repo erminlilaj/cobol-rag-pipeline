@@ -247,6 +247,74 @@ Expected result:
 
 Use reset when changing embedding models, clearing experiments, or rebuilding a collection from scratch.
 
+## Retrieval Debug Workflow
+
+Retrieval debug checks what evidence the vector database returns before any LLM answer is generated.
+
+```bash
+cobol-rag retrieve "General JSON document"
+cobol-rag retrieve "plain text document" --top-k 3
+```
+
+The output shows:
+
+- `score`: similarity score from retrieval.
+- `source_format`: which loader produced the document.
+- `source_id`: stable id used for sync/remove.
+- `source_path`: original file path.
+- `preview`: text that would be passed as evidence to a future query/chat step.
+
+This command does not call the answer model and does not produce a final response. Use it to debug whether Chroma is finding the right sources before adding answer generation.
+
+## One-Shot Query Workflow
+
+One-shot query retrieves evidence, sends that evidence to the local LLM, and prints an answer with sources.
+
+```bash
+cobol-rag query "What is in the plain text document?"
+cobol-rag query "What is in the JSON document?" --top-k 2
+```
+
+The answer is generated from retrieved context only. The CLI always prints a `Sources` table after the answer so you can check which indexed documents supported it.
+
+If retrieval works but `query` fails, check the configured local LLM. The default config pins `context_window: 4096` for `granite-code:8b`, matching the normal Ollama CLI context size and avoiding oversized API context requests.
+
+Current answer shape:
+
+```text
+Answer:
+...
+
+Sources:
+- source_id
+- source_path
+```
+
+Trust rule: an answer without sources is not useful for this project. If retrieval returns weak or wrong sources, debug with `cobol-rag retrieve ...` before trusting `cobol-rag query ...`.
+
+## Chat Workflow
+
+Terminal chat keeps a short conversation memory so follow-up questions can refer to earlier turns.
+
+```bash
+cobol-rag chat
+cobol-rag chat --collection cobol-dev --top-k 3
+```
+
+For one non-interactive chat turn:
+
+```bash
+cobol-rag chat --once "What is in the plain text document?"
+```
+
+Chat commands:
+
+- `/sources`: show sources from the last answer.
+- `/reset`: clear chat memory.
+- `/exit`: quit the chat loop.
+
+Chat memory is not indexed evidence. It is only used to understand follow-up wording. Answers still have to come from retrieved Chroma sources, and each answer prints a `Sources` table.
+
 During early development, before installing the package as editable, use:
 
 ```bash

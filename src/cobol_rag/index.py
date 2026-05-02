@@ -39,6 +39,7 @@ def configure_llamaindex(config: AppConfig) -> LlamaIndexRuntime:
     llm = Ollama(
         model=config.llm.model,
         base_url=config.llm.base_url,
+        context_window=config.llm.context_window,
         request_timeout=config.llm.request_timeout,
         temperature=config.llm.temperature,
     )

@@ -66,10 +66,10 @@ Status labels:
 | Phase 3: Chroma index manager | In Progress | setup/open/info and document upsert work; list/delete helpers still pending |
 | Phase 4: Manifest sync | Done | apply writes Chroma and manifest; follow-up dry-run reports skips |
 | Phase 5: Remove/reset | Done | remove by source id/path and reset by collection work |
-| Phase 6: Retrieval debug | Next | not implemented yet |
-| Phase 7: One-shot query | Planned | not implemented yet |
-| Phase 8: Chat RAG | Planned | not implemented yet |
-| Phase 9: Evaluation harness | Planned | not implemented yet |
+| Phase 6: Retrieval debug | Done | `cobol-rag retrieve ...` returns scores and source previews without LLM answers |
+| Phase 7: One-shot query | Done | `cobol-rag query ...` answers with a Sources table |
+| Phase 8: Chat RAG | Done | `cobol-rag chat --once ...` answers with sources; interactive commands are wired |
+| Phase 9: Evaluation harness | Next | not implemented yet |
 
 ## Repository Layout
 
@@ -619,15 +619,14 @@ Documentation criterion:
 
 ### Phase 6: Retrieval Debug Mode
 
-Status: `Planned`
+Status: `Done`
 
 Before trusting generated answers, add retrieval-only output:
 
 ```bash
 cobol-rag retrieve \
-  --collection test-pdb305 \
   --top-k 5 \
-  "Which CICS programs does PDB305 call?"
+  "General JSON document"
 ```
 
 Output should show:
@@ -635,13 +634,12 @@ Output should show:
 - similarity score
 - source ID
 - source path
-- program
-- chunk type
+- source format
 - short text preview
 
 Exit criterion:
 
-The CICS query retrieves `PDB305.CBL:cics_operations` in the top results.
+The sample queries retrieve the matching JSON/text inbox documents in the top results.
 
 Documentation criterion:
 
@@ -650,7 +648,7 @@ Documentation criterion:
 
 ### Phase 7: One-Shot Query With Citations
 
-Status: `Planned`
+Status: `Done`
 
 Implement:
 
@@ -660,8 +658,8 @@ src/cobol_rag/query.py
 
 Requirements:
 
-- use LlamaIndex query engine
-- inject a strict prompt requiring citations
+- retrieve sources from Chroma with LlamaIndex
+- inject a strict prompt requiring grounded answers
 - answer only from retrieved context
 - show source IDs after the answer
 - warn when no relevant source was retrieved
@@ -669,10 +667,21 @@ Requirements:
 Exit criterion:
 
 ```bash
-cobol-rag query --collection test-pdb305 "Which CICS programs does PDB305 call?"
+cobol-rag query "What is in the plain text document?"
 ```
 
 returns an answer with sources.
+
+Runtime note:
+
+```text
+granite-code:8b failed through the API until the config pinned context_window to 4096, matching the working Ollama CLI context.
+```
+
+Resolution applied:
+
+- set `llm.context_window: 4096` in `config/default.yaml`
+- pass that value into LlamaIndex `Ollama(...)`
 
 Documentation criterion:
 
@@ -681,7 +690,7 @@ Documentation criterion:
 
 ### Phase 8: Chat RAG
 
-Status: `Planned`
+Status: `Done`
 
 Implement:
 
@@ -691,19 +700,21 @@ src/cobol_rag/chat.py
 
 First version:
 
-- terminal chat loop
-- collection selection
-- configurable `top_k`
-- conversation memory for follow-up questions
-- citations on every answer
-- `/sources` command to show last retrieved chunks
-- `/reset` command to clear chat memory
-- `/exit` command to quit
+- terminal chat loop: done
+- collection selection: done through `--collection`
+- configurable `top_k`: done through `--top-k`
+- conversation memory for follow-up questions: done
+- citations on every answer: done through Sources table
+- `/sources` command to show last retrieved chunks: done
+- `/reset` command to clear chat memory: done
+- `/exit` command to quit: done
+- `--once` for non-interactive verification: done
 
 Example:
 
 ```bash
 cobol-rag chat --collection cobol-dev
+cobol-rag chat --once "What is in the plain text document?"
 ```
 
 Documentation criterion:

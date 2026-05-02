@@ -57,12 +57,12 @@ Status labels:
 | Step 1: Local setup | Done | `.venv/bin/python --version` and dependencies installed |
 | Step 2: Configuration | Done | `.venv/bin/cobol-rag config` prints active config |
 | Step 3: LlamaIndex setup in code | Done | `.venv/bin/cobol-rag index-info` opens the configured Chroma collection |
-| Step 4: Normalized document contract | Planned | not implemented yet |
-| Step 5: Loader adapters | Next | next command will be `cobol-rag inspect ...` |
-| Step 6: Easy add/remove/update workflow | Planned | not implemented yet |
+| Step 4: Normalized document contract | Done | `cobol-rag inspect` shows normalized metadata without indexing |
+| Step 5: Loader adapters | Done | general JSON and text loaders work; specific formats deferred |
+| Step 6: Easy add/remove/update workflow | Next | next step after general inspection |
 | Step 7: Planned CLI | In Progress | `cobol-rag --help` and `cobol-rag config` work |
 | Phase 1: Scaffold | Done | `.venv/bin/cobol-rag --help` and `.venv/bin/cobol-rag config` work |
-| Phase 2: Loader system | Next | not implemented yet |
+| Phase 2: Loader system | Done | general loader registry, JSON loader, text loader, and inspect command work |
 | Phase 3: Chroma index manager | In Progress | setup/open/info works; ingest/delete/list still pending |
 | Phase 4: Manifest sync | Planned | not implemented yet |
 | Phase 5: Remove/reset | Planned | not implemented yet |
@@ -92,9 +92,9 @@ src/cobol_rag/
   loaders/
     __init__.py
     base.py
-    cobol_rekt_chunks.py
     generic_json.py
-    markdown_text.py
+    plain_text.py
+    registry.py
   index.py
   sync.py
   query.py
@@ -259,7 +259,7 @@ cobol-rag index-info
 
 ## Step 4: Normalized Document Contract
 
-Status: `Planned`
+Status: `Done`
 
 Every loader must return LlamaIndex `Document` objects with:
 
@@ -268,15 +268,11 @@ Every loader must return LlamaIndex `Document` objects with:
   "text": "...",
   "metadata": {
     "source_id": "stable-file-or-chunk-id",
-    "source_path": "data/inbox/PDB305.CBL.report/chunks/...",
-    "source_format": "cobol_rekt_chunks",
-    "program": "PDB305.CBL",
-    "chunk_id": "PDB305.CBL:cics_operations",
-    "chunk_type": "cics_operations",
+    "source_path": "data/inbox/example.json",
+    "source_format": "generic_json",
+    "source_name": "example.json",
     "content_hash": "...",
-    "indexed_at": "...",
-    "analysis_tool": "cobol-rekt",
-    "schema_version": "1.4"
+    "metadata_version": "1"
   }
 }
 ```
@@ -286,11 +282,11 @@ Rules:
 - `source_id` must be stable across runs for the same logical chunk.
 - `content_hash` decides whether a document needs re-indexing.
 - `source_format` tells us which loader handled it.
-- `program`, `chunk_id`, and `chunk_type` should exist when available, but loaders for other formats may leave some of them empty.
+- Specific fields such as `program`, `chunk_id`, `chunk_type`, `schema_version`, or tool-specific fields are optional and should be added by later format-specific loaders only when the source format actually provides them.
 
 ## Step 5: Loader Adapters
 
-Status: `Next`
+Status: `Done`
 
 Implement loaders behind one interface:
 
@@ -307,15 +303,20 @@ class LoaderAdapter:
 
 Initial adapters:
 
-- `cobol_rekt_chunks`: reads `*.report/chunks/*.json`
-- `generic_json`: reads friend/test JSON files with configurable text and metadata fields
-- `markdown_text`: reads `.md`, `.txt`, `.cbl`, `.cpy`, and simple exported notes
+- `generic_json`: reads general JSON objects/lists and extracts text from configurable fields when possible
+- `plain_text`: reads `.md`, `.txt`, `.cbl`, `.cpy`, `.cob`, `.jcl`, and other simple text-like files
+
+Deferred adapters:
+
+- `cobol_rekt_chunks`: later, after the general loader contract is stable
+- friend-specific formats: later, when an actual sample is available
+- JCL/copybook/Cobol-specific enrichment: later, after the generic flow works end to end
 
 The CLI should auto-detect the loader, but also allow forcing one:
 
 ```bash
-cobol-rag inspect data/inbox/PDB305.CBL.report
-cobol-rag inspect data/inbox/friend-output.json --loader generic_json
+cobol-rag inspect data/inbox/example.json
+cobol-rag inspect data/inbox/example.txt --loader plain_text
 ```
 
 ## Step 6: Easy Add/Remove/Update Workflow
@@ -362,8 +363,8 @@ cobol-rag --help
 Inspection:
 
 ```bash
-cobol-rag inspect data/inbox/PDB305.CBL.report
-cobol-rag inspect data/inbox/friend-output.json --loader generic_json
+cobol-rag inspect data/inbox/example.json
+cobol-rag inspect data/inbox/example.txt --loader plain_text
 ```
 
 Sync:
@@ -454,24 +455,25 @@ Documentation criterion:
 
 ### Phase 2: Loader System
 
-Status: `Next`
+Status: `Done`
 
 Implement:
 
 ```bash
 src/cobol_rag/loaders/base.py
-src/cobol_rag/loaders/cobol_rekt_chunks.py
 src/cobol_rag/loaders/generic_json.py
-src/cobol_rag/loaders/markdown_text.py
+src/cobol_rag/loaders/plain_text.py
+src/cobol_rag/loaders/registry.py
 ```
 
 Exit criterion:
 
 ```bash
-cobol-rag inspect data/inbox/PDB305.CBL.report
+cobol-rag inspect data/inbox/example.json
+cobol-rag inspect data/inbox/example.txt
 ```
 
-prints chunk counts by loader, program, and chunk type.
+prints document counts by loader, source format, and source path without indexing anything.
 
 Documentation criterion:
 

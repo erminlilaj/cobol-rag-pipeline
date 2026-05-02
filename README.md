@@ -30,7 +30,7 @@ Future adjustment point: add a new subfolder convention if we need to separate d
 
 ### 2. Loader Adapter Detects Format
 
-A loader adapter decides whether it can read a file or folder. For example, `cobol_rekt_chunks` will handle `*.report/chunks/*.json`, while `generic_json` will handle simpler JSON files.
+A loader adapter decides whether it can read a file or folder. For now, the project has general adapters for JSON and plain text-like files. Specific adapters, such as a dedicated `cobol-rekt` chunk loader, should be added later when the generic flow is stable.
 
 Future adjustment point: add one new loader file in `src/cobol_rag/loaders/` instead of changing the rest of the pipeline.
 
@@ -124,6 +124,20 @@ cobol-rag index-info
 ```
 
 This creates `.chroma/` if needed, opens the configured collection, and prints the current LLM, embedding model, and document count.
+
+Inspect a file or folder without indexing it:
+
+```bash
+cobol-rag inspect data/inbox/example.json
+cobol-rag inspect data/inbox/example.txt
+```
+
+The current loaders are intentionally general:
+
+- `generic_json` handles JSON objects or lists. It extracts text from configured fields such as `text`, `content`, `summary`, or `description`; if none are present, it stores the stable JSON representation as text.
+- `plain_text` handles UTF-8 text-like files such as `.txt`, `.md`, `.cbl`, `.cpy`, `.cob`, and `.jcl`.
+
+Format-specific loaders, including `cobol-rekt` chunks or friend-specific output formats, should be added later as small adapters after we have real examples.
 
 During early development, before installing the package as editable, use:
 

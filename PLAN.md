@@ -59,12 +59,12 @@ Status labels:
 | Step 3: LlamaIndex setup in code | Done | `.venv/bin/cobol-rag index-info` opens the configured Chroma collection |
 | Step 4: Normalized document contract | Done | `cobol-rag inspect` shows normalized metadata without indexing |
 | Step 5: Loader adapters | Done | general JSON and text loaders work; specific formats deferred |
-| Step 6: Easy add/remove/update workflow | Next | next step after general inspection |
+| Step 6: Easy add/remove/update workflow | In Progress | `sync --dry-run` plans add/update/skip without writing |
 | Step 7: Planned CLI | In Progress | `cobol-rag --help` and `cobol-rag config` work |
 | Phase 1: Scaffold | Done | `.venv/bin/cobol-rag --help` and `.venv/bin/cobol-rag config` work |
 | Phase 2: Loader system | Done | general loader registry, JSON loader, text loader, and inspect command work |
 | Phase 3: Chroma index manager | In Progress | setup/open/info works; ingest/delete/list still pending |
-| Phase 4: Manifest sync | Planned | not implemented yet |
+| Phase 4: Manifest sync | In Progress | dry-run planning works; apply/write path still pending |
 | Phase 5: Remove/reset | Planned | not implemented yet |
 | Phase 6: Retrieval debug | Planned | not implemented yet |
 | Phase 7: One-shot query | Planned | not implemented yet |
@@ -321,16 +321,28 @@ cobol-rag inspect data/inbox/example.txt --loader plain_text
 
 ## Step 6: Easy Add/Remove/Update Workflow
 
-Status: `Planned`
+Status: `In Progress`
 
 Preferred workflow:
 
 ```bash
 cp -r /path/to/new/output data/inbox/
-cobol-rag sync
+cobol-rag inspect data/inbox/
+cobol-rag sync --dry-run
 ```
 
-`sync` should:
+Current safe implementation:
+
+- `sync --dry-run` scans `data/inbox/`
+- uses only the general loader registry
+- computes `content_hash` for each normalized document
+- reads `data/manifests/<collection>.json` if it exists
+- reports what would be added, updated, or skipped
+- does not write to Chroma
+- does not write the manifest
+- rejects `--apply` until real indexing is implemented
+
+Later, `sync --apply` should:
 
 - scan `data/inbox/`
 - detect supported files and folders
@@ -370,7 +382,7 @@ cobol-rag inspect data/inbox/example.txt --loader plain_text
 Sync:
 
 ```bash
-cobol-rag sync
+cobol-rag sync --dry-run
 cobol-rag sync --collection friend-test
 cobol-rag sync --inbox data/inbox --dry-run
 ```
@@ -520,7 +532,7 @@ Documentation criterion:
 
 ### Phase 4: Manifest-Based Sync
 
-Status: `Planned`
+Status: `In Progress`
 
 Implement:
 
@@ -534,24 +546,32 @@ Manifest example:
 {
   "collection": "cobol-dev",
   "sources": {
-    "data/inbox/PDB305.CBL.report/chunks/PDB305.CBL__cics_operations.json": {
-      "source_id": "PDB305.CBL:cics_operations",
+    "generic_json:data/inbox/example.json:0": {
+      "source_id": "generic_json:data/inbox/example.json:0",
+      "source_path": "data/inbox/example.json",
       "content_hash": "...",
-      "source_format": "cobol_rekt_chunks"
+      "source_format": "generic_json"
     }
   }
 }
 ```
 
-Exit criterion:
+Current exit criterion:
 
 ```bash
 cobol-rag sync --dry-run
-cobol-rag sync
-cobol-rag sync
 ```
 
-The second real `sync` reports everything as skipped/unchanged.
+prints add/update/skip counts and clearly says `indexing: no` and `manifest_write: no`.
+
+Later exit criterion:
+
+```bash
+cobol-rag sync --apply
+cobol-rag sync --dry-run
+```
+
+The second command reports everything as skipped/unchanged.
 
 Documentation criterion:
 

@@ -9,6 +9,7 @@ from rich.table import Table
 from cobol_rag.config import load_config
 from cobol_rag.index import collection_count, open_index
 from cobol_rag.loaders import LoaderError, load_path
+from cobol_rag.sync import SyncPlan, build_sync_plan
 
 app = typer.Typer(
     help="Flexible local RAG pipeline for COBOL analysis artifacts.",
@@ -132,6 +133,31 @@ def inspect(
     console.print(detail)
 
 
+@app.command()
+def sync(
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--apply",
+        help="Preview the sync plan or apply it. Only dry-run is implemented now.",
+    ),
+    path: Path = typer.Option(
+        Path("config/default.yaml"),
+        "--config",
+        "-c",
+        help="Path to the YAML config file.",
+    ),
+) -> None:
+    """Plan inbox synchronization using general loaders."""
+    if not dry_run:
+        raise typer.BadParameter(
+            "--apply is not implemented yet; use --dry-run for this safe step."
+        )
+
+    settings = load_config(path)
+    plan = build_sync_plan(settings, dry_run=dry_run)
+    _print_sync_plan(plan)
+
+
 def _preview(text: str, limit: int) -> str:
     if limit <= 0:
         return ""
@@ -139,6 +165,37 @@ def _preview(text: str, limit: int) -> str:
     if len(compact) <= limit:
         return compact
     return f"{compact[:limit].rstrip()}..."
+
+
+def _print_sync_plan(plan: SyncPlan) -> None:
+    summary = Table(title="Sync Plan")
+    summary.add_column("Metric")
+    summary.add_column("Value")
+    summary.add_row("collection", plan.collection)
+    summary.add_row("inbox", str(plan.inbox_dir))
+    summary.add_row("manifest", str(plan.manifest_path))
+    summary.add_row("dry_run", str(plan.dry_run))
+    summary.add_row("documents", str(plan.total_documents))
+    summary.add_row("would_add", str(plan.count("add")))
+    summary.add_row("would_update", str(plan.count("update")))
+    summary.add_row("would_skip", str(plan.count("skip")))
+    summary.add_row("indexing", "no")
+    summary.add_row("manifest_write", "no")
+    console.print(summary)
+
+    detail = Table(title="Sync Items")
+    detail.add_column("Action")
+    detail.add_column("Source Format")
+    detail.add_column("Source ID")
+    detail.add_column("Source Path")
+    for item in plan.items:
+        detail.add_row(
+            item.action,
+            item.source_format,
+            item.source_id,
+            item.source_path,
+        )
+    console.print(detail)
 
 
 if __name__ == "__main__":

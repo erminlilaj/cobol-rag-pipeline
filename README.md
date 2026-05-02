@@ -139,6 +139,42 @@ The current loaders are intentionally general:
 
 Format-specific loaders, including `cobol-rekt` chunks or friend-specific output formats, should be added later as small adapters after we have real examples.
 
+Plan an inbox sync without writing to Chroma:
+
+```bash
+cobol-rag sync --dry-run
+```
+
+`sync --dry-run` scans `data/inbox/`, loads supported files with the general loader registry, computes each document `content_hash`, reads the collection manifest from `data/manifests/<collection>.json` if it exists, and prints what would be added, updated, or skipped.
+
+Current safety rule: `sync --dry-run` does not write to Chroma and does not write the manifest. The `--apply` mode is intentionally blocked until the dry-run output is trustworthy.
+
+## Sync Workflow
+
+The intended day-to-day workflow is:
+
+```bash
+cp /path/to/output.json data/inbox/
+cobol-rag inspect data/inbox/output.json
+cobol-rag sync --dry-run
+```
+
+Read the sync output before applying future indexing behavior:
+
+- `would_add`: the document is not present in the manifest yet.
+- `would_update`: the same `source_id` exists, but its `content_hash` changed.
+- `would_skip`: the same `source_id` and `content_hash` already exist in the manifest.
+- `indexing: no`: no vector database write happened.
+- `manifest_write: no`: no manifest update happened.
+
+Manifest files will live in `data/manifests/` and are keyed by collection name. For example, the default collection will use:
+
+```text
+data/manifests/cobol-dev.json
+```
+
+Future adjustment point: when real indexing is added, keep `--dry-run` as the default safe preview and require an explicit `--apply` for writes.
+
 During early development, before installing the package as editable, use:
 
 ```bash

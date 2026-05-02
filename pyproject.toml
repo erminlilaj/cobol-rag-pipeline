@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cobol-rag-pipeline"
+version = "0.1.0"
+description = "Flexible local RAG pipeline for COBOL analysis artifacts."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "chromadb",
+  "llama-index",
+  "llama-index-embeddings-ollama",
+  "llama-index-llms-ollama",
+  "llama-index-vector-stores-chroma",
+  "pydantic-settings",
+  "pyyaml",
+  "rich",
+  "typer",
+]
+
+[project.scripts]
+cobol-rag = "cobol_rag.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]

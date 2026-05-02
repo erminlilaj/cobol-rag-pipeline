@@ -1,0 +1,46 @@
+paths:
+  chroma_dir: ".chroma"
+  inbox_dir: "data/inbox"
+  archive_dir: "data/archive"
+  manifest_dir: "data/manifests"
+
+llm:
+  provider: "ollama"
+  model: "granite-code:8b"
+  base_url: "http://localhost:11434"
+  request_timeout: 300
+  temperature: 0.1
+
+embedding:
+  provider: "ollama"
+  model: "mxbai-embed-large:latest"
+  base_url: "http://localhost:11434"
+
+index:
+  collection: "cobol-dev"
+  chunk_mode: "pre_chunked"
+  batch_size: 64
+
+retrieval:
+  top_k: 6
+  filters: {}
+  similarity_cutoff: null
+
+answers:
+  require_citations: true
+  show_sources: true
+
+loaders:
+  generic_json:
+    text_fields:
+      - "text"
+      - "content"
+      - "summary"
+      - "description"
+    metadata_fields:
+      - "program"
+      - "file"
+      - "section"
+      - "kind"
+      - "chunk_type"
+      - "schema_version"

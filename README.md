@@ -186,6 +186,37 @@ data/manifests/cobol-dev.json
 
 Future adjustment point: keep `--dry-run` as the default safe preview. Any destructive behavior, such as removing documents no longer present in `data/inbox/`, should get its own dry-run output before writes are allowed.
 
+## Remove Workflow
+
+Removal also follows the dry-run/apply rule.
+
+Preview removal by source path:
+
+```bash
+cobol-rag remove --source-path data/inbox/example.txt --dry-run
+```
+
+Apply removal:
+
+```bash
+cobol-rag remove --source-path data/inbox/example.txt --apply
+```
+
+You can also remove a single normalized document by `source_id`:
+
+```bash
+cobol-rag remove --source-id plain_text:data/inbox/example.txt --dry-run
+```
+
+Current removal support is intentionally general:
+
+- `--source-id` removes exactly one normalized source id.
+- `--source-path` removes every manifest entry that came from that path.
+- `--dry-run` only reads the manifest and prints matching entries.
+- `--apply` deletes matching Chroma records by `source_id`, then rewrites the manifest.
+
+Fields such as `program`, `chunk_type`, or tool-specific identifiers will be added to removal later, after format-specific loaders add those metadata fields.
+
 During early development, before installing the package as editable, use:
 
 ```bash

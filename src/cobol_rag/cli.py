@@ -9,6 +9,7 @@ from rich.table import Table
 from cobol_rag.config import load_config
 from cobol_rag.index import collection_count, open_index
 from cobol_rag.loaders import LoaderError, load_path
+from cobol_rag.remove import RemovePlan, apply_remove_plan, build_remove_plan
 from cobol_rag.sync import SyncPlan, apply_sync_plan, build_sync_plan
 
 app = typer.Typer(
@@ -138,7 +139,7 @@ def sync(
     dry_run: bool = typer.Option(
         True,
         "--dry-run/--apply",
-        help="Preview the sync plan or apply it. Only dry-run is implemented now.",
+        help="Preview the sync plan or apply it.",
     ),
     path: Path = typer.Option(
         Path("config/default.yaml"),
@@ -153,6 +154,47 @@ def sync(
     if not dry_run:
         apply_sync_plan(settings, plan)
     _print_sync_plan(plan)
+
+
+@app.command()
+def remove(
+    source_id: str | None = typer.Option(
+        None,
+        "--source-id",
+        help="Remove one manifest/index entry by normalized source id.",
+    ),
+    source_path: str | None = typer.Option(
+        None,
+        "--source-path",
+        help="Remove manifest/index entries by original source path.",
+    ),
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--apply",
+        help="Preview removal or apply it.",
+    ),
+    path: Path = typer.Option(
+        Path("config/default.yaml"),
+        "--config",
+        "-c",
+        help="Path to the YAML config file.",
+    ),
+) -> None:
+    """Remove indexed documents by general metadata."""
+    settings = load_config(path)
+    try:
+        plan = build_remove_plan(
+            settings,
+            source_id=source_id,
+            source_path=source_path,
+            dry_run=dry_run,
+        )
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+
+    if not dry_run:
+        apply_remove_plan(settings, plan)
+    _print_remove_plan(plan)
 
 
 def _preview(text: str, limit: int) -> str:
@@ -191,6 +233,33 @@ def _print_sync_plan(plan: SyncPlan) -> None:
             item.source_format,
             item.source_id,
             item.source_path,
+        )
+    console.print(detail)
+
+
+def _print_remove_plan(plan: RemovePlan) -> None:
+    summary = Table(title="Remove Plan")
+    summary.add_column("Metric")
+    summary.add_column("Value")
+    summary.add_row("collection", plan.collection)
+    summary.add_row("manifest", str(plan.manifest_path))
+    summary.add_row("dry_run", str(plan.dry_run))
+    summary.add_row("documents", str(plan.total_documents))
+    summary.add_row("indexing_delete", "no" if plan.dry_run else "yes")
+    summary.add_row("manifest_write", "no" if plan.dry_run else "yes")
+    console.print(summary)
+
+    detail = Table(title="Remove Items")
+    detail.add_column("Source Format")
+    detail.add_column("Source ID")
+    detail.add_column("Source Path")
+    detail.add_column("Content Hash")
+    for entry in plan.entries:
+        detail.add_row(
+            entry.source_format,
+            entry.source_id,
+            entry.source_path,
+            entry.content_hash,
         )
     console.print(detail)
 

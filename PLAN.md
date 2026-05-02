@@ -65,7 +65,7 @@ Status labels:
 | Phase 2: Loader system | Done | general loader registry, JSON loader, text loader, and inspect command work |
 | Phase 3: Chroma index manager | In Progress | setup/open/info and document upsert work; list/delete helpers still pending |
 | Phase 4: Manifest sync | Done | apply writes Chroma and manifest; follow-up dry-run reports skips |
-| Phase 5: Remove/reset | Next | not implemented yet |
+| Phase 5: Remove/reset | In Progress | remove by source id/path works; reset still pending |
 | Phase 6: Retrieval debug | Planned | not implemented yet |
 | Phase 7: One-shot query | Planned | not implemented yet |
 | Phase 8: Chat RAG | Planned | not implemented yet |
@@ -348,16 +348,22 @@ Implemented behavior:
 - write a local manifest to `data/manifests/<collection>.json` after successful indexing
 - print a summary of added, updated, skipped, and failed items
 
-Removal options:
+Implemented removal options:
 
 ```bash
 cobol-rag remove --source-path data/inbox/old-output.json
+cobol-rag remove --source-id plain_text:data/inbox/example.txt
+```
+
+Deferred removal options:
+
+```bash
 cobol-rag remove --program PDB305.CBL
 cobol-rag remove --source-format generic_json
 cobol-rag reset --collection cobol-dev
 ```
 
-For Chroma, deletion should be done through metadata filters or stable document IDs. Keep enough metadata in every node to delete by `program`, `source_path`, `source_format`, or `chunk_id`.
+For Chroma, deletion is currently done through stable `source_id` metadata. Later format-specific loaders should keep enough metadata in every node to delete by `program`, `source_format`, `chunk_type`, or other domain-specific fields.
 
 ## Step 7: Planned CLI
 
@@ -398,7 +404,7 @@ cobol-rag list --collection friend-test
 Remove:
 
 ```bash
-cobol-rag remove --program PDB305.CBL
+cobol-rag remove --source-id plain_text:data/inbox/example.txt
 cobol-rag remove --source-path data/inbox/friend-output.json
 ```
 
@@ -572,24 +578,26 @@ Documentation criterion:
 
 ### Phase 5: Remove And Reset
 
-Status: `Planned`
+Status: `In Progress`
 
 Implement:
 
-- `remove --program`
-- `remove --source-path`
-- `remove --source-format`
-- `remove --chunk-id`
+- `remove --source-id`: done
+- `remove --source-path`: done
+- `remove --program`: deferred until format-specific metadata exists
+- `remove --source-format`: planned
+- `remove --chunk-id`: deferred until format-specific metadata exists
 - `reset --collection`
 
 Exit criterion:
 
 ```bash
-cobol-rag remove --program PDB305.CBL --collection test-pdb305
-cobol-rag list --collection test-pdb305
+cobol-rag remove --source-path data/inbox/example.txt --dry-run
+cobol-rag remove --source-path data/inbox/example.txt --apply
+cobol-rag index-info
 ```
 
-no longer shows `PDB305.CBL`.
+document count decreases and the manifest no longer includes the removed source path.
 
 Documentation criterion:
 

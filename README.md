@@ -217,6 +217,36 @@ Current removal support is intentionally general:
 
 Fields such as `program`, `chunk_type`, or tool-specific identifiers will be added to removal later, after format-specific loaders add those metadata fields.
 
+## Reset Workflow
+
+Reset is the collection-level cleanup command. It does not delete `data/inbox/`; it only resets the configured Chroma collection and removes that collection's manifest.
+
+Preview reset:
+
+```bash
+cobol-rag reset --dry-run
+```
+
+Apply reset:
+
+```bash
+cobol-rag reset --apply
+```
+
+After reset:
+
+```bash
+cobol-rag index-info
+cobol-rag sync --dry-run
+```
+
+Expected result:
+
+- `index-info` shows `documents: 0`.
+- `sync --dry-run` sees the files still in `data/inbox/` and reports them as `would_add`.
+
+Use reset when changing embedding models, clearing experiments, or rebuilding a collection from scratch.
+
 During early development, before installing the package as editable, use:
 
 ```bash

@@ -65,8 +65,8 @@ Status labels:
 | Phase 2: Loader system | Done | general loader registry, JSON loader, text loader, and inspect command work |
 | Phase 3: Chroma index manager | In Progress | setup/open/info and document upsert work; list/delete helpers still pending |
 | Phase 4: Manifest sync | Done | apply writes Chroma and manifest; follow-up dry-run reports skips |
-| Phase 5: Remove/reset | In Progress | remove by source id/path works; reset still pending |
-| Phase 6: Retrieval debug | Planned | not implemented yet |
+| Phase 5: Remove/reset | Done | remove by source id/path and reset by collection work |
+| Phase 6: Retrieval debug | Next | not implemented yet |
 | Phase 7: One-shot query | Planned | not implemented yet |
 | Phase 8: Chat RAG | Planned | not implemented yet |
 | Phase 9: Evaluation harness | Planned | not implemented yet |
@@ -360,10 +360,18 @@ Deferred removal options:
 ```bash
 cobol-rag remove --program PDB305.CBL
 cobol-rag remove --source-format generic_json
-cobol-rag reset --collection cobol-dev
 ```
 
 For Chroma, deletion is currently done through stable `source_id` metadata. Later format-specific loaders should keep enough metadata in every node to delete by `program`, `source_format`, `chunk_type`, or other domain-specific fields.
+
+Implemented reset options:
+
+```bash
+cobol-rag reset --dry-run
+cobol-rag reset --apply
+```
+
+Reset affects only the configured collection and its manifest. It does not delete files from `data/inbox/`.
 
 ## Step 7: Planned CLI
 
@@ -578,7 +586,7 @@ Documentation criterion:
 
 ### Phase 5: Remove And Reset
 
-Status: `In Progress`
+Status: `Done`
 
 Implement:
 
@@ -587,7 +595,7 @@ Implement:
 - `remove --program`: deferred until format-specific metadata exists
 - `remove --source-format`: planned
 - `remove --chunk-id`: deferred until format-specific metadata exists
-- `reset --collection`
+- `reset`: done for the configured collection
 
 Exit criterion:
 
@@ -595,9 +603,14 @@ Exit criterion:
 cobol-rag remove --source-path data/inbox/example.txt --dry-run
 cobol-rag remove --source-path data/inbox/example.txt --apply
 cobol-rag index-info
+cobol-rag reset --dry-run
+cobol-rag reset --apply
+cobol-rag sync --dry-run
 ```
 
-document count decreases and the manifest no longer includes the removed source path.
+remove decreases document count and updates the manifest.
+
+reset clears the configured collection and removes its manifest, while keeping `data/inbox/` untouched. After reset, `sync --dry-run` reports inbox files as `would_add`.
 
 Documentation criterion:
 

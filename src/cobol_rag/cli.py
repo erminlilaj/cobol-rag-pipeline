@@ -10,6 +10,7 @@ from cobol_rag.config import load_config
 from cobol_rag.index import collection_count, open_index
 from cobol_rag.loaders import LoaderError, load_path
 from cobol_rag.remove import RemovePlan, apply_remove_plan, build_remove_plan
+from cobol_rag.reset import ResetPlan, apply_reset_plan, build_reset_plan
 from cobol_rag.sync import SyncPlan, apply_sync_plan, build_sync_plan
 
 app = typer.Typer(
@@ -197,6 +198,28 @@ def remove(
     _print_remove_plan(plan)
 
 
+@app.command()
+def reset(
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--apply",
+        help="Preview reset or apply it.",
+    ),
+    path: Path = typer.Option(
+        Path("config/default.yaml"),
+        "--config",
+        "-c",
+        help="Path to the YAML config file.",
+    ),
+) -> None:
+    """Reset the configured Chroma collection and its manifest."""
+    settings = load_config(path)
+    plan = build_reset_plan(settings, dry_run=dry_run)
+    if not dry_run:
+        apply_reset_plan(settings, plan)
+    _print_reset_plan(plan)
+
+
 def _preview(text: str, limit: int) -> str:
     if limit <= 0:
         return ""
@@ -262,6 +285,21 @@ def _print_remove_plan(plan: RemovePlan) -> None:
             entry.content_hash,
         )
     console.print(detail)
+
+
+def _print_reset_plan(plan: ResetPlan) -> None:
+    summary = Table(title="Reset Plan")
+    summary.add_column("Metric")
+    summary.add_column("Value")
+    summary.add_row("collection", plan.collection)
+    summary.add_row("chroma_dir", str(plan.chroma_dir))
+    summary.add_row("manifest", str(plan.manifest_path))
+    summary.add_row("dry_run", str(plan.dry_run))
+    summary.add_row("documents_before", str(plan.document_count))
+    summary.add_row("manifest_exists", str(plan.manifest_exists))
+    summary.add_row("collection_reset", "no" if plan.dry_run else "yes")
+    summary.add_row("manifest_removed", "no" if plan.dry_run else "yes")
+    console.print(summary)
 
 
 if __name__ == "__main__":

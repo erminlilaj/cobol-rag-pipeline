@@ -134,10 +134,51 @@ cobol-rag inspect data/inbox/example.txt
 
 The current loaders are intentionally general:
 
+- `rag_documents` handles the `rag_documents.jsonl` and `rag_documents.json` files produced by the `control_flow` RAG document factory. It keeps the factory text unchanged, uses the factory record `id` as the stable chunk id, and maps factory `type` into `chunk_type` for retrieval filters and intent reranking.
 - `generic_json` handles JSON objects or lists. It extracts text from configured fields such as `text`, `content`, `summary`, or `description`; if none are present, it stores the stable JSON representation as text.
 - `plain_text` handles UTF-8 text-like files such as `.txt`, `.md`, `.cbl`, `.cpy`, `.cob`, and `.jcl`.
 
-Format-specific loaders, including `cobol-rekt` chunks or friend-specific output formats, should be added later as small adapters after we have real examples.
+Format-specific loaders should stay as small adapters around one source contract, so the rest of the sync/retrieval pipeline stays stable.
+
+## Control Flow Factory Output
+
+The preferred input from `control_flow` is the final RAG index folder created by `scripts/pipeline/run_rag_factory.py`, especially:
+
+```text
+rag_index/rag_documents.jsonl
+rag_index/rag_manifest.json
+rag_index/program_index.json
+```
+
+For Ollama `mxbai-embed-large`, keep factory chunks compact. A safe tested setting from `control_flow` is:
+
+```bash
+python scripts/pipeline/build_rag_index.py \
+  --out-root /path/to/program_artifacts \
+  --out-dir /path/to/rag_index_embed_safe \
+  --max-text-chars 1200 \
+  --overlap-chars 150
+```
+
+Inspect the JSONL before indexing:
+
+```bash
+cobol-rag inspect /path/to/rag_index/rag_documents.jsonl
+cobol-rag inspect /path/to/rag_index
+```
+
+Sync it directly without copying into `data/inbox`. Passing the `rag_index` folder automatically selects `rag_documents.jsonl` when present:
+
+```bash
+cobol-rag sync /path/to/rag_index --dry-run
+cobol-rag sync /path/to/rag_index --apply
+```
+
+The loader preserves factory metadata such as `program`, `source_file`, `source_kind`, `chunk_index`, and `chunk_count`. It also exposes the factory document type as `chunk_type`, so commands like this can target a specific evidence family:
+
+```bash
+cobol-rag retrieve "which copybooks are shared?" --chunk-type global.copybook_usage
+```
 
 Plan an inbox sync without writing to Chroma:
 

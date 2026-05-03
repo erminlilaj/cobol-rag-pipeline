@@ -5,10 +5,18 @@ from pathlib import Path
 
 
 def resolve_index_path(path: Path) -> Path:
-    """If path is a knowledge-base_rag bundle (has manifest.json), return recommended_index_path.
+    """Resolve known bundle/index folders to the files that should be indexed.
 
     Leaves non-bundle paths unchanged so callers can use this unconditionally.
     """
+    if not path.is_dir():
+        return path
+
+    for candidate_name in ("rag_documents.jsonl", "rag_documents.json"):
+        candidate = path / candidate_name
+        if candidate.exists():
+            return candidate
+
     manifest = path / "manifest.json"
     if not manifest.exists():
         return path
@@ -27,6 +35,8 @@ def list_bundle_chunks(chunks_dir: Path) -> list[Path] | None:
     Returns None when chunks_manifest.json is absent, signalling the caller to
     fall back to a plain directory load.
     """
+    if not chunks_dir.is_dir():
+        return None
     manifest = chunks_dir / "chunks_manifest.json"
     if not manifest.exists():
         return None
@@ -40,5 +50,7 @@ def list_bundle_chunks(chunks_dir: Path) -> list[Path] | None:
 
 def find_bm25_index(chunks_dir: Path) -> Path | None:
     """Return the path to bm25_index.json if present alongside the chunks."""
+    if not chunks_dir.is_dir():
+        chunks_dir = chunks_dir.parent
     candidate = chunks_dir / "bm25_index.json"
     return candidate if candidate.exists() else None

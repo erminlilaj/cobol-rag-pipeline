@@ -198,11 +198,51 @@ def _intent_rerank(
 
     ranked = [result for _score, _index, result in scored]
     canonical_types = {
-        "copybooks": {"cobol_analysis_health", "program_summary", "dependencies", "copybook_resolution", "copybook_usage"},
-        "external_programs": {"external_program_calls", "cics_operations", "dependencies"},
-        "datasets_tables": {"datasets_tables_resources", "dependencies", "cics_operations"},
-        "dead_code": {"dead_code", "unused_copybooks", "commented_out_code", "cobol_analysis_health"},
-        "comments": {"commented_out_code", "program_summary", "paragraph_logic"},
+        "copybooks": {
+            "architecture.copybooks",
+            "global.copybook_usage",
+            "global.copybook_usage.summary",
+            "cobol_analysis_health",
+            "program_summary",
+            "dependencies",
+            "copybook_resolution",
+            "copybook_usage",
+        },
+        "external_programs": {
+            "architecture.calls",
+            "architecture.call",
+            "global.call_graph.summary",
+            "global.call_target",
+            "global.program_dependencies",
+            "external_program_calls",
+            "cics_operations",
+            "dependencies",
+        },
+        "datasets_tables": {
+            "architecture.db2_table",
+            "architecture.sqlinclude",
+            "global.db2_table_usage",
+            "global.db2_table_usage.summary",
+            "datasets_tables_resources",
+            "dependencies",
+            "cics_operations",
+        },
+        "dead_code": {
+            "dead_code",
+            "unused_copybooks",
+            "commented_out_code",
+            "program.comments",
+            "program.comment",
+            "cobol_analysis_health",
+        },
+        "comments": {
+            "program.comments",
+            "program.comment",
+            "commented_out_code",
+            "program_summary",
+            "program.summary",
+            "paragraph_logic",
+        },
     }.get(intent)
     if canonical_types:
         canonical = [
@@ -258,6 +298,9 @@ def _intent_score(intent: str, result: RetrievalResult) -> float:
 
     if intent == "copybooks":
         score = _chunk_boost(chunk_type, {
+            "architecture.copybooks": 0.24,
+            "global.copybook_usage.summary": 0.18,
+            "global.copybook_usage": 0.16,
             "cobol_analysis_health": 0.16,
             "program_summary": 0.14,
             "dependencies": 0.12,
@@ -278,6 +321,11 @@ def _intent_score(intent: str, result: RetrievalResult) -> float:
 
     if intent == "external_programs":
         score = _chunk_boost(chunk_type, {
+            "architecture.calls": 0.26,
+            "architecture.call": 0.22,
+            "global.program_dependencies": 0.18,
+            "global.call_target": 0.16,
+            "global.call_graph.summary": 0.14,
             "external_program_calls": 0.22,
             "cics_operations": 0.10,
             "dependencies": 0.08,
@@ -291,6 +339,10 @@ def _intent_score(intent: str, result: RetrievalResult) -> float:
 
     if intent == "datasets_tables":
         score = _chunk_boost(chunk_type, {
+            "architecture.db2_table": 0.24,
+            "architecture.sqlinclude": 0.16,
+            "global.db2_table_usage": 0.18,
+            "global.db2_table_usage.summary": 0.16,
             "datasets_tables_resources": 0.22,
             "dependencies": 0.12,
             "cics_operations": 0.06,
@@ -316,8 +368,11 @@ def _intent_score(intent: str, result: RetrievalResult) -> float:
 
     if intent == "comments":
         score = _chunk_boost(chunk_type, {
+            "program.comments": 0.20,
+            "program.comment": 0.18,
             "commented_out_code": 0.20,
             "program_summary": 0.06,
+            "program.summary": 0.06,
             "paragraph_logic": 0.04,
         })
         if any(term in text for term in ("comment", "commented-out", "inactive")):
@@ -328,6 +383,11 @@ def _intent_score(intent: str, result: RetrievalResult) -> float:
 
     if intent == "dependencies":
         score = _chunk_boost(chunk_type, {
+            "global.program_dependencies": 0.18,
+            "architecture.calls": 0.16,
+            "architecture.copybooks": 0.14,
+            "architecture.db2_table": 0.12,
+            "architecture.sqlinclude": 0.10,
             "dependencies": 0.16,
             "cics_operations": 0.14,
             "datasets_tables_resources": 0.10,
@@ -342,6 +402,7 @@ def _intent_score(intent: str, result: RetrievalResult) -> float:
 
     if intent == "program_summary":
         score = _chunk_boost(chunk_type, {
+            "program.summary": 0.20,
             "program_summary": 0.18,
             "cobol_analysis_health": 0.06,
             "dependencies": 0.04,

@@ -6,10 +6,12 @@ from cobol_rag.config import AppConfig
 from cobol_rag.loaders.base import LoadedDocument, LoaderAdapter, LoaderError
 from cobol_rag.loaders.generic_json import GenericJsonLoader
 from cobol_rag.loaders.plain_text import PlainTextLoader
+from cobol_rag.loaders.rag_documents import RagDocumentsLoader
 
 
 def list_loaders(config: AppConfig) -> list[LoaderAdapter]:
     return [
+        RagDocumentsLoader(config=config),
         GenericJsonLoader(config=config),
         PlainTextLoader(),
     ]

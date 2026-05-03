@@ -8,6 +8,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from cobol_rag.bundle import list_bundle_chunks, resolve_index_path
 from cobol_rag.chat import ChatSession
 from cobol_rag.config import load_config
 from cobol_rag.index import collection_count, open_index
@@ -55,7 +56,10 @@ def config(
     table.add_row("embedding", "provider", settings.embedding.provider)
     table.add_row("embedding", "model", settings.embedding.model)
     table.add_row("index", "collection", settings.index.collection)
+    table.add_row("index", "include_non_indexable", str(settings.index.include_non_indexable))
     table.add_row("retrieval", "top_k", str(settings.retrieval.top_k))
+    table.add_row("retrieval", "mode", settings.retrieval.mode)
+    table.add_row("retrieval", "bm25_top_k", str(settings.retrieval.bm25_top_k))
     table.add_row("answers", "require_citations", str(settings.answers.require_citations))
     console.print(table)
 
@@ -86,7 +90,7 @@ def index_info(
 
 @app.command()
 def inspect(
-    target: Path = typer.Argument(..., help="File or directory to inspect."),
+    target: Path = typer.Argument(..., help="File, directory, or knowledge-base_rag bundle to inspect."),
     loader: str | None = typer.Option(
         None,
         "--loader",
@@ -106,12 +110,13 @@ def inspect(
         help="Number of text preview characters to show.",
     ),
 ) -> None:
-    """Inspect files through general loaders without indexing them."""
+    """Inspect files through loaders without indexing them.
+
+    Accepts a knowledge-base_rag bundle path: resolves recommended_index_path
+    and lists only the curated chunk files.
+    """
     settings = load_config(path)
-    try:
-        loaded = load_path(target, config=settings, loader_name=loader)
-    except LoaderError as error:
-        raise typer.BadParameter(str(error)) from error
+    loaded = _load_target(target, settings, loader)
 
     summary = Table(title="Inspection Summary")
     summary.add_column("Metric")
@@ -123,6 +128,7 @@ def inspect(
 
     detail = Table(title="Loaded Documents")
     detail.add_column("Loader")
+    detail.add_column("chunk_type")
     detail.add_column("Source ID")
     detail.add_column("Source Path")
     detail.add_column("Chars", justify="right")
@@ -130,9 +136,11 @@ def inspect(
 
     for item in loaded:
         document = item.document
+        chunk_type = str(document.metadata.get("chunk_type", ""))
         preview = _preview(document.text, preview_chars)
         detail.add_row(
             item.loader_name,
+            chunk_type,
             str(document.metadata.get("source_id", "")),
             str(document.metadata.get("source_path", item.source_path)),
             str(len(document.text)),
@@ -143,6 +151,10 @@ def inspect(
 
 @app.command()
 def sync(
+    target: Path | None = typer.Argument(
+        None,
+        help="Bundle or directory to sync. Overrides config inbox_dir when provided.",
+    ),
     dry_run: bool = typer.Option(
         True,
         "--dry-run/--apply",
@@ -155,9 +167,18 @@ def sync(
         help="Path to the YAML config file.",
     ),
 ) -> None:
-    """Plan inbox synchronization using general loaders."""
+    """Plan or apply inbox/bundle synchronization.
+
+    Pass a knowledge-base_rag bundle path as the first argument to index only
+    its curated chunks folder instead of the default inbox directory.
+
+    Examples:
+        cobol-rag sync --dry-run
+        cobol-rag sync --apply
+        cobol-rag sync --apply /path/to/program.report/knowledge-base_rag
+    """
     settings = load_config(path)
-    plan = build_sync_plan(settings, dry_run=dry_run)
+    plan = build_sync_plan(settings, dry_run=dry_run, target=target)
     if not dry_run:
         apply_sync_plan(settings, plan)
     _print_sync_plan(plan)
@@ -235,6 +256,12 @@ def retrieve(
         min=1,
         help="Number of retrieval results to return.",
     ),
+    chunk_type: list[str] = typer.Option(
+        [],
+        "--chunk-type",
+        help="Filter results to these chunk types (repeatable). "
+             "E.g. --chunk-type dependencies --chunk-type cics_operations",
+    ),
     path: Path = typer.Option(
         Path("config/default.yaml"),
         "--config",
@@ -250,7 +277,12 @@ def retrieve(
 ) -> None:
     """Retrieve matching documents without generating an answer."""
     settings = load_config(path)
-    results = retrieve_documents(query=query, config=settings, top_k=top_k)
+    results = retrieve_documents(
+        query=query,
+        config=settings,
+        top_k=top_k,
+        chunk_types=chunk_type or None,
+    )
     _print_retrieval_results(query, results, preview_chars)
 
 
@@ -263,6 +295,11 @@ def query(
         min=1,
         help="Number of retrieved sources to use.",
     ),
+    chunk_type: list[str] = typer.Option(
+        [],
+        "--chunk-type",
+        help="Restrict retrieval to these chunk types (repeatable).",
+    ),
     path: Path = typer.Option(
         Path("config/default.yaml"),
         "--config",
@@ -273,7 +310,12 @@ def query(
     """Answer one question using retrieved sources and citations."""
     settings = load_config(path)
     try:
-        answer = answer_query(question=question, config=settings, top_k=top_k)
+        answer = answer_query(
+            question=question,
+            config=settings,
+            top_k=top_k,
+            chunk_types=chunk_type or None,
+        )
     except QueryError as error:
         raise typer.BadParameter(str(error)) from error
     _print_query_answer(answer)
@@ -286,6 +328,11 @@ def chat(
         "--top-k",
         min=1,
         help="Number of retrieved sources to use for each turn.",
+    ),
+    chunk_type: list[str] = typer.Option(
+        [],
+        "--chunk-type",
+        help="Restrict retrieval to these chunk types for the whole session (repeatable).",
     ),
     collection: str | None = typer.Option(
         None,
@@ -312,7 +359,11 @@ def chat(
             index=replace(settings.index, collection=collection),
         )
 
-    session = ChatSession(config=settings, top_k=top_k)
+    session = ChatSession(
+        config=settings,
+        top_k=top_k,
+        chunk_types=chunk_type or None,
+    )
     if once:
         try:
             answer = session.ask(once)
@@ -352,6 +403,33 @@ def chat(
         _print_query_answer(answer)
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _load_target(target: Path, settings, loader: str | None):
+    """Load a plain path or a knowledge-base_rag bundle (curated chunks only)."""
+    index_path = resolve_index_path(target)
+    if index_path != target:
+        chunk_files = list_bundle_chunks(index_path)
+        if chunk_files is not None:
+            loaded = []
+            for f in chunk_files:
+                try:
+                    loaded.extend(load_path(f, config=settings, loader_name=loader))
+                except LoaderError as err:
+                    console.print(f"[yellow]skip {f.name}: {err}[/yellow]")
+            return loaded
+        try:
+            return load_path(index_path, config=settings, loader_name=loader)
+        except LoaderError as error:
+            raise typer.BadParameter(str(error)) from error
+    try:
+        return load_path(target, config=settings, loader_name=loader)
+    except LoaderError as error:
+        raise typer.BadParameter(str(error)) from error
+
+
 def _preview(text: str, limit: int) -> str:
     if limit <= 0:
         return ""
@@ -366,25 +444,33 @@ def _print_sync_plan(plan: SyncPlan) -> None:
     summary.add_column("Metric")
     summary.add_column("Value")
     summary.add_row("collection", plan.collection)
-    summary.add_row("inbox", str(plan.inbox_dir))
+    summary.add_row("source", str(plan.inbox_dir))
     summary.add_row("manifest", str(plan.manifest_path))
     summary.add_row("dry_run", str(plan.dry_run))
     summary.add_row("documents", str(plan.total_documents))
     summary.add_row("would_add", str(plan.count("add")))
     summary.add_row("would_update", str(plan.count("update")))
     summary.add_row("would_skip", str(plan.count("skip")))
+    summary.add_row("would_remove", str(plan.count("remove")))
+    if plan.bm25_index_path:
+        summary.add_row("bm25_index", str(plan.bm25_index_path))
     summary.add_row("indexing", "no" if plan.dry_run else "yes")
     summary.add_row("manifest_write", "no" if plan.dry_run else "yes")
     console.print(summary)
 
     detail = Table(title="Sync Items")
     detail.add_column("Action")
+    detail.add_column("chunk_type")
     detail.add_column("Source Format")
     detail.add_column("Source ID")
     detail.add_column("Source Path")
     for item in plan.items:
+        chunk_type = ""
+        if item.loaded_document is not None:
+            chunk_type = str(item.loaded_document.document.metadata.get("chunk_type", ""))
         detail.add_row(
             item.action,
+            chunk_type,
             item.source_format,
             item.source_id,
             item.source_path,
@@ -450,18 +536,18 @@ def _print_retrieval_results(
     table = Table(title="Retrieved Sources")
     table.add_column("Rank", justify="right")
     table.add_column("Score", justify="right")
+    table.add_column("chunk_type")
     table.add_column("Source Format")
     table.add_column("Source ID")
-    table.add_column("Source Path")
     table.add_column("Preview")
     for rank, result in enumerate(results, start=1):
         score = "" if result.score is None else f"{result.score:.4f}"
         table.add_row(
             str(rank),
             score,
+            str(result.metadata.get("chunk_type", "")),
             str(result.metadata.get("source_format", "")),
             str(result.metadata.get("source_id", "")),
-            str(result.metadata.get("source_path", "")),
             _preview(result.text, preview_chars),
         )
     console.print(table)
@@ -479,17 +565,17 @@ def _print_sources(sources: list[RetrievalResult]) -> None:
     table = Table(title="Sources")
     table.add_column("Rank", justify="right")
     table.add_column("Score", justify="right")
+    table.add_column("chunk_type")
     table.add_column("Source Format")
     table.add_column("Source ID")
-    table.add_column("Source Path")
     for rank, source in enumerate(sources, start=1):
         score = "" if source.score is None else f"{source.score:.4f}"
         table.add_row(
             str(rank),
             score,
+            str(source.metadata.get("chunk_type", "")),
             str(source.metadata.get("source_format", "")),
             str(source.metadata.get("source_id", "")),
-            str(source.metadata.get("source_path", "")),
         )
     console.print(table)
 

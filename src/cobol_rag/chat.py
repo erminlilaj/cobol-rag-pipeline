@@ -18,12 +18,19 @@ class ChatTurn:
 class ChatSession:
     config: AppConfig
     top_k: int | None = None
+    chunk_types: list[str] | None = None
     max_history: int = 6
     turns: list[ChatTurn] = field(default_factory=list)
 
     def ask(self, message: str) -> QueryAnswer:
-        question = self._question_with_history(message)
-        answer = answer_query(question=question, config=self.config, top_k=self.top_k)
+        history = self._history_context()
+        answer = answer_query(
+            question=message,
+            config=self.config,
+            top_k=self.top_k,
+            chunk_types=self.chunk_types,
+            conversation_history=history,
+        )
         self.turns.append(
             ChatTurn(
                 user=message,
@@ -46,23 +53,11 @@ class ChatSession:
             return []
         return self.turns[-1].sources
 
-    def _question_with_history(self, message: str) -> str:
+    def _history_context(self) -> str | None:
         if not self.turns:
-            return message
+            return None
 
-        history = "\n".join(
+        return "\n".join(
             f"User: {turn.user}\nAssistant: {turn.assistant}"
             for turn in self.turns[-self.max_history :]
-        )
-        return "\n".join(
-            [
-                "Use this conversation history only to resolve follow-up references.",
-                "Do not treat conversation history as indexed evidence.",
-                "",
-                "Conversation history:",
-                history,
-                "",
-                "Current question:",
-                message,
-            ]
         )

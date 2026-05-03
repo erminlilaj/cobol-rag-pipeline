@@ -44,6 +44,7 @@ class IndexConfig:
     collection: str = "cobol-dev"
     chunk_mode: str = "pre_chunked"
     batch_size: int = 64
+    include_non_indexable: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,12 +52,15 @@ class RetrievalConfig:
     top_k: int = 6
     filters: dict[str, Any] = field(default_factory=dict)
     similarity_cutoff: float | None = None
+    mode: str = "hybrid"  # vector | bm25 | hybrid
+    bm25_top_k: int = 12
 
 
 @dataclass(frozen=True)
 class AnswerConfig:
     require_citations: bool = True
     show_sources: bool = True
+    system_prompt_path: str | None = "config/system_prompt.md"
 
 
 @dataclass(frozen=True)

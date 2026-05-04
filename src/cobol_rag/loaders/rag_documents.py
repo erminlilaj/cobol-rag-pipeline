@@ -14,6 +14,8 @@ from cobol_rag.loaders.base import (
 )
 
 
+MAX_EMBED_TEXT_CHARS = 600
+
 SCALAR_METADATA_TYPES = (str, int, float, bool)
 
 PIPELINE_METADATA_FIELDS = {
@@ -74,20 +76,31 @@ class RagDocumentsLoader:
                 metadata.setdefault("chunk_id", record_id)
                 metadata.setdefault("factory_record_id", record_id)
 
-            document = make_document(
-                text=text,
-                source_path=path,
-                source_format=self.name,
-                source_id=source_id,
-                extra_metadata=metadata,
-            )
-            loaded.append(
-                LoadedDocument(
-                    document=document,
-                    loader_name=self.name,
+            parts = self._split_text(text)
+            for part_index, part_text in enumerate(parts):
+                part_metadata = dict(metadata)
+                part_source_id = source_id
+                if len(parts) > 1:
+                    part_source_id = f"{source_id}:part{part_index + 1}"
+                    part_metadata["parent_source_id"] = source_id
+                    part_metadata["chunk_part_index"] = part_index
+                    part_metadata["chunk_part_count"] = len(parts)
+
+                document = make_document(
+                    text=part_text,
                     source_path=path,
+                    source_format=self.name,
+                    source_id=part_source_id,
+                    extra_metadata=part_metadata,
                 )
-            )
+                self._keep_metadata_out_of_embeddings(document)
+                loaded.append(
+                    LoadedDocument(
+                        document=document,
+                        loader_name=self.name,
+                        source_path=path,
+                    )
+                )
         return loaded
 
     def _read_records(self, path: Path) -> list[dict[str, Any]]:
@@ -203,3 +216,44 @@ class RagDocumentsLoader:
         if isinstance(value, int | float | bool):
             return str(value)
         return ""
+
+    def _split_text(self, text: str) -> list[str]:
+        """Keep each embedding request comfortably below local Ollama limits."""
+        compact = text.strip()
+        if len(compact) <= MAX_EMBED_TEXT_CHARS:
+            return [compact]
+
+        parts: list[str] = []
+        current: list[str] = []
+        current_length = 0
+        for line in compact.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            extra = len(line) + (1 if current else 0)
+            if current and current_length + extra > MAX_EMBED_TEXT_CHARS:
+                parts.append("\n".join(current))
+                current = []
+                current_length = 0
+
+            while len(line) > MAX_EMBED_TEXT_CHARS:
+                if current:
+                    parts.append("\n".join(current))
+                    current = []
+                    current_length = 0
+                parts.append(line[:MAX_EMBED_TEXT_CHARS])
+                line = line[MAX_EMBED_TEXT_CHARS:].lstrip()
+
+            if line:
+                current.append(line)
+                current_length += len(line) + (1 if current_length else 0)
+
+        if current:
+            parts.append("\n".join(current))
+        return parts or [compact[:MAX_EMBED_TEXT_CHARS]]
+
+    def _keep_metadata_out_of_embeddings(self, document: Any) -> None:
+        keep = {"program", "chunk_type", "title"}
+        document.excluded_embed_metadata_keys = [
+            key for key in document.metadata if key not in keep
+        ]

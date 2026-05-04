@@ -65,6 +65,26 @@ TESTS = [
         "semaphore restrictions.",
         ["ABEND00", "BROWSE-FASE2-TASTOER", "BROWSE-FASE2-NOTFND", "SQLERROR", "PXCSEMAF-STATUS"],
     ),
+    (
+        "generic_pf8_key",
+        "What happens when the user presses PF8 in PDCBVC?",
+        ["DFHPF8", "BROWSE-FASE2-PF8"],
+    ),
+    (
+        "generic_paragraph",
+        "Explain BROWSE-FASE2-ENTER in PDCBVC.",
+        ["BROWSE-FASE2-ENTER", "PREP-LINK-PD1FS00", "LINK-PD1VOCI"],
+    ),
+    (
+        "generic_call_target",
+        "Which parameters are passed to PD1FS00 in PDCBVC?",
+        ["COMMAREA=WPD1FS00", "LENGTH=PD1FS00-LUNGH", "PD1FS00-FUNZIONE"],
+    ),
+    (
+        "generic_variable",
+        "Where is TWCOB-VARCONT-NPAGINA set and used?",
+        ["TWCOB-VARCONT-NPAGINA", "BROWSE-FASE1", "BROWSE-FASE2-VISUAL"],
+    ),
 ]
 
 

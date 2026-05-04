@@ -306,14 +306,17 @@ def _literal_items(root: Path, program: str, paragraph: str | None = None) -> li
 
 
 def _call_by_target(root: Path, program: str, target: str) -> dict[str, Any] | None:
-    payload = _read_json(root / "architecture.call_parameters" / "architecture.call_parameters.json")
-    if not isinstance(payload, dict) or payload.get("program") != program:
-        return None
-    target = target.upper()
-    for call in payload.get("calls", []):
-        if isinstance(call, dict) and str(call.get("target", "")).upper() == target:
+    for call in _calls(root, program):
+        if str(call.get("target", "")).upper() == target.upper():
             return call
     return None
+
+
+def _calls(root: Path, program: str) -> list[dict[str, Any]]:
+    payload = _read_json(root / "architecture.call_parameters" / "architecture.call_parameters.json")
+    if not isinstance(payload, dict) or payload.get("program") != program:
+        return []
+    return [call for call in payload.get("calls", []) if isinstance(call, dict)]
 
 
 def _variable_payload(root: Path, program: str, variable: str) -> dict[str, Any] | None:
@@ -353,6 +356,41 @@ def _variables_in_question(question: str) -> list[str]:
         if token not in ignored and ("-" in token or token.startswith(("W", "PD", "TWCOB", "PX", "SQL"))):
             names.append(token)
     return list(dict.fromkeys(names))
+
+
+def _paragraph_names(root: Path, program: str) -> set[str]:
+    names: set[str] = set()
+    for edge in _cfg_edges(root, program):
+        for key in ("from", "to"):
+            value = str(edge.get(key, "")).strip().upper()
+            if value and value != program:
+                names.add(value)
+    for item in _literal_items(root, program):
+        paragraph = str(item.get("paragraph", "")).strip().upper()
+        if paragraph:
+            names.add(paragraph)
+    for call in _calls(root, program):
+        paragraph = str(call.get("paragraph", "")).strip().upper()
+        if paragraph:
+            names.add(paragraph)
+    return names
+
+
+def _paragraphs_in_question(root: Path, program: str, question: str) -> list[str]:
+    known = _paragraph_names(root, program)
+    found = [
+        token
+        for token in re.findall(r"\b[A-Z][A-Z0-9-]{2,}\b", question.upper())
+        if token in known
+    ]
+    return list(dict.fromkeys(found))
+
+
+def _call_target_in_question(root: Path, program: str, question: str) -> str | None:
+    targets = {str(call.get("target", "")).upper() for call in _calls(root, program)}
+    tokens = set(re.findall(r"\b[A-Z][A-Z0-9]{3,}\b", question.upper()))
+    matches = sorted(targets & tokens, key=len, reverse=True)
+    return matches[0] if matches else None
 
 
 def _comments_payload(root: Path, program: str) -> dict[str, Any] | None:
@@ -511,14 +549,21 @@ def _answer_structured_behavior(root: Path, program: str, question: str) -> str 
         return _answer_semaphore_flow(root, program)
     if _asks_about_browse_fase1_sequence(q):
         return _answer_paragraph_sequence(root, program, "BROWSE-FASE1", stop_at="SEND-PDCBVC1")
-    if _asks_about_call_preparation(q, "PD1VOCI"):
-        return _answer_call_preparation(root, program, "PD1VOCI")
+    call_target = _call_target_in_question(root, program, question)
+    if call_target and _asks_about_call_details(q):
+        return _answer_call_preparation(root, program, call_target)
     if _asks_about_pagination(q):
         return _answer_pagination(root, program)
     if _asks_about_row_selection(q):
         return _answer_row_selection(root, program)
     if _asks_about_pf_key_comparison(q):
         return _answer_pf_key_comparison(root, program)
+    paragraphs = _paragraphs_in_question(root, program, question)
+    if paragraphs and _asks_about_paragraph_behavior(q):
+        return _answer_paragraph_behavior(root, program, paragraphs[0])
+    key_answer = _answer_key_flow(root, program, question)
+    if key_answer:
+        return key_answer
     if _asks_about_variable_behavior(q):
         return _answer_variables_from_question(root, program, question)
     return None
@@ -543,8 +588,28 @@ def _asks_about_call_preparation(q: str, target: str) -> bool:
     return target.lower() in q and any(term in q for term in ("prepare", "prepared", "parameter", "influence", "commarea"))
 
 
+def _asks_about_call_details(q: str) -> bool:
+    return any(
+        term in q
+        for term in (
+            "call",
+            "calls",
+            "called",
+            "parameter",
+            "parameters",
+            "passed",
+            "prepare",
+            "prepared",
+            "commarea",
+            "length",
+            "link",
+            "xctl",
+        )
+    )
+
+
 def _asks_about_pagination(q: str) -> bool:
-    return any(term in q for term in ("pagination", "page", "pf7", "pf8")) and any(
+    return any(term in q for term in ("pagination", "page", "wctpag", "npagt", "npagina")) and any(
         term in q for term in ("enter", "pf7", "pf8", "wctpag", "npagt", "npagina")
     )
 
@@ -560,11 +625,62 @@ def _asks_about_pf_key_comparison(q: str) -> bool:
 
 
 def _asks_about_error_paths(q: str) -> bool:
-    return any(term in q for term in ("error message", "abnormal", "abend", "abnormal termination", "failed service", "invalid function"))
+    return any(
+        term in q
+        for term in (
+            "error message",
+            "abnormal",
+            "abend",
+            "abnormal termination",
+            "failed service",
+            "invalid function",
+            "invalid key",
+            "missing record",
+            "invalid selection",
+            "sql error",
+            "sqlerror",
+            "restriction",
+        )
+    )
 
 
 def _asks_about_variable_behavior(q: str) -> bool:
-    return any(term in q for term in ("how is", "where is", "what feeds", "calculated", "maintained")) and bool(_variables_in_question(q))
+    return any(
+        term in q
+        for term in (
+            "how is",
+            "where is",
+            "what feeds",
+            "who feeds",
+            "calculated",
+            "maintained",
+            "set",
+            "used",
+            "read",
+            "written",
+            "modified",
+            "origin",
+            "value of",
+        )
+    ) and bool(_variables_in_question(q))
+
+
+def _asks_about_paragraph_behavior(q: str) -> bool:
+    return any(
+        term in q
+        for term in (
+            "what happens",
+            "explain",
+            "sequence",
+            "flow",
+            "logic",
+            "do in",
+            "does",
+            "operations",
+            "before",
+            "after",
+        )
+    )
 
 
 def _answer_phase_decision(root: Path, program: str) -> str | None:
@@ -679,6 +795,14 @@ def _answer_call_preparation(root: Path, program: str, target: str) -> str | Non
             or str(variable.get("variable", "")).upper().startswith(f"{target}-LIQUID")
         ]
         if not selected:
+            selected = [
+                variable for variable in variables
+                if variable.get("writes_before_call") or variable.get("reads_before_call")
+            ][:8]
+        if not selected:
+            field_prefix = detail.get("field_prefix")
+            if field_prefix:
+                lines.append(f"- parameter detail `{field_prefix}` has no per-field write evidence in this artifact.")
             continue
         lines.append("- prepared fields:")
         for variable in selected[:18]:
@@ -791,6 +915,147 @@ def _answer_pf_key_comparison(root: Path, program: str) -> str | None:
             f"at line {call.get('line_start')}."
         )
     return "\n".join(lines)
+
+
+def _answer_key_flow(root: Path, program: str, question: str) -> str | None:
+    keys = _key_tokens_in_question(question)
+    if not keys:
+        return None
+
+    nav = _read_json(root / "ui.cics.navigation" / "ui.cics.navigation.json")
+    actions = []
+    if isinstance(nav, dict) and nav.get("program") == program:
+        actions = [
+            action for action in nav.get("content", {}).get("actions", [])
+            if action.get("key") in keys
+        ]
+
+    edges = [
+        edge for edge in _cfg_edges(root, program)
+        if any(key in str(edge.get("condition", "")) for key in keys)
+    ]
+    if not actions and not edges:
+        return None
+
+    lines = [f"{program} key/navigation flow for {', '.join(keys)}:"]
+    for action in actions:
+        target = str(action.get("target", ""))
+        lines.append(
+            f"- UI action: `{action.get('context')}` key `{action.get('key')}` -> "
+            f"`{target}` ({action.get('edge_type')}; {action.get('evidence')})."
+        )
+        for edge in [
+            edge for edge in _cfg_edges(root, program)
+            if str(edge.get("from", "")).upper() == target.upper()
+        ][:6]:
+            condition = edge.get("condition") or "unconditional"
+            lines.append(
+                f"  - then `{target}` -> `{edge.get('to')}` when "
+                f"`{condition}` ({edge.get('evidence', '')})."
+            )
+    for edge in edges[:12]:
+        condition = edge.get("condition") or "unconditional"
+        lines.append(
+            f"- CFG edge: `{edge.get('from')}` -> `{edge.get('to')}` when "
+            f"`{condition}` ({edge.get('evidence', '')})."
+        )
+    return "\n".join(lines)
+
+
+def _key_tokens_in_question(question: str) -> list[str]:
+    q = question.lower()
+    mapping = {
+        "enter": "DFHENTER",
+        "pf1": "DFHPF1",
+        "pf2": "DFHPF2",
+        "pf3": "DFHPF3",
+        "pf4": "DFHPF4",
+        "pf5": "DFHPF5",
+        "pf6": "DFHPF6",
+        "pf7": "DFHPF7",
+        "pf8": "DFHPF8",
+        "pf9": "DFHPF9",
+        "pf10": "DFHPF10",
+        "pf11": "DFHPF11",
+        "pf12": "DFHPF12",
+    }
+    keys = [target for token, target in mapping.items() if re.search(rf"\b{re.escape(token)}\b", q)]
+    keys.extend(re.findall(r"\bDFH(?:ENTER|PF\d+)\b", question.upper()))
+    return list(dict.fromkeys(keys))
+
+
+def _answer_paragraph_behavior(root: Path, program: str, paragraph: str) -> str | None:
+    paragraph = paragraph.upper()
+    edges = _cfg_edges(root, program)
+    outgoing = [edge for edge in edges if str(edge.get("from", "")).upper() == paragraph]
+    incoming = [edge for edge in edges if str(edge.get("to", "")).upper() == paragraph]
+    literals = _literal_items(root, program, paragraph=paragraph)
+    calls = [call for call in _calls(root, program) if str(call.get("paragraph", "")).upper() == paragraph]
+    variable_sites = _paragraph_variable_sites(root, program, paragraph)
+
+    if not outgoing and not incoming and not literals and not calls and not variable_sites:
+        return None
+
+    lines = [f"{program} paragraph `{paragraph}` behavior from `final_scripts`:"]
+    if incoming:
+        lines.append("- incoming control-flow:")
+        for edge in incoming[:8]:
+            condition = edge.get("condition") or "unconditional"
+            lines.append(f"  - `{edge.get('from')}` -> `{paragraph}` when `{condition}` ({edge.get('evidence', '')})")
+    if outgoing:
+        lines.append("- outgoing control-flow:")
+        for edge in outgoing[:12]:
+            condition = edge.get("condition") or "unconditional"
+            lines.append(f"  - `{paragraph}` -> `{edge.get('to')}` when `{condition}` ({edge.get('evidence', '')})")
+    if calls:
+        lines.append("- external/service calls:")
+        for call in calls:
+            params = ", ".join(call.get("parameters", [])) or "no explicit parameter"
+            lines.append(
+                f"  - line {call.get('line_start')}: `{call.get('call_type')}` -> "
+                f"`{call.get('target')}` with {params}"
+            )
+    if literals:
+        lines.append("- literal assignments:")
+        for item in literals[:12]:
+            lines.append(
+                f"  - line {item.get('line')}: `{item.get('target_variable')}` = "
+                f"{item.get('literal')}"
+            )
+    if variable_sites:
+        lines.append("- variable evidence in this paragraph:")
+        for site in variable_sites[:12]:
+            lines.append(
+                f"  - {site['kind']} `{site['variable']}` line {site['line']}: {site['statement']}"
+            )
+    return "\n".join(lines)
+
+
+def _paragraph_variable_sites(root: Path, program: str, paragraph: str) -> list[dict[str, str]]:
+    sites: list[dict[str, str]] = []
+    dataflow_dir = root / "dataflow.variable"
+    if not dataflow_dir.exists():
+        return sites
+    for path in sorted(dataflow_dir.glob("dataflow.variable.*.json")):
+        payload = _read_json(path)
+        if not isinstance(payload, dict) or payload.get("program") != program:
+            continue
+        variable = str(payload.get("content", {}).get("variable", "")).upper()
+        evidence = payload.get("content", {}).get("evidence", {})
+        for kind, key in (("write", "write_sites"), ("read", "read_sites"), ("control", "control_sites")):
+            for site in evidence.get(key, []):
+                if str(site.get("paragraph", "")).upper() != paragraph:
+                    continue
+                sites.append(
+                    {
+                        "kind": kind,
+                        "variable": variable,
+                        "line": str(site.get("line_start", "?")),
+                        "statement": str(site.get("statement", "")).strip(),
+                    }
+                )
+                break
+    return sites
 
 
 def _answer_error_paths(root: Path, program: str) -> str | None:

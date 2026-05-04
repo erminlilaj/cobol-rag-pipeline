@@ -18,12 +18,18 @@ class ChatTurn:
 class ChatSession:
     config: AppConfig
     top_k: int | None = None
+    chunk_types: list[str] | None = None
     max_history: int = 6
     turns: list[ChatTurn] = field(default_factory=list)
 
     def ask(self, message: str) -> QueryAnswer:
         question = self._question_with_history(message)
-        answer = answer_query(question=question, config=self.config, top_k=self.top_k)
+        answer = answer_query(
+            question=question,
+            config=self.config,
+            top_k=self.top_k,
+            chunk_types=self.chunk_types,
+        )
         self.turns.append(
             ChatTurn(
                 user=message,

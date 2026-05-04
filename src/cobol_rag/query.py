@@ -26,6 +26,7 @@ def answer_query(
     question: str,
     config: AppConfig,
     top_k: int | None = None,
+    chunk_types: list[str] | None = None,
 ) -> QueryAnswer:
     current_question = _current_question(question)
     local_answer = _try_local_answer(current_question)
@@ -48,7 +49,7 @@ def answer_query(
         )
 
     try:
-        sources = retrieve(question, config=config, top_k=top_k)
+        sources = retrieve(question, config=config, top_k=top_k, chunk_types=chunk_types)
     except Exception:
         return QueryAnswer(
             question=question,
@@ -65,6 +66,7 @@ def answer_query(
                 f"{current_question} program.comments commented_out_code classification_counts dead_code unused_copybooks",
                 config=config,
                 top_k=max(top_k or config.retrieval.top_k, 12),
+                chunk_types=chunk_types,
             )
             sources = _merge_sources(targeted_sources, sources)
         except Exception:

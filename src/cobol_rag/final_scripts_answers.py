@@ -9,11 +9,19 @@ from typing import Any
 
 def answer_from_final_scripts(question: str) -> str | None:
     root = find_final_scripts_root()
-    program = program_from_question(question)
-    if root is None or program is None:
+    if root is None:
+        return None
+
+    program = _program_for_question(root, question)
+    if program is None:
         return None
 
     q = question.lower()
+
+    if _asks_about_copybooks(q) and "unused" in q:
+        answer = _answer_copybooks(root, program, q)
+        if answer:
+            return answer
 
     if _asks_about_lines_or_counts(q):
         answer = _answer_counts(root, program, q)
@@ -47,6 +55,11 @@ def answer_from_final_scripts(question: str) -> str | None:
 
     if _asks_about_datasets(q):
         return _answer_datasets(root, program)
+
+    if _asks_about_screen_field_lineage(q):
+        answer = _answer_screen_field_lineage(root, program, question)
+        if answer:
+            return answer
 
     if _asks_about_ui_navigation(q):
         answer = _answer_ui_navigation(root, program)
@@ -139,6 +152,71 @@ def program_from_question(question: str) -> str | None:
     return max(candidates, key=len)
 
 
+def _program_for_question(root: Path, question: str) -> str | None:
+    candidate = program_from_question(question)
+    core_programs = _core_programs_from_root(root)
+    if candidate and candidate in core_programs:
+        return candidate
+    return _primary_program_from_root(root) or candidate
+
+
+def _default_program_from_root(root: Path) -> str | None:
+    primary = _primary_program_from_root(root)
+    if primary:
+        return primary
+    programs = _programs_from_root(root)
+    if len(programs) == 1:
+        return next(iter(programs))
+    return None
+
+
+def _primary_program_from_root(root: Path) -> str | None:
+    programs = _core_programs_from_root(root)
+    if not programs:
+        return None
+    return sorted(programs)[0]
+
+
+def _core_programs_from_root(root: Path) -> set[str]:
+    programs: set[str] = set()
+    for relative in (
+        "program_summary/program.summary.json",
+        "program.comments/program.comments.json",
+        "architecture.copybooks/architecture.copybooks.json",
+        "architecture.call_parameters/architecture.call_parameters.json",
+        "dataflow.literal_assignments/dataflow.literal_assignments.json",
+        "dataflow.used_variables/dataflow.used_variables.json",
+    ):
+        payload = _read_json(root / relative)
+        if isinstance(payload, dict):
+            program = str(payload.get("program", "")).strip().upper()
+            if program and program != "__GLOBAL__":
+                programs.add(program)
+    return programs
+
+
+def _programs_from_root(root: Path) -> set[str]:
+    programs: set[str] = set()
+    for relative in (
+        "program_summary/program.summary.json",
+        "program.comments/program.comments.json",
+        "architecture.copybooks/architecture.copybooks.json",
+        "architecture.call_parameters/architecture.call_parameters.json",
+    ):
+        payload = _read_json(root / relative)
+        if isinstance(payload, dict):
+            program = str(payload.get("program", "")).strip().upper()
+            if program and program != "__GLOBAL__":
+                programs.add(program)
+    for path in root.glob("**/*.json"):
+        payload = _read_json(path)
+        if isinstance(payload, dict):
+            program = str(payload.get("program", "")).strip().upper()
+            if program and program != "__GLOBAL__":
+                programs.add(program)
+    return programs
+
+
 def _asks_about_lines_or_counts(q: str) -> bool:
     return any(term in q for term in ("how many", "number of", "count", "loc", "lines"))
 
@@ -169,6 +247,28 @@ def _asks_about_datasets(q: str) -> bool:
 
 def _asks_about_ui_navigation(q: str) -> bool:
     return any(term in q for term in ("pf key", "pfkey", "screen", "map", "navigation", "cics key", "eibaid"))
+
+
+def _asks_about_screen_field_lineage(q: str) -> bool:
+    has_screen_term = any(term in q for term in ("screen", "map", "field"))
+    has_lineage_term = any(
+        term in q
+        for term in (
+            "connected",
+            "connection",
+            "variable",
+            "variables",
+            "origin",
+            "data origin",
+            "computation",
+            "computed",
+            "calculated",
+            "modified",
+            "defined",
+            "feeds",
+        )
+    )
+    return has_screen_term and has_lineage_term
 
 
 def _asks_about_business_rules(q: str) -> bool:
@@ -264,7 +364,13 @@ def _answer_commented_code(root: Path, program: str, q: str) -> str | None:
         comment for comment in comments.get("comments", [])
         if comment.get("classification") == "commented_out_code"
     ]
-    lines = [f"Commented-out code/data found in {program}: {len(commented)} item(s)."]
+    if "dead code" in q or "unreachable" in q:
+        lines = [
+            f"I do not have a dedicated unreachable-code proof for {program}.",
+            f"The available comments analysis flags commented-out code/data: {len(commented)} item(s).",
+        ]
+    else:
+        lines = [f"Commented-out code/data found in {program}: {len(commented)} item(s)."]
     for comment in commented[:20]:
         lines.append(f"- line {comment.get('line')}: {str(comment.get('text_raw') or comment.get('text', '')).strip()}")
     if "copy" in q:
@@ -339,13 +445,96 @@ def _answer_copybooks(root: Path, program: str, q: str) -> str | None:
             "This is not a full unused-copybook proof; it compares COPY members against dataflow variable origins.",
             f"- COPY members listed: {', '.join(all_copybooks)}",
             f"- COPY members with variables referenced in dataflow: {', '.join(sorted(used_origins)) or 'none'}",
-            f"- Need review / possibly unused by this heuristic: {', '.join(heuristic_unused) or 'none'}",
+            f"- Need review / possibly unused by this heuristic ({len(heuristic_unused)}): {', '.join(heuristic_unused) or 'none'}",
         ]
         return "\n".join(lines)
     lines = [f"{program} COPY members ({len(all_copybooks)}): {', '.join(all_copybooks)}."]
     for category, names in classified.items():
         lines.append(f"- {category}: {', '.join(names)}")
     return "\n".join(lines)
+
+
+def _answer_screen_field_lineage(root: Path, program: str, question: str) -> str | None:
+    variables = _screen_variables(root, program)
+    if not variables:
+        return None
+
+    by_name = {str(item.get("content", {}).get("variable", "")).upper(): item for item in variables}
+    tokens = [
+        token
+        for token in re.findall(r"\b[A-Z][A-Z0-9-]{2,}\b", question.upper())
+        if token not in {"PDCBVC", "SCREEN", "FIELD", "MAP", "DATA", "ORIGIN", "COMPUTATION", "VARIABLE"}
+    ]
+    exact = next((token for token in tokens if token in by_name), None)
+    if exact:
+        return _format_variable_lineage(program, by_name[exact])
+
+    related = []
+    for token in tokens:
+        related.extend(name for name in by_name if name.startswith(token) or token.startswith(name))
+    related = sorted(set(related))
+    if related:
+        lines = [f"I found several {program} screen/map variables matching the field reference:"]
+        for name in related[:10]:
+            content = by_name[name].get("content", {})
+            lines.append(
+                f"- {name}: origin {content.get('origin', '?')}; "
+                f"defined in {_join_or_none(content.get('defined_in', []))}; "
+                f"modified in {_join_or_none(content.get('modified_in', []))}; "
+                f"used in {_join_or_none(content.get('used_in', []))}"
+            )
+        lines.append("Ask again with one exact field name to get the full origin/computation trace.")
+        return "\n".join(lines)
+
+    candidate_names = sorted(by_name)[:20]
+    return (
+        "I need the concrete map field name to trace data origin/computation safely. "
+        f"For {program}, the screen/map variables I can trace from COPY `PDCBVCM` include: "
+        f"{', '.join(candidate_names)}. "
+        "Ask for one field, for example: `What feeds SCELTAI on the screen?`"
+    )
+
+
+def _screen_variables(root: Path, program: str) -> list[dict[str, Any]]:
+    variables: list[dict[str, Any]] = []
+    for path in sorted((root / "dataflow.variable").glob("dataflow.variable.*.json")):
+        payload = _read_json(path)
+        if not isinstance(payload, dict) or payload.get("program") != program:
+            continue
+        content = payload.get("content", {})
+        origin = str(content.get("origin", "")).upper()
+        if origin == "COPY:PDCBVCM":
+            variables.append(payload)
+    return variables
+
+
+def _format_variable_lineage(program: str, payload: dict[str, Any]) -> str:
+    content = payload.get("content", {})
+    variable = content.get("variable", "?")
+    lines = [
+        f"{program} screen/map field `{variable}`:",
+        f"- origin: {content.get('origin', '?')}",
+        f"- defined in: {_join_or_none(content.get('defined_in', []))}",
+        f"- modified in: {_join_or_none(content.get('modified_in', []))}",
+        f"- used in: {_join_or_none(content.get('used_in', []))}",
+        f"- controls flow: {'yes' if content.get('controls_flow') else 'no'}",
+    ]
+    evidence = content.get("evidence", {})
+    for label, key in (("writes", "write_sites"), ("reads", "read_sites"), ("controls", "control_sites")):
+        sites = evidence.get(key, [])
+        if not sites:
+            continue
+        lines.append(f"- {label}:")
+        for site in sites[:6]:
+            line = site.get("line_start", "?")
+            paragraph = site.get("paragraph", "?")
+            statement = str(site.get("statement", "")).strip()
+            lines.append(f"  - line {line} {paragraph}: {statement}")
+    return "\n".join(lines)
+
+
+def _join_or_none(values: list[Any]) -> str:
+    return ", ".join(str(value) for value in values) if values else "none"
 
 
 def _copybook_origins_from_dataflow(root: Path, program: str) -> set[str]:

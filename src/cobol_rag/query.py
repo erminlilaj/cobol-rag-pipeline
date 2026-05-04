@@ -106,12 +106,13 @@ def _current_question(question: str) -> str:
 
 def _try_local_answer(question: str) -> str | None:
     text = question.strip().lower()
+    normalized = text.strip(" ?.!").strip()
     if text in {"hi", "hello", "hey", "ciao", "salve", "buongiorno", "good morning", "good afternoon"}:
         return (
             "Hi. I can help you inspect the indexed COBOL analysis. "
             "Try asking about called programs, COMMAREA parameters, forced values, DB2 tables, copybooks, or screen fields."
         )
-    if text in {"what are you", "who are you", "what can you do", "help", "how can you help"}:
+    if normalized in {"what are you", "who are you", "what can you do", "help", "how can you help"}:
         return (
             "I am a local COBOL RAG assistant for this workspace. I search the indexed analysis artifacts and use them "
             "to answer questions about programs, calls, COMMAREA parameters, variables, DB2 tables, copybooks, comments, "
@@ -149,6 +150,11 @@ def _is_cobol_question(question: str) -> bool:
         "field",
         "hardcoded",
         "forced value",
+        "unused",
+        "dead code",
+        "commented code",
+        "commented-out",
+        "commented out",
         "literal",
         "call",
         "called",

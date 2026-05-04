@@ -247,6 +247,54 @@ Expected result:
 
 Use reset when changing embedding models, clearing experiments, or rebuilding a collection from scratch.
 
+## Final Scripts Enrichment Workflow
+
+The detailed `final_scripts/` bundle is the evidence source for questions that
+need deterministic analysis instead of a generic LLM guess. Some useful
+question classes are not always present as first-class artifacts in the bundle,
+so the pipeline can derive normalized review artifacts from the existing JSON
+files.
+
+Preview the derived artifacts:
+
+```bash
+cobol-rag enrich-final-scripts --root /path/to/final_scripts --program PDCBVC --dry-run
+```
+
+Write them back into the bundle:
+
+```bash
+cobol-rag enrich-final-scripts --root /path/to/final_scripts --program PDCBVC --apply
+```
+
+If the bundle is outside the repository, set the environment variable once:
+
+```bash
+export COBOL_RAG_FINAL_SCRIPTS_DIR="/path/to/final_scripts"
+cobol-rag enrich-final-scripts --program PDCBVC --dry-run
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:COBOL_RAG_FINAL_SCRIPTS_DIR="C:\path\to\final_scripts"
+cobol-rag enrich-final-scripts --program PDCBVC --dry-run
+```
+
+Current derived artifact types:
+
+- `quality.dead_code`: separates commented-out code from CFG reachability.
+- `architecture.unused_copybooks`: compares COPY members with available
+  variable/call evidence and reports proof level, so the assistant does not
+  overclaim unused copybooks.
+- `jcl.file_io`: maps JCL jobs, steps, DD reads, writes, and SYSOUT evidence to
+  matching batch programs when the JCL artifacts contain that linkage.
+
+These artifacts are also built in memory by direct-answer code when possible,
+so the UI can answer common review questions even before `--apply` is run.
+Writing them is still useful because it makes the evidence explicit and easier
+to inspect, sync, and evaluate.
+
 ## Retrieval Debug Workflow
 
 Retrieval debug checks what evidence the vector database returns before any LLM answer is generated.

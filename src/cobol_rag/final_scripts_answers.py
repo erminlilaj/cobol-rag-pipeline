@@ -6,6 +6,13 @@ import re
 from pathlib import Path
 from typing import Any
 
+from cobol_rag.final_scripts_artifacts import (
+    load_or_build_jcl_file_io,
+    load_or_build_quality_dead_code,
+    load_or_build_unused_copybooks,
+    program_has_jcl_evidence,
+)
+
 
 def answer_from_final_scripts(question: str) -> str | None:
     root = find_final_scripts_root()
@@ -161,6 +168,8 @@ def _program_for_question(root: Path, question: str) -> str | None:
     core_programs = _core_programs_from_root(root)
     if candidate and candidate in core_programs:
         return candidate
+    if candidate and program_has_jcl_evidence(root, candidate):
+        return candidate
     return _primary_program_from_root(root) or candidate
 
 
@@ -226,7 +235,7 @@ def _asks_about_lines_or_counts(q: str) -> bool:
 
 
 def _asks_about_dead_or_commented_code(q: str) -> bool:
-    return any(term in q for term in ("unused code", "dead code", "commented-out", "commented out", "commented code"))
+    return any(term in q for term in ("unused code", "dead code", "unreachable", "commented-out", "commented out", "commented code"))
 
 
 def _asks_about_calls(q: str) -> bool:
@@ -466,22 +475,26 @@ def _extract_paragraph_count(summary: dict[str, Any] | None) -> int | None:
 
 
 def _answer_commented_code(root: Path, program: str, q: str) -> str | None:
-    comments = _comments_payload(root, program)
-    if not comments:
-        return None
-    commented = [
-        comment for comment in comments.get("comments", [])
-        if comment.get("classification") == "commented_out_code"
-    ]
+    artifact = load_or_build_quality_dead_code(root, program)
+    content = artifact.get("content", {})
+    commented = content.get("commented_out_code", [])
+    if not isinstance(commented, list):
+        commented = []
+    reachability = content.get("cfg_reachability", {})
     if "dead code" in q or "unreachable" in q:
         lines = [
-            f"I do not have a dedicated unreachable-code proof for {program}.",
-            f"The available comments analysis flags commented-out code/data: {len(commented)} item(s).",
+            f"{program} dead-code evidence from `quality.dead_code`:",
+            f"- commented-out code/data: {len(commented)} item(s).",
+            (
+                f"- CFG reachability: {reachability.get('unreachable_nodes_count', 0)} unreachable "
+                f"paragraph/node(s) among {reachability.get('nodes_count', 0)} CFG nodes."
+            ),
+            "- Limitation: static CFG reachability is not a runtime execution proof.",
         ]
     else:
         lines = [f"Commented-out code/data found in {program}: {len(commented)} item(s)."]
     for comment in commented[:20]:
-        lines.append(f"- line {comment.get('line')}: {str(comment.get('text_raw') or comment.get('text', '')).strip()}")
+        lines.append(f"- line {comment.get('line')}: {str(comment.get('text', '')).strip()}")
     if "copy" in q:
         copy_answer = _answer_copybooks(root, program, q)
         if copy_answer:
@@ -1123,14 +1136,20 @@ def _answer_copybooks(root: Path, program: str, q: str) -> str | None:
     all_copybooks = content.get("all", [])
     classified = content.get("classified", {})
     if "unused" in q:
-        used_origins = _copybook_origins_from_dataflow(root, program)
-        heuristic_unused = [name for name in all_copybooks if name not in used_origins]
+        artifact = load_or_build_unused_copybooks(root, program)
+        artifact_content = artifact.get("content", {})
+        referenced = artifact_content.get("referenced_copybooks", [])
+        needs_review = artifact_content.get("needs_review_copybooks", [])
         lines = [
-            f"{program} COPY usage heuristic:",
-            "This is not a full unused-copybook proof; it compares COPY members against dataflow variable origins.",
-            f"- COPY members listed: {', '.join(all_copybooks)}",
-            f"- COPY members with variables referenced in dataflow: {', '.join(sorted(used_origins)) or 'none'}",
-            f"- Need review / possibly unused by this heuristic ({len(heuristic_unused)}): {', '.join(heuristic_unused) or 'none'}",
+            f"{program} COPY usage heuristic from `architecture.unused_copybooks`:",
+            "This is not a full unused-copybook proof; it compares COPY members against available dataflow/call artifacts.",
+            f"- COPY members listed: {', '.join(artifact_content.get('all_copybooks', all_copybooks))}",
+            f"- COPY members with reference evidence: {', '.join(referenced) or 'none'}",
+            (
+                f"- Need review / possibly unused by this heuristic ({len(needs_review)}): "
+                f"{', '.join(needs_review) or 'none'}"
+            ),
+            "- Proven unused COPY members: none from the available artifacts.",
         ]
         return "\n".join(lines)
     lines = [f"{program} COPY members ({len(all_copybooks)}): {', '.join(all_copybooks)}."]
@@ -1304,19 +1323,37 @@ def _answer_db2_sql(root: Path, program: str) -> str | None:
 
 
 def _answer_datasets(root: Path, program: str) -> str:
-    matched_jobs: list[str] = []
-    for summary in (root / "jcl").glob("**/jcl.summary.json"):
-        payload = _read_json(summary)
-        if not isinstance(payload, dict):
-            continue
-        programs = {str(item).upper() for item in payload.get("programs", [])}
-        if program.upper() in programs:
-            matched_jobs.append(str(payload.get("job", summary.parent.name)))
-    if matched_jobs:
-        return f"{program} appears in JCL job(s): {', '.join(sorted(set(matched_jobs)))}. Check the job dataset artifacts for inputs/outputs."
+    artifact = load_or_build_jcl_file_io(root, program)
+    content = artifact.get("content", {})
+    if content.get("has_jcl_linkage"):
+        lines = [f"{program} JCL file-I/O evidence from `jcl.file_io`:"]
+        jobs = content.get("matching_jobs", [])
+        if jobs:
+            lines.append("- matching job(s): " + ", ".join(str(job.get("job")) for job in jobs))
+        reads = content.get("reads", [])
+        writes = content.get("writes", [])
+        sysout = content.get("sysout", [])
+        if reads:
+            lines.append(f"- reads ({len(reads)}):")
+            for item in reads[:10]:
+                lines.append(f"  - {item.get('job')}/{item.get('step')} {item.get('ddname')}: {item.get('dsn')}")
+        if writes:
+            lines.append(f"- writes/produces ({len(writes)}):")
+            for item in writes[:10]:
+                lines.append(f"  - {item.get('job')}/{item.get('step')} {item.get('ddname')}: {item.get('dsn')}")
+        if sysout:
+            lines.append(f"- SYSOUT outputs ({len(sysout)}):")
+            for item in sysout[:8]:
+                lines.append(f"  - {item.get('job')}/{item.get('step')} {item.get('ddname')}: SYSOUT={item.get('sysout')} OUTPUT={item.get('output')}")
+        return "\n".join(lines)
+
+    known_jobs = content.get("known_jobs", [])
+    known_programs = content.get("known_programs_sample", [])
     return (
-        f"I found no JCL dataset/file-I/O artifact connecting {program} to produced datasets in `final_scripts`. "
-        "For this PDCBVC index, dataset production is not evidenced; it looks like a CICS/DB2 program rather than a batch dataset producer."
+        f"`jcl.file_io` found no JCL dataset/file-I/O linkage for {program}. "
+        "Produced datasets are not evidenced for this program in the available final_scripts artifacts. "
+        f"Known JCL job(s) in the artifact set: {', '.join(known_jobs) or 'none'}. "
+        f"Known batch program sample: {', '.join(known_programs[:10]) or 'none'}."
     )
 
 

@@ -235,7 +235,16 @@
       "category": "dead_code",
       "question": "Is there any unused code/copy in this PDCBVC?",
       "assertions": {
-        "contains_all": ["Commented-out code/data found", "15 item", "line 433", "COPY usage heuristic", "DFHBMSCA", "PDRVC"],
+        "contains_all": ["Commented-out code/data found", "15 item", "line 433", "architecture.unused_copybooks", "DFHBMSCA", "PDRVC", "Proven unused COPY members: none"],
+        "forbidden": ["No, there is no dead code"]
+      }
+    },
+    {
+      "id": "dead_code.cfg_reachability",
+      "category": "dead_code",
+      "question": "Is there unreachable code in PDCBVC?",
+      "assertions": {
+        "contains_all": ["quality.dead_code", "commented-out code/data: 15", "0 unreachable", "CFG nodes", "not a runtime execution proof"],
         "forbidden": ["No, there is no dead code"]
       }
     },
@@ -252,8 +261,16 @@
       "category": "datasets",
       "question": "Which datasets does PDCBVC produce?",
       "assertions": {
-        "contains_all": ["no JCL dataset/file-I/O artifact", "PDCBVC", "not evidenced"],
+        "contains_all": ["jcl.file_io", "no JCL dataset/file-I/O linkage", "PDCBVC", "Produced datasets are not evidenced", "PDCAFIN2"],
         "forbidden": ["SYSOUT", "produces dataset"]
+      }
+    },
+    {
+      "id": "datasets.batch_program_outputs",
+      "category": "datasets",
+      "question": "Which datasets does PDHM730C produce?",
+      "assertions": {
+        "contains_all": ["PDHM730C JCL file-I/O evidence", "PDCAFIN2", "SKINPUT", "TEPDET.BVARIAZ.CAF", "FOUTPUT", "TEPDET.BVOCI.CAF", "SYSOUT outputs"]
       }
     },
     {

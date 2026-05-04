@@ -59,3 +59,21 @@ On Windows PowerShell:
 $env:COBOL_RAG_FINAL_SCRIPTS_DIR="C:\path\to\final_scripts"
 python eval\run_gold_eval.py
 ```
+
+## Artifact Enrichment
+
+Before evaluating review-style questions, preview the normalized artifacts that
+the assistant can derive from `final_scripts`:
+
+```bash
+cobol-rag enrich-final-scripts --root /path/to/final_scripts --program PDCBVC --dry-run
+```
+
+The current enrichment covers:
+
+- `quality.dead_code` for commented-out code and CFG reachability.
+- `architecture.unused_copybooks` for COPY members with no current reference evidence.
+- `jcl.file_io` for JCL DD read/write/SYSOUT evidence when a batch program is linked.
+
+Use `--apply` only when you want those generated JSON files written into the
+bundle. The direct-answer layer can still build them in memory for local tests.

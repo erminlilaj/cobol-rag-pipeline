@@ -11,6 +11,8 @@ from rich.table import Table
 from cobol_rag.bundle import list_bundle_chunks, resolve_index_path
 from cobol_rag.chat import ChatSession
 from cobol_rag.config import load_config
+from cobol_rag.final_scripts_answers import find_final_scripts_root
+from cobol_rag.final_scripts_artifacts import build_all_missing_artifacts, write_missing_artifacts
 from cobol_rag.index import collection_count, open_index
 from cobol_rag.loaders import LoaderError, load_path
 from cobol_rag.query import QueryAnswer, QueryError, answer_query
@@ -177,6 +179,62 @@ def sync(
     if not dry_run:
         apply_sync_plan(settings, plan)
     _print_sync_plan(plan)
+
+
+@app.command("enrich-final-scripts")
+def enrich_final_scripts(
+    root: Path | None = typer.Option(
+        None,
+        "--root",
+        help="final_scripts root. Defaults to COBOL_RAG_FINAL_SCRIPTS_DIR or auto-discovery.",
+    ),
+    program: str | None = typer.Option(
+        None,
+        "--program",
+        "-p",
+        help="Program to enrich. Defaults to the program_summary artifact when available.",
+    ),
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--apply",
+        help="Preview generated artifacts or write them into final_scripts.",
+    ),
+) -> None:
+    """Build normalized quality/file-I-O artifacts from existing final_scripts."""
+    final_scripts_root = root or find_final_scripts_root()
+    if final_scripts_root is None:
+        raise typer.BadParameter(
+            "Could not find final_scripts. Set COBOL_RAG_FINAL_SCRIPTS_DIR or pass --root."
+        )
+    final_scripts_root = final_scripts_root.resolve()
+    selected_program = (program or _program_from_final_scripts_root(final_scripts_root)).upper()
+    artifacts = build_all_missing_artifacts(final_scripts_root, selected_program)
+
+    if not dry_run:
+        written = write_missing_artifacts(final_scripts_root, selected_program)
+    else:
+        written = []
+
+    table = Table(title="Final Scripts Enrichment")
+    table.add_column("Metric")
+    table.add_column("Value")
+    table.add_row("root", str(final_scripts_root))
+    table.add_row("program", selected_program)
+    table.add_row("dry_run", str(dry_run))
+    table.add_row("artifacts", str(len(artifacts)))
+    table.add_row("write", "no" if dry_run else "yes")
+    console.print(table)
+
+    detail = Table(title="Generated Artifacts")
+    detail.add_column("Type")
+    detail.add_column("Summary")
+    for artifact_type, payload in artifacts.items():
+        detail.add_row(artifact_type, _artifact_summary(payload))
+    console.print(detail)
+
+    if written:
+        for path in written:
+            console.print(f"[green]wrote[/green] {path}")
 
 
 @app.command()
@@ -418,6 +476,50 @@ def _load_target(target: Path, settings, loader: str | None):
         return load_path(target, config=settings, loader_name=loader)
     except LoaderError as error:
         raise typer.BadParameter(str(error)) from error
+
+
+def _program_from_final_scripts_root(root: Path) -> str:
+    for relative in (
+        "program_summary/program.summary.json",
+        "program.comments/program.comments.json",
+        "architecture.copybooks/architecture.copybooks.json",
+    ):
+        path = root / relative
+        if not path.exists():
+            continue
+        try:
+            import json
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        program = str(payload.get("program", "")).strip().upper()
+        if program and program != "__GLOBAL__":
+            return program
+    raise typer.BadParameter("Could not infer program from final_scripts. Pass --program.")
+
+
+def _artifact_summary(payload: dict) -> str:
+    content = payload.get("content", {})
+    artifact_type = payload.get("type")
+    if artifact_type == "quality.dead_code":
+        reachability = content.get("cfg_reachability", {})
+        return (
+            f"commented_out={content.get('commented_out_code_count', 0)}, "
+            f"unreachable={reachability.get('unreachable_nodes_count', 0)}"
+        )
+    if artifact_type == "architecture.unused_copybooks":
+        return (
+            f"copybooks={content.get('copybooks_total', 0)}, "
+            f"referenced={len(content.get('referenced_copybooks', []))}, "
+            f"needs_review={content.get('needs_review_count', 0)}"
+        )
+    if artifact_type == "jcl.file_io":
+        return (
+            f"matching_jobs={content.get('matching_jobs_count', 0)}, "
+            f"reads={len(content.get('reads', []))}, writes={len(content.get('writes', []))}"
+        )
+    return str(payload.get("title", ""))
 
 
 def _preview(text: str, limit: int) -> str:

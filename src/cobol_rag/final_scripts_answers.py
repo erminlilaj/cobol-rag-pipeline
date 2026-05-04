@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -61,9 +62,17 @@ def answer_from_final_scripts(question: str) -> str | None:
 
 
 def find_final_scripts_root() -> Path | None:
+    configured = os.environ.get("COBOL_RAG_FINAL_SCRIPTS_DIR")
+    if configured:
+        path = Path(configured).expanduser().resolve()
+        if path.exists():
+            return path
+
     cwd = Path.cwd().resolve()
     for base in (cwd, *cwd.parents):
         candidates = [
+            base / "final_scripts",
+            base / "data" / "final_scripts",
             base / "control_flow" / "artifacts" / "final" / "final_scripts",
             base.parent / "control_flow" / "artifacts" / "final" / "final_scripts",
             base / "artifacts" / "final" / "final_scripts",

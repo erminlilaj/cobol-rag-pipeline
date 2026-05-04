@@ -1,0 +1,278 @@
+{
+  "schema_version": 1,
+  "suite": "pdcbvc_gold",
+  "program": "PDCBVC",
+  "description": "Gold evaluation set for the PDCBVC COBOL RAG assistant. The suite separates deterministic final_scripts questions from RAG/LLM questions that require a live index and Ollama.",
+  "defaults": {
+    "requirements": ["final_scripts"],
+    "case_sensitive": false,
+    "top_k": null
+  },
+  "cases": [
+    {
+      "id": "assistant.greeting",
+      "category": "assistant",
+      "question": "hi",
+      "requirements": [],
+      "assertions": {
+        "contains_all": ["COBOL RAG assistant", "called programs", "COMMAREA"],
+        "forbidden": ["configured Ollama model", "I cannot search"]
+      }
+    },
+    {
+      "id": "assistant.identity",
+      "category": "assistant",
+      "question": "who are you",
+      "requirements": [],
+      "assertions": {
+        "contains_all": ["local COBOL RAG assistant", "indexed analysis artifacts", "control flow"],
+        "forbidden": ["I cannot search", "not responding"]
+      }
+    },
+    {
+      "id": "metadata.line_count",
+      "category": "metadata",
+      "question": "How many code lines is PDCBVC?",
+      "assertions": {
+        "contains_all": ["912 total physical source lines", "392 LOC", "14 paragraphs", "65 comment lines", "15 comments"],
+        "forbidden": ["not provided", "conversation history"]
+      }
+    },
+    {
+      "id": "metadata.copybook_count",
+      "category": "metadata",
+      "question": "How many copybooks does PDCBVC use?",
+      "assertions": {
+        "contains_all": ["12 COPY members", "DFHAID", "PD1FS00", "PDCBVCM", "PXCSEMAF"],
+        "forbidden": ["cannot confirm", "not provided"]
+      }
+    },
+    {
+      "id": "metadata.call_count",
+      "category": "metadata",
+      "question": "How many outgoing calls does PDCBVC have?",
+      "assertions": {
+        "contains_all": ["5 outgoing calls", "architecture.call_parameters.json"]
+      }
+    },
+    {
+      "id": "metadata.literal_count",
+      "category": "metadata",
+      "question": "How many forced values does PDCBVC have?",
+      "assertions": {
+        "contains_all": ["65 literal assignments", "dataflow.literal_assignments.json"]
+      }
+    },
+    {
+      "id": "calls.all_parameters",
+      "category": "calls",
+      "question": "Which programs does PDCBVC call and with which parameters?",
+      "assertions": {
+        "contains_all": ["PD1VOCI", "WPD1VOCI", "PD1FS00", "WPD1FS00", "PXRSEMAF", "PXCSEMAF-AREA", "PD0UTI01", "WPDRUTI01", "PDPRED"],
+        "forbidden": ["PD0UTI02", "PD0UTI03", "PD0UTI04", "PD0UTI09"]
+      }
+    },
+    {
+      "id": "calls.pd1fs00_parameters",
+      "category": "calls",
+      "question": "Which parameters are passed to PD1FS00 in PDCBVC?",
+      "assertions": {
+        "contains_all": ["PD1FS00", "COMMAREA=WPD1FS00", "LENGTH=PD1FS00-LUNGH", "PD1FS00-FUNZIONE"],
+        "forbidden": ["WPD1VOCI"]
+      }
+    },
+    {
+      "id": "calls.pd1voci_preparation",
+      "category": "calls",
+      "question": "In PDCBVC.CBL, how are the parameters for the external program PD1VOCI prepared, and how do TWCOB-VARCONT-NUMFUNZ and TWCOB-FUNZIONE influence PD1VOCI-FUNZIONE, PD1VOCI-TIPO-ESTRA, and PD1VOCI-TIPO-VOCE?",
+      "assertions": {
+        "contains_all": ["PD1VOCI-FUNZIONE", "PD1VOCI-TIPO-ESTRA", "PD1VOCI-TIPO-VOCE", "TWCOB-VARCONT-NUMFUNZ", "TWCOB-FUNZIONE"],
+        "forbidden": ["simply return", "calling program and the data being processed"]
+      }
+    },
+    {
+      "id": "control.phase_dispatch",
+      "category": "control_flow",
+      "question": "In PDCBVC.CBL, how does the program decide whether to execute BROWSE-FASE1 or BROWSE-FASE2, and what happens if TWCOB-FASE contains an unexpected value?",
+      "assertions": {
+        "contains_all": ["TWCOB-FASE = '1'", "BROWSE-FASE1", "TWCOB-FASE = '2'", "BROWSE-FASE2", "ABEND00"],
+        "forbidden": ["ELSE clause and execute BROWSE-FASE2"]
+      }
+    },
+    {
+      "id": "control.browse_fase1_sequence",
+      "category": "control_flow",
+      "question": "In PDCBVC.CBL, explain the full sequence of operations performed during BROWSE-FASE1 before the map PDCBVC1 is sent to the terminal.",
+      "assertions": {
+        "contains_all": ["PREP-LINK-PD1FS00", "READ-TAB-SEMAF", "INIZ-PARAM", "LINK-PD1VOCI", "CALCOLA-NPAG", "PREPARA-MAP", "SEND-PDCBVC1"],
+        "forbidden": ["EXEC CICS ADDRESS TWA", "updating database records and generating reports"]
+      }
+    },
+    {
+      "id": "control.browse_fase2_enter",
+      "category": "control_flow",
+      "question": "Explain BROWSE-FASE2-ENTER in PDCBVC.",
+      "assertions": {
+        "contains_all": ["BROWSE-FASE2-ENTER", "PREP-LINK-PD1FS00", "BROWSE-FASE2-SEL", "INIZ-PARAM", "LINK-PD1VOCI", "CALCOLA-NPAG"]
+      }
+    },
+    {
+      "id": "control.xctl_liv4",
+      "category": "control_flow",
+      "question": "Explain XCTL-LIV4 in PDCBVC.",
+      "assertions": {
+        "contains_all": ["XCTL-LIV4", "RESET-TWA", "XCTL-MAIN", "TWCOB-FASE", "TWCOB-FUNZIONE", "TWCOB-NOME-PGM"],
+        "contains_any": [["PROG-LIV4", "PDPRED"]]
+      }
+    },
+    {
+      "id": "control.pagination",
+      "category": "control_flow",
+      "question": "In PDCBVC.CBL, how is pagination calculated and maintained across user interactions, especially when the user presses ENTER, PF7, or PF8?",
+      "assertions": {
+        "contains_all": ["WCTPAG", "TWCOB-VARCONT-NPAGINA", "BROWSE-FASE2-ENTER", "BROWSE-FASE2-PF7", "BROWSE-FASE2-PF8"],
+        "forbidden": ["TWCOB-VARCONT-NUMFUNZ and TWCOB-FUNZIONE variables to control pagination"]
+      }
+    },
+    {
+      "id": "control.row_selection",
+      "category": "control_flow",
+      "question": "In PDCBVC.CBL, when the user selects a row from the browse screen, how does the program validate the selected progressivo and move the selected accounting voice into the TWA before transferring control to the next program?",
+      "assertions": {
+        "contains_all": ["SCELTAI", "WPROGR", "BROWSE-FASE2-SEL-20", "TWCOB-VARCONT-PROGVOCE"],
+        "forbidden": ["TWCOB-VARCONT-NUMFUNZ is greater than 0"]
+      }
+    },
+    {
+      "id": "control.pf_key_comparison",
+      "category": "control_flow",
+      "question": "In PDCBVC.CBL, compare the control-flow behavior of function keys PF1, PF2, PF3, PF4, and PF9. Which target programs are selected, and what common TWA reset logic is applied?",
+      "assertions": {
+        "contains_all": ["DFHPF1", "XCTL-LIV1", "DFHPF2", "XCTL-LIV2", "DFHPF3", "XCTL-LIV3", "DFHPF4", "XCTL-LIV4", "DFHPF9", "XCTL-LIV0", "RESET-TWA", "PDPRED"],
+        "forbidden": ["PD0UTI02", "PD0UTI03", "PD0UTI04", "PD0UTI09"]
+      }
+    },
+    {
+      "id": "control.pf8_key",
+      "category": "control_flow",
+      "question": "What happens when the user presses PF8 in PDCBVC?",
+      "assertions": {
+        "contains_all": ["DFHPF8", "BROWSE-FASE2-PF8"],
+        "contains_any": [["BROWSE-FASE2-ENTER", "WCTPAG"]]
+      }
+    },
+    {
+      "id": "control.semaphore_flow",
+      "category": "control_flow",
+      "question": "In PDCBVC.CBL, under what exact conditions does the program read the semaphore PDAGGVIP, and what control-flow path is taken when the semaphore status is closed?",
+      "assertions": {
+        "contains_all": ["READ-TAB-SEMAF", "PDAGGVIP", "PXCSEMAF-STATUS = 1", "XCTL-LIV4", "PXRSEMAF"],
+        "forbidden": ["PD1VOCI-TABVOX-NUMERO = 0 AND TWCOB-XCTL-PGM = 'PDCGVC'"]
+      }
+    },
+    {
+      "id": "control.error_paths",
+      "category": "control_flow",
+      "question": "In PDCBVC.CBL, identify all paths that lead to an error message or abnormal termination, including invalid function keys, missing records, invalid selection, failed service calls, SQL errors, and semaphore restrictions.",
+      "assertions": {
+        "contains_all": ["ABEND00", "BROWSE-FASE2-TASTOER", "BROWSE-FASE2-NOTFND", "SQLERROR", "PXCSEMAF-STATUS", "PD1VOCI-RETURN", "PDRUTI01-RETURN"],
+        "forbidden": ["all paths jump to ABEND00"]
+      }
+    },
+    {
+      "id": "control.ui_navigation",
+      "category": "ui_navigation",
+      "question": "What is PDCBVC UI navigation?",
+      "assertions": {
+        "contains_all": ["9 item", "DFHENTER", "DFHPF1", "DFHPF7", "DFHPF8", "BROWSE-FASE2-TASTOER"]
+      }
+    },
+    {
+      "id": "dataflow.wctpag",
+      "category": "dataflow",
+      "question": "Where is WCTPAG set and used?",
+      "assertions": {
+        "contains_all": ["WCTPAG", "writes", "reads", "BROWSE-FASE2-PF8", "MUOVI-DATI", "controls flow: yes"]
+      }
+    },
+    {
+      "id": "dataflow.npagina",
+      "category": "dataflow",
+      "question": "Where is TWCOB-VARCONT-NPAGINA set and used?",
+      "assertions": {
+        "contains_all": ["TWCOB-VARCONT-NPAGINA", "origin: COMMAREA", "BROWSE-FASE1", "BROWSE-FASE2-VISUAL", "MUOVI-DATI"]
+      }
+    },
+    {
+      "id": "dataflow.scelta_map_field",
+      "category": "dataflow",
+      "question": "I have a problem with SCELTAI on the map, what feeds it?",
+      "assertions": {
+        "contains_all": ["SCELTAI", "COPY:PDCBVCM", "BROWSE-FASE2-ENTER", "BROWSE-FASE2-SEL-10", "controls flow: yes"],
+        "forbidden": ["PD1FS00"]
+      }
+    },
+    {
+      "id": "dataflow.forced_values",
+      "category": "dataflow",
+      "question": "Is there any forced value in PDCBVC?",
+      "assertions": {
+        "contains_all": ["65 matching item", "TWCOB-FASE = 2", "PD1FS00-FUNZIONE = 03", "PD1VOCI-FUNZIONE = 11", "M1MSGL = -1"],
+        "forbidden": ["not provided"]
+      }
+    },
+    {
+      "id": "copybooks.unused_heuristic",
+      "category": "copybooks",
+      "question": "How many unused copybooks?",
+      "assertions": {
+        "contains_all": ["COPY usage heuristic", "Need review / possibly unused by this heuristic (3)", "DFHBMSCA", "PDRTIP01", "PDRVC"],
+        "forbidden": ["cannot confirm unused"]
+      }
+    },
+    {
+      "id": "dead_code.commented_and_copy",
+      "category": "dead_code",
+      "question": "Is there any unused code/copy in this PDCBVC?",
+      "assertions": {
+        "contains_all": ["Commented-out code/data found", "15 item", "line 433", "COPY usage heuristic", "DFHBMSCA", "PDRVC"],
+        "forbidden": ["No, there is no dead code"]
+      }
+    },
+    {
+      "id": "db2.sql_evidence",
+      "category": "db2_sql",
+      "question": "Which DB2 tables and SQL includes does PDCBVC use?",
+      "assertions": {
+        "contains_all": ["DB2 table DUAL", "SQL includes", "PDPSQLER", "PDWSQLER", "SQLCA"]
+      }
+    },
+    {
+      "id": "datasets.produced_missing",
+      "category": "datasets",
+      "question": "Which datasets does PDCBVC produce?",
+      "assertions": {
+        "contains_all": ["no JCL dataset/file-I/O artifact", "PDCBVC", "not evidenced"],
+        "forbidden": ["SYSOUT", "produces dataset"]
+      }
+    },
+    {
+      "id": "business.rules",
+      "category": "business_rules",
+      "question": "What business rules are in PDCBVC?",
+      "assertions": {
+        "contains_all": ["30 rule artifact", "BR-001", "TWCOB-FASE", "BR-004", "PXCSEMAF-STATUS"]
+      }
+    },
+    {
+      "id": "rag.program_purpose",
+      "category": "rag_llm",
+      "question": "What is the purpose of program PDCBVC?",
+      "requirements": ["rag_index", "ollama"],
+      "assertions": {
+        "contains_all": ["PDCBVC"],
+        "contains_any": [["browse", "CICS", "program", "accounting", "voice"]]
+      }
+    }
+  ]
+}

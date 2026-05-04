@@ -1,0 +1,61 @@
+# Evaluation
+
+This folder contains deterministic evaluation tools for the COBOL RAG assistant.
+
+## Gold Suite
+
+The main gold file is:
+
+```bash
+eval/questions/pdcbvc_gold.json
+```
+
+It defines question cases, categories, runtime requirements, and assertions:
+
+- `contains_all`: every listed fragment must appear in the answer.
+- `contains_any`: at least one fragment from each group must appear.
+- `regex_all`: every regex must match the answer.
+- `forbidden`: listed fragments must not appear.
+- `min_sources`: minimum number of retrieved sources required.
+- `source_contains_all`: fragments that must appear in retrieved source text or metadata.
+
+Cases can require:
+
+- `final_scripts`: structured analysis artifacts are discoverable.
+- `rag_index`: a local manifest or Chroma directory exists.
+- `ollama`: the configured Ollama server responds.
+
+Cases whose requirements are missing are skipped by default, so the structured
+final_scripts tests can run offline while RAG/LLM tests are still tracked.
+
+## Run
+
+From the repository root:
+
+```bash
+python eval/run_gold_eval.py
+```
+
+Useful options:
+
+```bash
+python eval/run_gold_eval.py --category control_flow
+python eval/run_gold_eval.py --case calls.all_parameters --show-answers
+python eval/run_gold_eval.py --json-output eval/out/pdcbvc_gold_report.json
+python eval/run_gold_eval.py --markdown-output eval/out/pdcbvc_gold_report.md
+```
+
+For this project, point the runner at the detailed artifacts if they are not
+inside the repository:
+
+```bash
+export COBOL_RAG_FINAL_SCRIPTS_DIR="$PWD/final_scripts"
+python eval/run_gold_eval.py
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:COBOL_RAG_FINAL_SCRIPTS_DIR="C:\path\to\final_scripts"
+python eval\run_gold_eval.py
+```

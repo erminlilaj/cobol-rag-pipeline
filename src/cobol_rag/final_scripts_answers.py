@@ -552,6 +552,8 @@ def _answer_structured_behavior(root: Path, program: str, question: str) -> str 
     call_target = _call_target_in_question(root, program, question)
     if call_target and _asks_about_call_details(q):
         return _answer_call_preparation(root, program, call_target)
+    if _asks_about_variable_behavior(q) and _asks_for_specific_variable_trace(q):
+        return _answer_variables_from_question(root, program, question)
     if _asks_about_pagination(q):
         return _answer_pagination(root, program)
     if _asks_about_row_selection(q):
@@ -663,6 +665,10 @@ def _asks_about_variable_behavior(q: str) -> bool:
             "value of",
         )
     ) and bool(_variables_in_question(q))
+
+
+def _asks_for_specific_variable_trace(q: str) -> bool:
+    return any(term in q for term in ("where is", "set and used", "read and written", "written", "modified", "origin"))
 
 
 def _asks_about_paragraph_behavior(q: str) -> bool:

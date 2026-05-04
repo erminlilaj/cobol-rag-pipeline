@@ -111,7 +111,7 @@ def _try_local_answer(question: str) -> str | None:
     normalized = text.strip(" ?.!").strip()
     if text in {"hi", "hello", "hey", "ciao", "salve", "buongiorno", "good morning", "good afternoon"}:
         return (
-            "Hi. I can help you inspect the indexed COBOL analysis. "
+            "Hi. I am the COBOL RAG assistant for this workspace. I can help you inspect the indexed COBOL analysis. "
             "Try asking about called programs, COMMAREA parameters, forced values, DB2 tables, copybooks, or screen fields."
         )
     if normalized in {"what are you", "who are you", "what can you do", "help", "how can you help"}:

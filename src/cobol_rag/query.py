@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from cobol_rag.config import AppConfig
+from cobol_rag.final_scripts_answers import answer_from_final_scripts
 from cobol_rag.index import open_index
 from cobol_rag.retrieve import RetrievalResult, retrieve
 
@@ -27,6 +29,14 @@ def answer_query(
     chunk_types: list[str] | None = None,
     conversation_history: str | None = None,
 ) -> QueryAnswer:
+    final_scripts_answer = answer_from_final_scripts(question)
+    if final_scripts_answer:
+        return QueryAnswer(question=question, answer=final_scripts_answer, sources=[])
+
+    metadata_answer = _try_program_metadata_answer(question)
+    if metadata_answer:
+        return QueryAnswer(question=question, answer=metadata_answer, sources=[])
+
     sources = retrieve(question, config=config, top_k=top_k, chunk_types=chunk_types)
     if not sources:
         return QueryAnswer(
@@ -77,6 +87,85 @@ def _load_system_prompt(config: AppConfig) -> str:
     if not path.exists():
         return ""
     return path.read_text(encoding="utf-8").strip()
+
+
+def _try_program_metadata_answer(question: str) -> str | None:
+    q = question.lower()
+    if not any(term in q for term in ("how many", "number of", "count")):
+        return None
+    if not any(term in q for term in ("line", "lines", "loc", "code lines")):
+        return None
+
+    program = _program_from_question(question)
+    if not program:
+        return None
+    payload = _load_final_script_comments_payload(program)
+    if not payload:
+        return None
+
+    total_lines = payload.get("metrics", {}).get("total_lines")
+    if total_lines is None:
+        return None
+    comment_count = payload.get("count")
+    commented_out = payload.get("classification_counts", {}).get("commented_out_code")
+    details = [f"{program} has {total_lines} total source lines."]
+    if comment_count is not None:
+        details.append(f"The comments artifact also reports {comment_count} comment lines.")
+    if commented_out is not None:
+        details.append(f"{commented_out} of those are classified as commented-out code.")
+    details.append("Source: `program.comments.json` metrics.")
+    return " ".join(details)
+
+
+def _load_final_script_comments_payload(program: str) -> dict | None:
+    comments_path = (
+        Path.cwd().parent
+        / "control_flow"
+        / "artifacts"
+        / "final"
+        / "final_scripts"
+        / "program.comments"
+        / "program.comments.json"
+    )
+    if not comments_path.exists():
+        return None
+    try:
+        payload = json.loads(comments_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if payload.get("program") != program:
+        return None
+    return payload
+
+
+def _program_from_question(question: str) -> str | None:
+    ignored = {
+        "IS",
+        "THERE",
+        "ANY",
+        "UNUSED",
+        "CODE",
+        "COPY",
+        "THIS",
+        "PROGRAM",
+        "DEAD",
+        "COMMENTED",
+        "OUT",
+        "HOW",
+        "MANY",
+        "LINES",
+        "LINE",
+        "NUMBER",
+        "COUNT",
+    }
+    candidates = [
+        token
+        for token in re.findall(r"\b[A-Z][A-Z0-9]{3,}\b", question.upper())
+        if token not in ignored
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=len)
 
 
 def _build_prompt(
@@ -156,12 +245,18 @@ def _try_static_values_answer(question: str, sources: list[RetrievalResult]) -> 
     if not any(term in q for term in ("forced value", "forced values", "static value", "static values", "hardcoded", "hard-coded")):
         return None
 
-    static_sources = [source for source in sources if source.metadata.get("chunk_type") == "static_values"]
+    static_sources = [
+        source for source in sources
+        if source.metadata.get("chunk_type") in {"static_values", "dataflow.literal_assignments"}
+    ]
     if not static_sources:
         return "The retrieved sources do not contain a static/forced-values chunk for this question."
 
     value_lines = []
     for source in static_sources:
+        if source.metadata.get("chunk_type") == "dataflow.literal_assignments":
+            value_lines.extend(_assignment_lines(source.text))
+            continue
         for line in source.text.splitlines():
             clean = line.strip()
             if clean.startswith("- "):
@@ -177,10 +272,16 @@ def _try_external_programs_answer(question: str, sources: list[RetrievalResult])
     if not any(term in q for term in ("outside program", "outside programs", "external program", "external programs", "external call", "external calls", "called program", "called programs", "with parameters", "commarea")):
         return None
 
-    call_sources = [source for source in sources if source.metadata.get("chunk_type") == "external_program_calls"]
+    call_sources = [
+        source for source in sources
+        if source.metadata.get("chunk_type") in {"external_program_calls", "architecture.call_parameters"}
+    ]
     if call_sources:
         lines = []
         for source in call_sources:
+            if source.metadata.get("chunk_type") == "architecture.call_parameters":
+                lines.extend(_call_parameter_lines(source.text))
+                continue
             for line in source.text.splitlines():
                 clean = line.strip()
                 if clean.startswith("- "):
@@ -203,6 +304,27 @@ def _try_external_programs_answer(question: str, sources: list[RetrievalResult])
             + "\n".join(_first_nonempty_lines("\n".join(source.text for source in fallback), limit=8))
         )
     return "The retrieved sources do not contain external-program call evidence."
+
+
+def _assignment_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    for sentence in re.split(r"(?<=\.)\s+", text.replace("\n", " ")):
+        clean = sentence.strip()
+        if " gets " in clean and " line " in clean:
+            lines.append(f"- {clean}")
+    return lines
+
+
+def _call_parameter_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    compact = " ".join(text.split())
+    match = re.search(r"Embedding:\s*(.*?)(?:\s*Metadata:|$)", compact)
+    call_text = match.group(1) if match else compact
+    for sentence in re.split(r"(?<=\.)\s+", call_text):
+        clean = sentence.strip()
+        if " uses " in clean and ("via" in clean or "CALL" in clean or "CICS" in clean):
+            lines.append(f"- {clean}")
+    return lines
 
 
 def _try_datasets_tables_answer(question: str, sources: list[RetrievalResult]) -> str | None:

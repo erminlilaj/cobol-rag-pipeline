@@ -209,6 +209,7 @@ def _intent_rerank(
             "copybook_usage",
         },
         "external_programs": {
+            "architecture.call_parameters",
             "architecture.calls",
             "architecture.call",
             "global.call_graph.summary",
@@ -314,13 +315,17 @@ def _intent_score(intent: str, result: RetrievalResult) -> float:
         return score
 
     if intent == "static_values":
-        score = _chunk_boost(chunk_type, {"static_values": 0.18})
-        if "static values" in text or "hardcoded" in text:
+        score = _chunk_boost(chunk_type, {
+            "dataflow.literal_assignments": 0.24,
+            "static_values": 0.18,
+        })
+        if any(term in text for term in ("static values", "hardcoded", "literal", "forced value", "gets")):
             score += 0.05
         return score
 
     if intent == "external_programs":
         score = _chunk_boost(chunk_type, {
+            "architecture.call_parameters": 0.30,
             "architecture.calls": 0.26,
             "architecture.call": 0.22,
             "global.program_dependencies": 0.18,
@@ -331,9 +336,9 @@ def _intent_score(intent: str, result: RetrievalResult) -> float:
             "dependencies": 0.08,
             "paragraph_logic": 0.02,
         })
-        if any(term in text for term in ("external program calls", "commarea", "length", "program transfers")):
+        if any(term in text for term in ("external program calls", "outgoing call parameters", "commarea", "length", "program transfers")):
             score += 0.06
-        if chunk_type in {"static_values", "datasets_tables_resources"}:
+        if chunk_type in {"static_values", "dataflow.literal_assignments", "datasets_tables_resources"}:
             score -= 0.04
         return score
 

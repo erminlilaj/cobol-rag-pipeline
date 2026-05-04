@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -23,9 +24,9 @@ from cobol_rag.sync import apply_sync_plan, build_sync_plan
 app = FastAPI(title="COBOL RAG API")
 
 # Mount the static files for the UI
-UI_DIR = Path("ui")
-if not UI_DIR.exists():
-    UI_DIR.mkdir()
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CONFIG_PATH = PROJECT_ROOT / "config" / "default.yaml"
+UI_DIR = PROJECT_ROOT / "ui"
 
 # Global chat session cache (simplistic approach for single user)
 _chat_session: Optional[ChatSession] = None
@@ -33,7 +34,7 @@ _chat_session: Optional[ChatSession] = None
 def get_chat_session() -> ChatSession:
     global _chat_session
     if _chat_session is None:
-        settings = load_config(Path("config/default.yaml"))
+        settings = load_config(CONFIG_PATH)
         _chat_session = ChatSession(config=settings)
     return _chat_session
 
@@ -49,6 +50,17 @@ class InspectRequest(BaseModel):
 class RetrieveRequest(BaseModel):
     query: str
     top_k: Optional[int] = None
+
+@app.get("/api/health")
+def health() -> Any:
+    settings = load_config(CONFIG_PATH)
+    return {
+        "status": "ok",
+        "collection": settings.index.collection,
+        "inbox_dir": str(settings.paths.inbox_dir),
+        "llm": settings.llm.model,
+        "embedding": settings.embedding.model,
+    }
 
 @app.post("/api/chat")
 def chat(req: ChatRequest) -> Any:
@@ -76,7 +88,7 @@ def chat_reset() -> Any:
 
 @app.get("/api/config")
 def get_config_endpoint() -> Any:
-    settings = load_config(Path("config/default.yaml"))
+    settings = load_config(CONFIG_PATH)
     return {
         "paths": {
             "chroma_dir": str(settings.paths.chroma_dir),
@@ -105,7 +117,7 @@ def get_config_endpoint() -> Any:
 
 @app.get("/api/index-info")
 def get_index_info() -> Any:
-    settings = load_config(Path("config/default.yaml"))
+    settings = load_config(CONFIG_PATH)
     resources = open_index(settings)
     return {
         "chroma_dir": str(settings.paths.chroma_dir),
@@ -117,7 +129,7 @@ def get_index_info() -> Any:
 
 @app.get("/api/inbox")
 def get_inbox() -> Any:
-    settings = load_config(Path("config/default.yaml"))
+    settings = load_config(CONFIG_PATH)
     inbox_dir = settings.paths.inbox_dir
     
     def _build_tree(dir_path: Path) -> dict:
@@ -140,7 +152,7 @@ def get_inbox() -> Any:
 
 @app.post("/api/sync")
 def sync_inbox(req: SyncRequest) -> Any:
-    settings = load_config(Path("config/default.yaml"))
+    settings = load_config(CONFIG_PATH)
     plan = build_sync_plan(settings, dry_run=False)
     
     # Filter items if specific paths are provided
@@ -152,7 +164,7 @@ def sync_inbox(req: SyncRequest) -> Any:
             # Include if item path matches a selected path or is under a selected path (directory)
             if any(item_path == sp or sp in item_path.parents for sp in selected_paths):
                 filtered_items.append(item)
-        plan.items = filtered_items
+        plan = replace(plan, items=filtered_items)
 
     apply_sync_plan(settings, plan)
     
@@ -166,14 +178,14 @@ def sync_inbox(req: SyncRequest) -> Any:
 
 @app.post("/api/reset")
 def reset_collection() -> Any:
-    settings = load_config(Path("config/default.yaml"))
+    settings = load_config(CONFIG_PATH)
     plan = build_reset_plan(settings, dry_run=False)
     apply_reset_plan(settings, plan)
     return {"status": "ok", "message": f"Collection {plan.collection} reset."}
 
 @app.post("/api/inspect")
 def inspect_target(req: InspectRequest) -> Any:
-    settings = load_config(Path("config/default.yaml"))
+    settings = load_config(CONFIG_PATH)
     target = Path(req.target)
     try:
         loaded = load_path(target, config=settings)
@@ -199,7 +211,7 @@ def inspect_target(req: InspectRequest) -> Any:
 
 @app.post("/api/retrieve")
 def retrieve_raw(req: RetrieveRequest) -> Any:
-    settings = load_config(Path("config/default.yaml"))
+    settings = load_config(CONFIG_PATH)
     results = retrieve_documents(query=req.query, config=settings, top_k=req.top_k)
     
     docs = []
@@ -218,7 +230,7 @@ def retrieve_raw(req: RetrieveRequest) -> Any:
         "items": docs
     }
 
-app.mount("/", StaticFiles(directory="ui", html=True), name="ui")
+app.mount("/", StaticFiles(directory=str(UI_DIR), html=True), name="ui")
 
 def run():
     uvicorn.run("cobol_rag.api:app", host="0.0.0.0", port=8000, reload=True)

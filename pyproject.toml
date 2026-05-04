@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "chromadb",
+  "fastapi",
   "llama-index",
   "llama-index-embeddings-ollama",
   "llama-index-llms-ollama",
@@ -18,10 +19,12 @@ dependencies = [
   "pyyaml",
   "rich",
   "typer",
+  "uvicorn",
 ]
 
 [project.scripts]
 cobol-rag = "cobol_rag.cli:app"
+cobol-rag-api = "cobol_rag.api:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]

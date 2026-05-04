@@ -1318,6 +1318,7 @@ def _answer_copybooks(root: Path, program: str, q: str) -> str | None:
             [
                 _cite("architecture.unused_copybooks/architecture.unused_copybooks.json", detail="derived artifact"),
                 _cite("architecture.copybooks/architecture.copybooks.json", detail="content.all"),
+                _cite("dataflow.used_variables/dataflow.used_variables.json", detail="copybook-origin evidence"),
                 _cite("dataflow.variable/*.json", detail="copybook-origin evidence"),
                 _cite("architecture.call_parameters/architecture.call_parameters.json", detail="parameter evidence"),
             ],

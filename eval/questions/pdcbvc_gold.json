@@ -34,7 +34,7 @@
       "category": "metadata",
       "question": "How many code lines is PDCBVC?",
       "assertions": {
-        "contains_all": ["912 total physical source lines", "392 LOC", "14 paragraphs", "65 comment lines", "15 comments"],
+        "contains_all": ["912 total physical source lines", "392 LOC", "14 paragraphs", "65 comment lines", "15 comments", "Evidence:", "program.comments/program.comments.json"],
         "forbidden": ["not provided", "conversation history"]
       }
     },
@@ -208,7 +208,7 @@
       "category": "dataflow",
       "question": "I have a problem with SCELTAI on the map, what feeds it?",
       "assertions": {
-        "contains_all": ["SCELTAI", "COPY:PDCBVCM", "BROWSE-FASE2-ENTER", "BROWSE-FASE2-SEL-10", "controls flow: yes"],
+        "contains_all": ["SCELTAI", "COPY:PDCBVCM", "BROWSE-FASE2-ENTER", "BROWSE-FASE2-SEL-10", "controls flow: yes", "screen_field_lineage", "dataflow.variable/dataflow.variable.SCELTAI.json", "SCELTAL", "WPROGR"],
         "forbidden": ["PD1FS00"]
       }
     },
@@ -226,7 +226,7 @@
       "category": "copybooks",
       "question": "How many unused copybooks?",
       "assertions": {
-        "contains_all": ["COPY usage heuristic", "Need review / possibly unused by this heuristic (3)", "DFHBMSCA", "PDRTIP01", "PDRVC"],
+        "contains_all": ["COPY usage heuristic", "Need review / possibly unused by this heuristic (3)", "DFHBMSCA", "PDRTIP01", "PDRVC", "Evidence:", "architecture.unused_copybooks/architecture.unused_copybooks.json", "dataflow.used_variables/dataflow.used_variables.json"],
         "forbidden": ["cannot confirm unused"]
       }
     },
@@ -235,7 +235,7 @@
       "category": "dead_code",
       "question": "Is there any unused code/copy in this PDCBVC?",
       "assertions": {
-        "contains_all": ["Commented-out code/data found", "15 item", "line 433", "architecture.unused_copybooks", "DFHBMSCA", "PDRVC", "Proven unused COPY members: none"],
+        "contains_all": ["Commented-out code/data found", "15 item", "line 433", "program.comments/program.comments.json", "architecture.unused_copybooks", "DFHBMSCA", "PDRVC", "Proven unused COPY members: none"],
         "forbidden": ["No, there is no dead code"]
       }
     },
@@ -261,7 +261,7 @@
       "category": "datasets",
       "question": "Which datasets does PDCBVC produce?",
       "assertions": {
-        "contains_all": ["jcl.file_io", "no JCL dataset/file-I/O linkage", "PDCBVC", "Produced datasets are not evidenced", "PDCAFIN2"],
+        "contains_all": ["jcl.file_io", "no JCL dataset/file-I/O linkage", "PDCBVC", "Produced datasets are not evidenced", "PDCAFIN2", "Evidence:"],
         "forbidden": ["SYSOUT", "produces dataset"]
       }
     },
@@ -270,7 +270,7 @@
       "category": "datasets",
       "question": "Which datasets does PDHM730C produce?",
       "assertions": {
-        "contains_all": ["PDHM730C JCL file-I/O evidence", "PDCAFIN2", "SKINPUT", "TEPDET.BVARIAZ.CAF", "FOUTPUT", "TEPDET.BVOCI.CAF", "SYSOUT outputs"]
+        "contains_all": ["PDHM730C JCL file-I/O evidence", "PDCAFIN2", "SKINPUT", "TEPDET.BVARIAZ.CAF", "FOUTPUT", "TEPDET.BVOCI.CAF", "SYSOUT outputs", "jcl/_batch_input_check/PDCAFIN2/jcl.steps.PDHM730C.json", "line 84"]
       }
     },
     {

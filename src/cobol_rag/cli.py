@@ -519,6 +519,11 @@ def _artifact_summary(payload: dict) -> str:
             f"matching_jobs={content.get('matching_jobs_count', 0)}, "
             f"reads={len(content.get('reads', []))}, writes={len(content.get('writes', []))}"
         )
+    if artifact_type == "screen_field_lineage":
+        return (
+            f"fields={content.get('fields_count', 0)}, "
+            f"copybooks={', '.join(content.get('copybook_origins', [])) or 'none'}"
+        )
     return str(payload.get("title", ""))
 
 

@@ -74,6 +74,12 @@ The current enrichment covers:
 - `quality.dead_code` for commented-out code and CFG reachability.
 - `architecture.unused_copybooks` for COPY members with no current reference evidence.
 - `jcl.file_io` for JCL DD read/write/SYSOUT evidence when a batch program is linked.
+- `screen_field_lineage` for BMS/map fields, field families, connected variables,
+  and exact read/write/control evidence.
 
 Use `--apply` only when you want those generated JSON files written into the
 bundle. The direct-answer layer can still build them in memory for local tests.
+
+Gold cases should assert both facts and citations. For example, a screen-field
+answer should mention the field, the map copybook, connected variables, and a
+source such as `dataflow.variable/dataflow.variable.SCELTAI.json | line 317`.

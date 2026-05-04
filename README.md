@@ -289,11 +289,19 @@ Current derived artifact types:
   overclaim unused copybooks.
 - `jcl.file_io`: maps JCL jobs, steps, DD reads, writes, and SYSOUT evidence to
   matching batch programs when the JCL artifacts contain that linkage.
+- `screen_field_lineage`: groups BMS/map variables by screen field family and
+  cites read, write, control-flow, literal/attribute, and connected-variable
+  evidence.
 
 These artifacts are also built in memory by direct-answer code when possible,
 so the UI can answer common review questions even before `--apply` is run.
 Writing them is still useful because it makes the evidence explicit and easier
 to inspect, sync, and evaluate.
+
+Direct structured answers include an `Evidence:` section or inline citations
+such as `dataflow.variable/dataflow.variable.SCELTAI.json | line 317`, so a
+good answer is traceable back to the generated artifact and COBOL/JCL line
+where that line number is available.
 
 ## Retrieval Debug Workflow
 

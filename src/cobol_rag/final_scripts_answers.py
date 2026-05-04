@@ -9,6 +9,7 @@ from typing import Any
 from cobol_rag.final_scripts_artifacts import (
     load_or_build_jcl_file_io,
     load_or_build_quality_dead_code,
+    load_or_build_screen_field_lineage,
     load_or_build_unused_copybooks,
     program_has_jcl_evidence,
 )
@@ -40,6 +41,11 @@ def answer_from_final_scripts(question: str) -> str | None:
         if answer:
             return answer
 
+    if _asks_about_screen_field_lineage(q):
+        answer = _answer_screen_field_lineage(root, program, question)
+        if answer:
+            return answer
+
     answer = _answer_structured_behavior(root, program, question)
     if answer:
         return answer
@@ -66,11 +72,6 @@ def answer_from_final_scripts(question: str) -> str | None:
 
     if _asks_about_datasets(q):
         return _answer_datasets(root, program)
-
-    if _asks_about_screen_field_lineage(q):
-        answer = _answer_screen_field_lineage(root, program, question)
-        if answer:
-            return answer
 
     if _asks_about_ui_navigation(q):
         answer = _answer_ui_navigation(root, program)
@@ -349,10 +350,52 @@ def _site_lines(
         line = site.get("line_start", "?")
         paragraph = site.get("paragraph", "?")
         statement = str(site.get("statement", "")).strip()
-        lines.append(f"{indent}- line {line} `{paragraph}`: {statement}")
+        citation = _site_citation(payload, line)
+        suffix = f" [{citation}]" if citation else ""
+        lines.append(f"{indent}- line {line} `{paragraph}`: {statement}{suffix}")
     if not lines:
         lines.append(f"{indent}- none")
     return lines
+
+
+def _site_citation(payload: dict[str, Any], line: Any) -> str:
+    variable = str(payload.get("content", {}).get("variable", "")).upper()
+    if variable:
+        return _cite(f"dataflow.variable/dataflow.variable.{variable}.json", line=line)
+    return ""
+
+
+def _cite(path: str, *, line: Any | None = None, detail: str | None = None) -> str:
+    parts = [path]
+    if line not in (None, "", -1, "?"):
+        parts.append(f"line {line}")
+    if detail:
+        parts.append(detail)
+    return " | ".join(parts)
+
+
+def _append_evidence(lines: list[str], evidence: list[str], *, limit: int = 8) -> None:
+    unique = []
+    seen = set()
+    for item in evidence:
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    if not unique:
+        return
+    lines.append("")
+    lines.append("Evidence:")
+    for item in unique[:limit]:
+        lines.append(f"- {item}")
+
+
+def _line_from_site_list(payload: dict[str, Any], key: str) -> Any | None:
+    for site in payload.get("content", {}).get("evidence", {}).get(key, []):
+        line = site.get("line_start")
+        if isinstance(line, int) and line > 0:
+            return line
+    return None
 
 
 def _variables_in_question(question: str) -> list[str]:
@@ -425,15 +468,21 @@ def _answer_counts(root: Path, program: str, q: str) -> str | None:
 
     if "copy" in q and isinstance(copybooks, dict):
         all_copybooks = copybooks.get("content", {}).get("all", [])
-        return f"{program} has {len(all_copybooks)} COPY members listed: {', '.join(all_copybooks)}."
+        lines = [f"{program} has {len(all_copybooks)} COPY members listed: {', '.join(all_copybooks)}."]
+        _append_evidence(lines, [_cite("architecture.copybooks/architecture.copybooks.json", detail="content.all")])
+        return "\n".join(lines)
 
     if ("call" in q or "external" in q or "outside" in q) and isinstance(calls, dict):
         call_items = calls.get("calls", [])
-        return f"{program} has {len(call_items)} outgoing calls in `architecture.call_parameters.json`."
+        lines = [f"{program} has {len(call_items)} outgoing calls in `architecture.call_parameters.json`."]
+        _append_evidence(lines, [_cite("architecture.call_parameters/architecture.call_parameters.json", detail="calls")])
+        return "\n".join(lines)
 
     if ("literal" in q or "forced" in q or "hardcoded" in q) and isinstance(literals, dict):
         items = literals.get("assignments", [])
-        return f"{program} has {len(items)} literal assignments in `dataflow.literal_assignments.json`."
+        lines = [f"{program} has {len(items)} literal assignments in `dataflow.literal_assignments.json`."]
+        _append_evidence(lines, [_cite("dataflow.literal_assignments/dataflow.literal_assignments.json", detail="assignments")])
+        return "\n".join(lines)
 
     if comments and any(term in q for term in ("line", "lines", "loc", "code")):
         total_lines = comments.get("metrics", {}).get("total_lines")
@@ -453,7 +502,15 @@ def _answer_counts(root: Path, program: str, q: str) -> str | None:
         if commented_out is not None:
             parts.append(f"{commented_out} comments are classified as commented-out code.")
         if parts:
-            return " ".join(parts)
+            lines = [" ".join(parts)]
+            _append_evidence(
+                lines,
+                [
+                    _cite("program.comments/program.comments.json", detail="metrics.total_lines/count/classification_counts"),
+                    _cite("program_summary/program.summary.json", detail="content"),
+                ],
+            )
+            return "\n".join(lines)
 
     return None
 
@@ -494,12 +551,21 @@ def _answer_commented_code(root: Path, program: str, q: str) -> str | None:
     else:
         lines = [f"Commented-out code/data found in {program}: {len(commented)} item(s)."]
     for comment in commented[:20]:
-        lines.append(f"- line {comment.get('line')}: {str(comment.get('text', '')).strip()}")
+        citation = comment.get("citation") or _cite("program.comments/program.comments.json", line=comment.get("line"))
+        lines.append(f"- line {comment.get('line')}: {str(comment.get('text', '')).strip()} [{citation}]")
     if "copy" in q:
         copy_answer = _answer_copybooks(root, program, q)
         if copy_answer:
             lines.append("")
             lines.append(copy_answer)
+    _append_evidence(
+        lines,
+        [
+            _cite("quality.dead_code/quality.dead_code.json", detail="derived artifact"),
+            _cite("program.comments/program.comments.json", detail="commented_out_code"),
+            _cite("controlflow.cfg/controlflow.cfg.json", detail="CFG reachability"),
+        ],
+    )
     return "\n".join(lines)
 
 
@@ -509,6 +575,7 @@ def _answer_calls(root: Path, program: str) -> str | None:
         return None
     calls = payload.get("calls", [])
     lines = [f"{program} outgoing calls with parameters:"]
+    evidence: list[str] = []
     for call in calls:
         target = call.get("target", "?")
         call_type = call.get("call_type", "?")
@@ -521,6 +588,14 @@ def _answer_calls(root: Path, program: str) -> str | None:
         if call.get("length"):
             details.append(f"LENGTH={call.get('length')}")
         lines.append("; ".join(details) + ".")
+        evidence.append(
+            _cite(
+                "architecture.call_parameters/architecture.call_parameters.json",
+                line=call.get("line_start"),
+                detail=str(target),
+            )
+        )
+    _append_evidence(lines, evidence)
     return "\n".join(lines)
 
 
@@ -536,6 +611,7 @@ def _answer_literal_assignments(root: Path, program: str, q: str) -> str | None:
     elif "control" in q or "flow" in q:
         items = [item for item in items if item.get("controls_flow")]
     lines = [f"{program} literal assignments: {len(items)} matching item(s)."]
+    evidence: list[str] = []
     for item in items[:25]:
         tags = []
         if item.get("call_commarea_field"):
@@ -549,6 +625,14 @@ def _answer_literal_assignments(root: Path, program: str, q: str) -> str | None:
             f"- line {item.get('line')} {item.get('paragraph')}: "
             f"{item.get('target_variable')} = {item.get('literal')}{suffix}"
         )
+        evidence.append(
+            _cite(
+                "dataflow.literal_assignments/dataflow.literal_assignments.json",
+                line=item.get("line"),
+                detail=str(item.get("target_variable", "")),
+            )
+        )
+    _append_evidence(lines, evidence)
     return "\n".join(lines)
 
 
@@ -718,6 +802,13 @@ def _answer_phase_decision(root: Path, program: str) -> str | None:
         lines.append("")
         lines.append("Supporting variable evidence:")
         lines.extend(_site_lines(variable, "control_sites", limit=6))
+    _append_evidence(
+        lines,
+        [
+            _cite("controlflow.cfg/controlflow.cfg.json", detail="TWCOB-FASE dispatch edges"),
+            _cite("dataflow.variable/dataflow.variable.TWCOB-FASE.json", detail="control_sites"),
+        ],
+    )
     return "\n".join(lines)
 
 
@@ -763,6 +854,14 @@ def _answer_semaphore_flow(root: Path, program: str) -> str | None:
             f"- If `{edge.get('condition')}`, `READ-TAB-SEMAF` performs `{edge.get('to')}` "
             f"({edge.get('evidence', '')})."
         )
+    _append_evidence(
+        lines,
+        [
+            _cite("controlflow.cfg/controlflow.cfg.json", detail="READ-TAB-SEMAF edges"),
+            _cite("dataflow.literal_assignments/dataflow.literal_assignments.json", detail="PXCSEMAF assignments"),
+            _cite("architecture.call_parameters/architecture.call_parameters.json", line=(call or {}).get("line_start"), detail="PXRSEMAF"),
+        ],
+    )
     return "\n".join(lines)
 
 
@@ -783,6 +882,7 @@ def _answer_paragraph_sequence(root: Path, program: str, paragraph: str, stop_at
         lines.append(f"- {detail}.")
         if stop_at and edge.get("to") == stop_at:
             break
+    _append_evidence(lines, [_cite("controlflow.cfg/controlflow.cfg.json", detail=f"{paragraph} outgoing edges")])
     return "\n".join(lines)
 
 
@@ -838,6 +938,13 @@ def _answer_call_preparation(root: Path, program: str, target: str) -> str | Non
         if variable:
             lines.append(f"- `{name}` control/read evidence:")
             lines.extend(_site_lines(variable, "control_sites", limit=8, indent="  "))
+    _append_evidence(
+        lines,
+        [
+            _cite("architecture.call_parameters/architecture.call_parameters.json", line=call.get("line_start"), detail=target),
+            _cite("dataflow.variable/*.json", detail="write/read sites for call parameters"),
+        ],
+    )
     return "\n".join(lines)
 
 
@@ -872,6 +979,13 @@ def _answer_pagination(root: Path, program: str) -> str | None:
         for edge in ui_edges[:12]:
             condition = edge.get("condition") or "unconditional"
             lines.append(f"  - `{edge.get('from')}` -> `{edge.get('to')}` when `{condition}` ({edge.get('evidence', '')})")
+    _append_evidence(
+        lines,
+        [
+            _cite("dataflow.variable/dataflow.variable.WCTPAG.json", detail="write/control sites"),
+            _cite("controlflow.cfg/controlflow.cfg.json", detail="PF7/PF8/ENTER pagination edges"),
+        ],
+    )
     return "\n".join(lines)
 
 
@@ -897,6 +1011,13 @@ def _answer_row_selection(root: Path, program: str) -> str | None:
         lines.append(f"- `{content.get('variable')}` evidence:")
         lines.extend(_site_lines(variable, "read_sites", limit=4, indent="  "))
         lines.extend(_site_lines(variable, "write_sites", limit=4, indent="  "))
+    _append_evidence(
+        lines,
+        [
+            _cite("controlflow.cfg/controlflow.cfg.json", detail="row-selection edges"),
+            _cite("dataflow.variable/*.json", detail="SCELTAI/WPROGR/TWA variable sites"),
+        ],
+    )
     return "\n".join(lines)
 
 
@@ -933,6 +1054,14 @@ def _answer_pf_key_comparison(root: Path, program: str) -> str | None:
             f"- `XCTL-MAIN` transfers control with `{call.get('call_type')}` to `{call.get('target')}` "
             f"at line {call.get('line_start')}."
         )
+    _append_evidence(
+        lines,
+        [
+            _cite("ui.cics.navigation/ui.cics.navigation.json", detail="PF key actions"),
+            _cite("controlflow.cfg/controlflow.cfg.json", detail="XCTL reset edges"),
+            _cite("architecture.call_parameters/architecture.call_parameters.json", line=(call or {}).get("line_start"), detail="PDPRED"),
+        ],
+    )
     return "\n".join(lines)
 
 
@@ -978,6 +1107,13 @@ def _answer_key_flow(root: Path, program: str, question: str) -> str | None:
             f"- CFG edge: `{edge.get('from')}` -> `{edge.get('to')}` when "
             f"`{condition}` ({edge.get('evidence', '')})."
         )
+    _append_evidence(
+        lines,
+        [
+            _cite("ui.cics.navigation/ui.cics.navigation.json", detail="key actions"),
+            _cite("controlflow.cfg/controlflow.cfg.json", detail="key-conditioned edges"),
+        ],
+    )
     return "\n".join(lines)
 
 
@@ -1047,6 +1183,15 @@ def _answer_paragraph_behavior(root: Path, program: str, paragraph: str) -> str 
             lines.append(
                 f"  - {site['kind']} `{site['variable']}` line {site['line']}: {site['statement']}"
             )
+    _append_evidence(
+        lines,
+        [
+            _cite("controlflow.cfg/controlflow.cfg.json", detail=f"{paragraph} edges"),
+            _cite("dataflow.literal_assignments/dataflow.literal_assignments.json", detail=f"{paragraph} literals"),
+            _cite("architecture.call_parameters/architecture.call_parameters.json", detail=f"{paragraph} calls"),
+            _cite("dataflow.variable/*.json", detail=f"{paragraph} variable sites"),
+        ],
+    )
     return "\n".join(lines)
 
 
@@ -1114,6 +1259,13 @@ def _answer_error_paths(root: Path, program: str) -> str | None:
     if sqlerror:
         lines.append("- SQL handling evidence:")
         lines.extend(_site_lines(sqlerror, "read_sites", limit=3, indent="  "))
+    _append_evidence(
+        lines,
+        [
+            _cite("controlflow.cfg/controlflow.cfg.json", detail="ABEND/message/restriction edges"),
+            _cite("dataflow.variable/*.json", detail="message and SQL variable sites"),
+        ],
+    )
     return "\n".join(lines)
 
 
@@ -1140,9 +1292,11 @@ def _answer_copybooks(root: Path, program: str, q: str) -> str | None:
         artifact_content = artifact.get("content", {})
         referenced = artifact_content.get("referenced_copybooks", [])
         needs_review = artifact_content.get("needs_review_copybooks", [])
+        status_items = artifact_content.get("copybook_status", [])
         lines = [
             f"{program} COPY usage heuristic from `architecture.unused_copybooks`:",
             "This is not a full unused-copybook proof; it compares COPY members against available dataflow/call artifacts.",
+            f"- Proof level: {artifact_content.get('proof_level', 'available-artifact review')}.",
             f"- COPY members listed: {', '.join(artifact_content.get('all_copybooks', all_copybooks))}",
             f"- COPY members with reference evidence: {', '.join(referenced) or 'none'}",
             (
@@ -1151,19 +1305,39 @@ def _answer_copybooks(root: Path, program: str, q: str) -> str | None:
             ),
             "- Proven unused COPY members: none from the available artifacts.",
         ]
+        if status_items:
+            lines.append("- per-copybook status:")
+            for item in status_items:
+                evidence = item.get("evidence", [])
+                citation = ""
+                if evidence:
+                    citation = f" [{evidence[0].get('citation') or evidence[0].get('source')}]"
+                lines.append(f"  - {item.get('copybook')}: {item.get('status')}{citation}")
+        _append_evidence(
+            lines,
+            [
+                _cite("architecture.unused_copybooks/architecture.unused_copybooks.json", detail="derived artifact"),
+                _cite("architecture.copybooks/architecture.copybooks.json", detail="content.all"),
+                _cite("dataflow.variable/*.json", detail="copybook-origin evidence"),
+                _cite("architecture.call_parameters/architecture.call_parameters.json", detail="parameter evidence"),
+            ],
+        )
         return "\n".join(lines)
     lines = [f"{program} COPY members ({len(all_copybooks)}): {', '.join(all_copybooks)}."]
     for category, names in classified.items():
         lines.append(f"- {category}: {', '.join(names)}")
+    _append_evidence(lines, [_cite("architecture.copybooks/architecture.copybooks.json", detail="content.classified")])
     return "\n".join(lines)
 
 
 def _answer_screen_field_lineage(root: Path, program: str, question: str) -> str | None:
-    variables = _screen_variables(root, program)
-    if not variables:
+    artifact = load_or_build_screen_field_lineage(root, program)
+    content = artifact.get("content", {})
+    fields = content.get("fields", [])
+    if not isinstance(fields, list) or not fields:
         return None
 
-    by_name = {str(item.get("content", {}).get("variable", "")).upper(): item for item in variables}
+    by_name = {str(item.get("field", "")).upper(): item for item in fields if isinstance(item, dict)}
     tokens = [
         token
         for token in re.findall(r"\b[A-Z][A-Z0-9-]{2,}\b", question.upper())
@@ -1171,32 +1345,46 @@ def _answer_screen_field_lineage(root: Path, program: str, question: str) -> str
     ]
     exact = next((token for token in tokens if token in by_name), None)
     if exact:
-        return _format_variable_lineage(program, by_name[exact])
+        return _format_screen_field_lineage(program, by_name[exact])
 
     related = []
     for token in tokens:
-        related.extend(name for name in by_name if name.startswith(token) or token.startswith(name))
+        related.extend(
+            name
+            for name, field in by_name.items()
+            if name.startswith(token)
+            or token.startswith(name)
+            or str(field.get("family", "")).startswith(token)
+            or token.startswith(str(field.get("family", "")))
+        )
     related = sorted(set(related))
     if related:
-        lines = [f"I found several {program} screen/map variables matching the field reference:"]
+        lines = [f"I found several {program} screen/map fields matching the reference:"]
         for name in related[:10]:
-            content = by_name[name].get("content", {})
+            field = by_name[name]
             lines.append(
-                f"- {name}: origin {content.get('origin', '?')}; "
-                f"defined in {_join_or_none(content.get('defined_in', []))}; "
-                f"modified in {_join_or_none(content.get('modified_in', []))}; "
-                f"used in {_join_or_none(content.get('used_in', []))}"
+                f"- {name}: origin {field.get('origin', '?')}; "
+                f"family {field.get('family', '?')}; "
+                f"modified in {_join_or_none(field.get('modified_in', []))}; "
+                f"used in {_join_or_none(field.get('used_in', []))}; "
+                f"controls flow: {'yes' if field.get('controls_flow') else 'no'}"
             )
         lines.append("Ask again with one exact field name to get the full origin/computation trace.")
+        _append_evidence(lines, [_cite("screen_field_lineage/screen_field_lineage.json", detail="fields")])
         return "\n".join(lines)
 
     candidate_names = sorted(by_name)[:20]
-    return (
-        "I need the concrete map field name to trace data origin/computation safely. "
-        f"For {program}, the screen/map variables I can trace from COPY `PDCBVCM` include: "
-        f"{', '.join(candidate_names)}. "
-        "Ask for one field, for example: `What feeds SCELTAI on the screen?`"
-    )
+    lines = [
+        "I need the concrete map field name to trace data origin/computation safely.",
+        (
+            f"For {program}, `screen_field_lineage` can trace {len(by_name)} screen/map variables "
+            f"from copybook origin(s) {', '.join(content.get('copybook_origins', [])) or 'unknown'}."
+        ),
+        f"Examples: {', '.join(candidate_names)}.",
+        "Ask for one field, for example: `What feeds SCELTAI on the screen?`",
+    ]
+    _append_evidence(lines, [_cite("screen_field_lineage/screen_field_lineage.json", detail="fields")])
+    return "\n".join(lines)
 
 
 def _screen_variables(root: Path, program: str) -> list[dict[str, Any]]:
@@ -1233,7 +1421,64 @@ def _format_variable_lineage(program: str, payload: dict[str, Any]) -> str:
             line = site.get("line_start", "?")
             paragraph = site.get("paragraph", "?")
             statement = str(site.get("statement", "")).strip()
-            lines.append(f"  - line {line} {paragraph}: {statement}")
+            lines.append(f"  - line {line} {paragraph}: {statement} [{_site_citation(payload, line)}]")
+    _append_evidence(lines, [_site_citation(payload, _line_from_site_list(payload, "read_sites") or _line_from_site_list(payload, "write_sites"))])
+    return "\n".join(lines)
+
+
+def _format_screen_field_lineage(program: str, field: dict[str, Any]) -> str:
+    name = str(field.get("field", "?"))
+    lines = [
+        f"{program} screen/map field `{name}` lineage from `screen_field_lineage`:",
+        f"- origin: {field.get('origin', '?')}",
+        f"- BMS-style family: {field.get('family', '?')} ({', '.join(field.get('family_members', [])) or name})",
+        f"- defined in: {_join_or_none(field.get('defined_in', []))}",
+        f"- modified in: {_join_or_none(field.get('modified_in', []))}",
+        f"- used in: {_join_or_none(field.get('used_in', []))}",
+        f"- controls flow: {'yes' if field.get('controls_flow') else 'no'}",
+    ]
+    if field.get("read_sites"):
+        lines.append("- read/input/control use:")
+        for site in field.get("read_sites", [])[:8]:
+            lines.append(
+                f"  - line {site.get('line_start')} `{site.get('paragraph')}`: "
+                f"{site.get('statement')} [{site.get('citation')}]"
+            )
+    if field.get("write_sites"):
+        lines.append("- direct writes:")
+        for site in field.get("write_sites", [])[:8]:
+            lines.append(
+                f"  - line {site.get('line_start')} `{site.get('paragraph')}`: "
+                f"{site.get('statement')} [{site.get('citation')}]"
+            )
+    if field.get("control_sites"):
+        lines.append("- control-flow use:")
+        for site in field.get("control_sites", [])[:8]:
+            lines.append(
+                f"  - line {site.get('line_start')} `{site.get('paragraph')}`: "
+                f"{site.get('statement')} [{site.get('citation')}]"
+            )
+    if field.get("literal_assignments"):
+        lines.append("- related screen literal/attribute assignments in the same field family:")
+        for item in field.get("literal_assignments", [])[:8]:
+            lines.append(
+                f"  - line {item.get('line')} `{item.get('paragraph')}`: "
+                f"{item.get('target_variable')} = {item.get('literal')} [{item.get('citation')}]"
+            )
+    if field.get("related_variables"):
+        lines.append("- connected variables seen in the same statements:")
+        for item in field.get("related_variables", [])[:8]:
+            lines.append(
+                f"  - `{item.get('variable')}` at line {item.get('line')} "
+                f"({item.get('relationship')}) [{item.get('citation')}]"
+            )
+    _append_evidence(
+        lines,
+        [
+            _cite("screen_field_lineage/screen_field_lineage.json", detail=name),
+            str(field.get("source_artifact", "")),
+        ],
+    )
     return "\n".join(lines)
 
 
@@ -1319,6 +1564,13 @@ def _answer_db2_sql(root: Path, program: str) -> str | None:
     if sql:
         includes = [str(item.get("content", {}).get("include") or item.get("title", "")) for item in sql]
         lines.append(f"- SQL includes: {', '.join(includes)}")
+    _append_evidence(
+        lines,
+        [
+            _cite("architecture.db2_table/*.json", detail="DB2 table artifacts"),
+            _cite("architecture.sqlinclude/*.json", detail="SQL include artifacts"),
+        ],
+    )
     return "\n".join(lines)
 
 
@@ -1327,6 +1579,7 @@ def _answer_datasets(root: Path, program: str) -> str:
     content = artifact.get("content", {})
     if content.get("has_jcl_linkage"):
         lines = [f"{program} JCL file-I/O evidence from `jcl.file_io`:"]
+        evidence: list[str] = [_cite("jcl.file_io/" + f"jcl.file_io.{program.upper()}.json", detail="derived artifact")]
         jobs = content.get("matching_jobs", [])
         if jobs:
             lines.append("- matching job(s): " + ", ".join(str(job.get("job")) for job in jobs))
@@ -1336,25 +1589,46 @@ def _answer_datasets(root: Path, program: str) -> str:
         if reads:
             lines.append(f"- reads ({len(reads)}):")
             for item in reads[:10]:
-                lines.append(f"  - {item.get('job')}/{item.get('step')} {item.get('ddname')}: {item.get('dsn')}")
+                lines.append(
+                    f"  - {item.get('job')}/{item.get('step')} {item.get('ddname')}: "
+                    f"{item.get('dsn')} [{item.get('citation')}]"
+                )
+                evidence.append(str(item.get("citation", "")))
         if writes:
             lines.append(f"- writes/produces ({len(writes)}):")
             for item in writes[:10]:
-                lines.append(f"  - {item.get('job')}/{item.get('step')} {item.get('ddname')}: {item.get('dsn')}")
+                lines.append(
+                    f"  - {item.get('job')}/{item.get('step')} {item.get('ddname')}: "
+                    f"{item.get('dsn')} [{item.get('citation')}]"
+                )
+                evidence.append(str(item.get("citation", "")))
         if sysout:
             lines.append(f"- SYSOUT outputs ({len(sysout)}):")
             for item in sysout[:8]:
-                lines.append(f"  - {item.get('job')}/{item.get('step')} {item.get('ddname')}: SYSOUT={item.get('sysout')} OUTPUT={item.get('output')}")
+                lines.append(
+                    f"  - {item.get('job')}/{item.get('step')} {item.get('ddname')}: "
+                    f"SYSOUT={item.get('sysout')} OUTPUT={item.get('output')} [{item.get('citation')}]"
+                )
+                evidence.append(str(item.get("citation", "")))
+        _append_evidence(lines, evidence)
         return "\n".join(lines)
 
     known_jobs = content.get("known_jobs", [])
     known_programs = content.get("known_programs_sample", [])
-    return (
+    lines = [
         f"`jcl.file_io` found no JCL dataset/file-I/O linkage for {program}. "
         "Produced datasets are not evidenced for this program in the available final_scripts artifacts. "
         f"Known JCL job(s) in the artifact set: {', '.join(known_jobs) or 'none'}. "
         f"Known batch program sample: {', '.join(known_programs[:10]) or 'none'}."
+    ]
+    _append_evidence(
+        lines,
+        [
+            _cite("jcl.file_io/" + f"jcl.file_io.{program.upper()}.json", detail="derived artifact"),
+            _cite("jcl/**/*.json", detail="scanned JCL summaries and steps"),
+        ],
     )
+    return "\n".join(lines)
 
 
 def _answer_ui_navigation(root: Path, program: str) -> str | None:
@@ -1368,6 +1642,7 @@ def _answer_ui_navigation(root: Path, program: str) -> str | None:
             f"- {action.get('context')}: key {action.get('key')} -> {action.get('target')} "
             f"({action.get('edge_type')})"
         )
+    _append_evidence(lines, [_cite("ui.cics.navigation/ui.cics.navigation.json", detail="content.actions/maps")])
     return "\n".join(lines)
 
 
@@ -1386,4 +1661,5 @@ def _answer_business_rules(root: Path, program: str) -> str | None:
         condition = content.get("condition") or content.get("if") or rule.get("embedding_text", "")
         target = content.get("target") or content.get("then") or ""
         lines.append(f"- {rule_id}: {condition} {target}".strip())
+    _append_evidence(lines, [_cite("business_rule/business_rule*.json", detail="rule artifacts")])
     return "\n".join(lines)

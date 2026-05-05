@@ -30,6 +30,10 @@ def answer_from_final_scripts(question: str) -> str | None:
 
     q = question.lower()
 
+    variable_answer = _answer_variable_reference(root, program, question)
+    if variable_answer:
+        return variable_answer
+
     if _asks_about_program_overview(q, question, program):
         answer = _answer_program_overview(root, program)
         if answer:
@@ -576,6 +580,104 @@ def _variables_in_question(question: str) -> list[str]:
         if token not in ignored and ("-" in token or token.startswith(("W", "PD", "TWCOB", "PX", "SQL"))):
             names.append(token)
     return list(dict.fromkeys(names))
+
+
+def _known_variables(root: Path, program: str) -> set[str]:
+    dataflow_dir = root / "dataflow.variable"
+    return {
+        path.name.removeprefix("dataflow.variable.").removesuffix(".json").upper()
+        for path in dataflow_dir.glob("dataflow.variable.*.json")
+        if path.is_file()
+    }
+
+
+def _variable_reference_tokens(question: str) -> list[str]:
+    ignored = {
+        "ABOUT",
+        "COBOL",
+        "CODE",
+        "DOES",
+        "FILE",
+        "FUNCTION",
+        "METHOD",
+        "PROGRAM",
+        "REPOSITORY",
+        "STORES",
+        "STORE",
+        "WHAT",
+        "WHERE",
+        "WHICH",
+    }
+    tokens = [
+        token
+        for token in re.findall(r"\b[A-Z][A-Z0-9-]{2,}\b", question.upper())
+        if token not in ignored
+    ]
+    return list(dict.fromkeys(tokens))
+
+
+def _looks_like_variable_reference_question(q: str) -> bool:
+    return any(
+        term in q
+        for term in (
+            "what does",
+            "what is",
+            "what stores",
+            "stores",
+            "store",
+            "variable",
+            "field",
+            "calculated",
+            "computed",
+            "set",
+            "used",
+            "modified",
+            "read",
+            "written",
+            "origin",
+            "value",
+        )
+    )
+
+
+def _answer_variable_reference(root: Path, program: str, question: str) -> str | None:
+    q = question.lower()
+    if not _looks_like_variable_reference_question(q):
+        return None
+
+    known = _known_variables(root, program)
+    if not known:
+        return None
+
+    tokens = _variable_reference_tokens(question)
+    variables = [_variable_payload(root, program, token) for token in tokens if token in known]
+    variables = [variable for variable in variables if variable]
+    if variables:
+        lines = [f"{program} variable evidence:"]
+        for variable in variables[:4]:
+            lines.append(_format_variable_lineage(program, variable))
+        return "\n\n".join(lines)
+
+    unknowns = [
+        token
+        for token in tokens
+        if token not in {program, "PDCBVC", "COBOL", "CBL"} and _looks_like_variable_name(token)
+    ]
+    if not unknowns:
+        return None
+    unknown = unknowns[0]
+    close = _closest_program(unknown, sorted(known))
+    lines = [f"I do not have indexed dataflow evidence for variable `{unknown}` in `{program}`."]
+    if close:
+        lines.append(f"Closest indexed variable: `{close}`. Ask about `{close}` if that is what you meant.")
+    lines.append("Check the variable name or regenerate the analysis artifacts if this variable should exist.")
+    return "\n".join(lines)
+
+
+def _looks_like_variable_name(token: str) -> bool:
+    if "-" in token:
+        return True
+    return token.startswith(("W", "PD", "TWCOB", "PX", "SQL", "FUNZ", "M1", "SCELTA"))
 
 
 def _paragraph_names(root: Path, program: str) -> set[str]:

@@ -26,6 +26,11 @@ def answer_from_final_scripts(question: str) -> str | None:
 
     q = question.lower()
 
+    if _asks_about_program_overview(q, question, program):
+        answer = _answer_program_overview(root, program)
+        if answer:
+            return answer
+
     if _asks_about_copybooks(q) and "unused" in q:
         answer = _answer_copybooks(root, program, q)
         if answer:
@@ -290,12 +295,108 @@ def _asks_about_business_rules(q: str) -> bool:
 
 
 def _read_json(path: Path) -> Any | None:
-    if not path.exists():
+    candidates = [path]
+    if len(path.parents) >= 2:
+        # Support both historical final_scripts layout:
+        #   root/program_summary/program.summary.json
+        # and generated pipeline layout:
+        #   root/program.summary.json
+        flat_candidate = path.parent.parent / path.name
+        if flat_candidate not in candidates:
+            candidates.append(flat_candidate)
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            return json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+    return None
+
+
+def _asks_about_program_overview(q: str, question: str, program: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", " ", q).strip()
+    if normalized == program.lower():
+        return True
+    if program.lower() not in q:
+        return False
+    return any(
+        term in q
+        for term in (
+            "explain the code",
+            "explain code",
+            "explain the program",
+            "describe the program",
+            "summarize",
+            "summary",
+            "overview",
+            "purpose",
+            f"what is {program.lower()}",
+        )
+    )
+
+
+def _answer_program_overview(root: Path, program: str) -> str | None:
+    summary = _summary_payload(root, program)
+    if not summary:
         return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+
+    meta = summary.get("meta", {}) if isinstance(summary.get("meta"), dict) else {}
+    loc = meta.get("loc") or _extract_approx_loc(summary)
+    paragraphs = meta.get("paragraphs") or _extract_paragraph_count(summary)
+    statements = meta.get("statements")
+
+    lines = [f"{program} overview from the indexed analysis:"]
+    if summary.get("content"):
+        lines.append(f"- {summary.get('content')}")
+    metric_parts = []
+    if loc is not None:
+        metric_parts.append(f"{loc} LOC")
+    if statements is not None:
+        metric_parts.append(f"{statements} statements")
+    if paragraphs is not None:
+        metric_parts.append(f"{paragraphs} paragraphs")
+    if metric_parts:
+        lines.append(f"- Size: {', '.join(str(part) for part in metric_parts)}.")
+
+    calls = _calls(root, program)
+    if calls:
+        call_bits = []
+        for call in calls[:8]:
+            target = call.get("target", "?")
+            call_type = call.get("call_type", "?")
+            paragraph = call.get("paragraph", "?")
+            call_bits.append(f"{target} ({call_type} in {paragraph})")
+        lines.append(f"- External interactions: {len(calls)} outgoing call(s): {', '.join(call_bits)}.")
+
+    copybooks = _read_json(root / "architecture.copybooks" / "architecture.copybooks.json")
+    if isinstance(copybooks, dict) and copybooks.get("program") == program:
+        all_copybooks = copybooks.get("content", {}).get("all", [])
+        if all_copybooks:
+            lines.append(f"- COPY usage: {len(all_copybooks)} COPY member(s): {', '.join(all_copybooks)}.")
+
+    comments = _comments_payload(root, program)
+    if comments:
+        comment_count = comments.get("count")
+        commented_out = comments.get("classification_counts", {}).get("commented_out_code")
+        comment_bits = []
+        if comment_count is not None:
+            comment_bits.append(f"{comment_count} comment lines")
+        if commented_out is not None:
+            comment_bits.append(f"{commented_out} commented-out code/data item(s)")
+        if comment_bits:
+            lines.append(f"- Comment evidence: {', '.join(comment_bits)}.")
+
+    _append_evidence(
+        lines,
+        [
+            _cite("program_summary/program.summary.json", detail="program overview"),
+            _cite("architecture.call_parameters/architecture.call_parameters.json", detail="outgoing calls"),
+            _cite("architecture.copybooks/architecture.copybooks.json", detail="COPY usage"),
+            _cite("program.comments/program.comments.json", detail="comment metrics"),
+        ],
+    )
+    return "\n".join(lines)
 
 
 def _cfg_edges(root: Path, program: str) -> list[dict[str, Any]]:

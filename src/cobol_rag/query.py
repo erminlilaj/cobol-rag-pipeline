@@ -239,7 +239,55 @@ Final answer:
     text = str(response.text).strip()
     if not text:
         return evidence_answer
+    if not _polish_preserves_structured_evidence(evidence_answer, text):
+        return evidence_answer
     return text
+
+
+def _polish_preserves_structured_evidence(evidence_answer: str, polished_answer: str) -> bool:
+    required = _protected_evidence_terms(evidence_answer)
+    if not required:
+        return True
+
+    haystack = polished_answer.upper()
+    missing = [term for term in required if term.upper() not in haystack]
+    if missing:
+        return False
+    return not _looks_like_identifier_corruption(evidence_answer, polished_answer)
+
+
+def _protected_evidence_terms(text: str) -> list[str]:
+    terms: list[str] = []
+    terms.extend(re.findall(r"`([^`]{3,80})`", text))
+    terms.extend(re.findall(r"\b[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+\b", text))
+    terms.extend(re.findall(r"\b(?:PD|PX|PR|DFH|TWCOB|SQL|M1|W)[A-Z0-9-]{2,}\b", text))
+    terms.extend(re.findall(r"\bABEND00\b", text))
+    terms.extend(re.findall(r"\bline\s+\d+\b", text, flags=re.IGNORECASE))
+
+    ignored = {"UNKNOWN", "WORKING-STORAGE", "COMMAREA", "COPY", "CICS", "CALL", "JUMP", "LINK"}
+    unique: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        cleaned = term.strip()
+        if not cleaned or cleaned.upper() in ignored or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        unique.append(cleaned)
+    return unique[:120]
+
+
+def _looks_like_identifier_corruption(evidence_answer: str, polished_answer: str) -> bool:
+    original_terms = {term.upper() for term in _protected_evidence_terms(evidence_answer)}
+    polished_terms = set(re.findall(r"\b[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+\b", polished_answer.upper()))
+    suspicious = [
+        term
+        for term in polished_terms
+        if term not in original_terms and (
+            term.startswith("BROWN")
+            or term.startswith("BROWSE") and not any(source.startswith(term) or term.startswith(source) for source in original_terms)
+        )
+    ]
+    return bool(suspicious)
 
 
 def _try_program_metadata_answer(question: str) -> str | None:

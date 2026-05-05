@@ -952,13 +952,17 @@ def _answer_structured_behavior(root: Path, program: str, question: str) -> str 
         return _answer_variables_from_question(root, program, question)
     if _asks_about_pagination(q):
         return _answer_pagination(root, program)
-    if _asks_about_row_selection(q):
-        return _answer_row_selection(root, program)
     if _asks_about_pf_key_comparison(q):
         return _answer_pf_key_comparison(root, program)
     paragraphs = _paragraphs_in_question(root, program, question)
     if paragraphs and _asks_about_paragraph_behavior(q):
+        if paragraphs[0] == "PREP-RIGA" and _asks_about_display_row_build(q):
+            answer = _answer_prep_riga_row_build(root, program)
+            if answer:
+                return answer
         return _answer_paragraph_behavior(root, program, paragraphs[0])
+    if _asks_about_row_selection(q):
+        return _answer_row_selection(root, program)
     key_answer = _answer_key_flow(root, program, question)
     if key_answer:
         return key_answer
@@ -1013,7 +1017,11 @@ def _asks_about_pagination(q: str) -> bool:
 
 
 def _asks_about_row_selection(q: str) -> bool:
-    return any(term in q for term in ("selects a row", "selected progressivo", "progressivo", "selected accounting voice"))
+    return any(term in q for term in ("selects a row", "selected progressivo", "selected accounting voice"))
+
+
+def _asks_about_display_row_build(q: str) -> bool:
+    return any(term in q for term in ("displayed row", "build each", "build", "row", "voice code", "installment amount", "progressivo"))
 
 
 def _asks_about_pf_key_comparison(q: str) -> bool:
@@ -1074,6 +1082,8 @@ def _asks_about_paragraph_behavior(q: str) -> bool:
         term in q
         for term in (
             "what happens",
+            "build",
+            "displayed row",
             "explain",
             "sequence",
             "flow",
@@ -1081,6 +1091,7 @@ def _asks_about_paragraph_behavior(q: str) -> bool:
             "do in",
             "does",
             "operations",
+            "row",
             "before",
             "after",
         )
@@ -1496,6 +1507,62 @@ def _answer_paragraph_behavior(root: Path, program: str, paragraph: str) -> str 
     return "\n".join(lines)
 
 
+def _answer_prep_riga_row_build(root: Path, program: str) -> str | None:
+    paragraph = "PREP-RIGA"
+    variable_sites = [
+        *_paragraph_variable_sites(root, program, paragraph),
+        *_paragraph_variable_sites(root, program, "PREP-RIGA-010"),
+    ]
+    if not variable_sites:
+        return None
+
+    by_line = {int(site["line"]): site for site in variable_sites if str(site.get("line", "")).isdigit()}
+    interesting_lines = [701, 702, 703, 707, 708, 709, 712, 713, 714, 715, 716, 724, 725, 732, 734, 736, 737, 739]
+    lines = [f"{program} builds each displayed row in `PREP-RIGA` from dataflow and CFG evidence:"]
+
+    descriptions = {
+        701: "clears `RIGA-MAPPA`, the row buffer.",
+        702: "moves `WCTRIG` to `WPROGR`, the displayed row/progressivo marker.",
+        703: "moves `PD1VOCI-TABVOX-CODVOX(PD1VOCI-IND)` to `VOCE`, the accounting voice code source.",
+        707: "sets `FUNZ`: spaces for insert flow, otherwise `PD1VOCI-TABVOX-TIPVAR(PD1VOCI-IND)`.",
+        708: "moves `WVOCE` to `WCODVO`, preparing the displayed voice code field.",
+        709: "moves `PD1VOCI-TABVOX-DESCRIZ(PD1VOCI-IND)` to `WDESCVO`, the displayed description.",
+        712: "moves `PD1VOCI-TABVOX-INIZ(PD1VOCI-IND)` to `WDATE2` for start-date formatting.",
+        713: "moves `WDATE2-AA34` to `WDATA-AA`.",
+        714: "moves `WDATE2-MM` to `WDATA-MM`.",
+        715: "moves `WDATE2-GG` to `WDATA-GG`.",
+        716: "moves formatted `WDATA` to `DATA-IMPIANTO`, the displayed start date.",
+        724: "checks whether `PD1VOCI-TABVOX-FINE(PD1VOCI-IND)` is spaces for the end date.",
+        725: "when the end date is blank, moves the placeholder `'   -    '` to `DATA-CESSAZIONE`.",
+        732: "sets `PDRUTI01-FUNZIONE` to `'05'` before amount formatting.",
+        734: "moves the raw installment value to `PDRUTI01-F05-VALORE`.",
+        736: "moves formatted `PDRUTI01-F05-IMPOX11` to `IMPORTO-RATA`, the displayed installment amount.",
+        737: "moves `PD1VOCI-TABVOX-PROGVOX(PD1VOCI-IND)` to `WPROGREC`, the record progressivo.",
+        739: "moves the built `RIGA-MAPPA` into `MRIGAO(WCTRIG)`.",
+    }
+    for line in interesting_lines:
+        site = by_line.get(line)
+        if not site:
+            continue
+        lines.append(f"- line {line}: {descriptions[line]} `{site['statement']}`")
+
+    outgoing = [edge for edge in _cfg_edges(root, program) if str(edge.get("from", "")).upper() == paragraph]
+    if outgoing:
+        lines.append("- control/service steps:")
+        for edge in outgoing:
+            condition = edge.get("condition") or "unconditional"
+            lines.append(f"  - `{paragraph}` -> `{edge.get('to')}` when `{condition}` ({edge.get('evidence', '')})")
+
+    _append_evidence(
+        lines,
+        [
+            _cite("dataflow.variable/*.json", detail="PREP-RIGA row variable sites"),
+            _cite("controlflow.cfg/controlflow.cfg.json", detail="PREP-RIGA service/control edges"),
+        ],
+    )
+    return "\n".join(lines)
+
+
 def _paragraph_variable_sites(root: Path, program: str, paragraph: str) -> list[dict[str, str]]:
     sites: list[dict[str, str]] = []
     dataflow_dir = root / "dataflow.variable"
@@ -1519,8 +1586,14 @@ def _paragraph_variable_sites(root: Path, program: str, paragraph: str) -> list[
                         "statement": str(site.get("statement", "")).strip(),
                     }
                 )
-                break
-    return sites
+    return sorted(
+        sites,
+        key=lambda item: (
+            int(item["line"]) if str(item.get("line", "")).isdigit() else 10**9,
+            item["variable"],
+            item["kind"],
+        ),
+    )
 
 
 def _answer_error_paths(root: Path, program: str) -> str | None:

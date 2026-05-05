@@ -144,6 +144,15 @@
       }
     },
     {
+      "id": "control.prep_riga_row_build",
+      "category": "control_flow",
+      "question": "In PDCBVC.CBL, how does the program build each displayed row in PREP-RIGA, including voice code, description, start date, end date, installment amount, and record progressivo?",
+      "assertions": {
+        "contains_all": ["PREP-RIGA", "RIGA-MAPPA", "PD1VOCI-TABVOX-CODVOX", "PD1VOCI-TABVOX-DESCRIZ", "PD1VOCI-TABVOX-INIZ", "DATA-IMPIANTO", "PD1VOCI-TABVOX-FINE", "DATA-CESSAZIONE", "PDRUTI01-F05-IMPOX11", "IMPORTO-RATA", "PD1VOCI-TABVOX-PROGVOX", "WPROGREC", "MRIGAO"],
+        "forbidden": ["SCELTAI is not equal to", "go to BROWSE-FASE2-SEL"]
+      }
+    },
+    {
       "id": "control.pf_key_comparison",
       "category": "control_flow",
       "question": "In PDCBVC.CBL, compare the control-flow behavior of function keys PF1, PF2, PF3, PF4, and PF9. Which target programs are selected, and what common TWA reset logic is applied?",

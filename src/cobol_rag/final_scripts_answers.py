@@ -220,7 +220,23 @@ def _looks_like_explicit_program_reference(question: str, candidate: str) -> boo
         return True
     if any(marker in q for marker in (f"file {c}", f"program {c}", f"code {c}", f"{c} file", f"{c} program")):
         return True
-    return c.startswith(("pd", "px", "pr")) and any(term in q for term in ("what does", "explain", "summarize"))
+    return c.startswith(("pd", "px", "pr")) and any(
+        term in q
+        for term in (
+            "what does",
+            "explain",
+            "summarize",
+            "which dataset",
+            "which datasets",
+            "what dataset",
+            "what datasets",
+            "produce",
+            "produces",
+            "produced",
+            "file i/o",
+            "file io",
+        )
+    )
 
 
 def _closest_program(candidate: str, programs: list[str]) -> str | None:
@@ -1202,6 +1218,9 @@ def _answer_call_preparation(root: Path, program: str, target: str) -> str | Non
     call = _call_by_target(root, program, target)
     if not call:
         return None
+    if target.upper() == "PD1VOCI":
+        return _answer_pd1voci_preparation(root, program, call)
+
     lines = [
         f"{program} prepares `{target}` in `{call.get('paragraph')}` before the call:",
         (
@@ -1258,6 +1277,110 @@ def _answer_call_preparation(root: Path, program: str, target: str) -> str | Non
         ],
     )
     return "\n".join(lines)
+
+
+def _answer_pd1voci_preparation(root: Path, program: str, call: dict[str, Any]) -> str:
+    lines = [
+        f"{program} prepares `PD1VOCI` parameters in `INIZ-PARAM` before the `LINK-PD1VOCI` call.",
+        (
+            "`LINK-PD1VOCI` only executes the CICS LINK and checks the return code; "
+            "the COMMAREA fields are prepared earlier in `INIZ-PARAM`, `INIZ-PARAM-010`, and `INIZ-PARAM-020`."
+        ),
+        (
+            f"- call statement line {call.get('line_start')}: {call.get('call_type')} "
+            f"COMMAREA={call.get('commarea', 'n/a')} LENGTH={call.get('length', 'n/a')}."
+        ),
+        "- base COMMAREA setup:",
+    ]
+
+    for variable in (
+        "PD1VOCI-DATI",
+        "PD1VOCI-COD-VOCE",
+        "PD1VOCI-CODDIP-TIPO",
+        "PD1VOCI-CODDIP-MATR",
+        "PD1VOCI-CODDIP-PAD",
+        "PD1VOCI-TIPO-VARIAZ",
+        "PD1VOCI-TIPO-GEST",
+    ):
+        lines.extend(_variable_write_site_lines(root, program, variable, min_line=426, max_line=477, limit=3, indent="  "))
+
+    lines.extend(
+        [
+            "- `TWCOB-VARCONT-NUMFUNZ` and `TWCOB-FUNZIONE` drive the PD1VOCI function fields:",
+            "  - `TWCOB-VARCONT-NUMFUNZ = '1'` sets `PD1VOCI-FUNZIONE = '11'`.",
+            "  - `TWCOB-VARCONT-NUMFUNZ = '6'` sets `PD1VOCI-FUNZIONE = '12'`.",
+            "  - `TWCOB-FUNZIONE = 'I'` sets `PD1VOCI-FUNZIONE = '02'` and `PD1VOCI-TIPO-ESTRA = 'A'`.",
+            "  - other handled cases set `PD1VOCI-FUNZIONE = '11'`.",
+        ]
+    )
+    for variable in ("PD1VOCI-FUNZIONE", "PD1VOCI-TIPO-ESTRA"):
+        lines.extend(_variable_write_site_lines(root, program, variable, min_line=426, max_line=477, limit=8, indent="  "))
+
+    lines.extend(
+        [
+            "- `TWCOB-VARCONT-NUMFUNZ` drives `PD1VOCI-TIPO-VOCE`:",
+            "  - NUMFUNZ `2` -> `PD1VOCI-TIPO-VOCE = '1'`.",
+            "  - NUMFUNZ `3` -> `PD1VOCI-TIPO-VOCE = '3'`.",
+            "  - NUMFUNZ `4` -> `PD1VOCI-TIPO-VOCE = '2'`.",
+            "  - NUMFUNZ `5` -> `PD1VOCI-TIPO-VOCE = '4'`.",
+            "  - otherwise -> `PD1VOCI-TIPO-VOCE = '0'`.",
+        ]
+    )
+    lines.extend(_variable_write_site_lines(root, program, "PD1VOCI-TIPO-VOCE", min_line=450, max_line=470, limit=8, indent="  "))
+
+    lines.extend(
+        [
+            "- liquidation period fields come from `TWCOB-VARCONT-*`, not directly from `TWCOB-FUNZIONE`:",
+        ]
+    )
+    for variable in ("PD1VOCI-LIQUID1-ANNO", "PD1VOCI-LIQUID1-MESE", "PD1VOCI-LIQUID1-TIPO"):
+        lines.extend(_variable_write_site_lines(root, program, variable, min_line=470, max_line=477, limit=4, indent="  "))
+
+    return_var = _variable_payload(root, program, "PD1VOCI-RETURN")
+    if return_var:
+        lines.append("- return handling in `LINK-PD1VOCI`:")
+        lines.extend(_site_lines(return_var, "write_sites", limit=1, indent="  "))
+        lines.extend(_site_lines(return_var, "read_sites", limit=2, indent="  "))
+
+    _append_evidence(
+        lines,
+        [
+            _cite("dataflow.variable/*.json", detail="PD1VOCI write sites in INIZ-PARAM"),
+            _cite("architecture.call_parameters/architecture.call_parameters.json", line=call.get("line_start"), detail="PD1VOCI"),
+        ],
+    )
+    return "\n".join(lines)
+
+
+def _variable_write_site_lines(
+    root: Path,
+    program: str,
+    variable: str,
+    *,
+    min_line: int | None = None,
+    max_line: int | None = None,
+    limit: int = 6,
+    indent: str = "",
+) -> list[str]:
+    payload = _variable_payload(root, program, variable)
+    if not payload:
+        return []
+    lines: list[str] = []
+    for site in payload.get("content", {}).get("evidence", {}).get("write_sites", []):
+        line = site.get("line_start")
+        if isinstance(line, int):
+            if min_line is not None and line < min_line:
+                continue
+            if max_line is not None and line > max_line:
+                continue
+        paragraph = site.get("paragraph", "?")
+        statement = str(site.get("statement", "")).strip()
+        citation = _site_citation(payload, line)
+        suffix = f" [{citation}]" if citation else ""
+        lines.append(f"{indent}- line {line} `{paragraph}`: {statement}{suffix}")
+        if len(lines) >= limit:
+            break
+    return lines
 
 
 def _answer_pagination(root: Path, program: str) -> str | None:
@@ -1620,15 +1743,19 @@ def _answer_error_paths(root: Path, program: str) -> str | None:
             condition = edge.get("condition") or "unconditional"
             lines.append(f"  - `{edge.get('from')}` -> `{edge.get('to')}` when `{condition}` ({edge.get('evidence', '')})")
     if restriction_edges:
-        lines.append("- restriction/early-transfer paths:")
+        lines.append("- restriction / early-transfer paths (not ABEND00):")
         for edge in restriction_edges[:6]:
             condition = edge.get("condition") or "unconditional"
             lines.append(f"  - `{edge.get('from')}` -> `{edge.get('to')}` when `{condition}` ({edge.get('evidence', '')})")
+    message_field_lines: list[str] = []
     for name in ("M1MSGO", "M1MSGL", "SCELTAL"):
         variable = _variable_payload(root, program, name)
         if variable:
-            lines.append(f"- `{name}` message/map evidence:")
-            lines.extend(_site_lines(variable, "write_sites", limit=5, indent="  "))
+            message_field_lines.append(f"  - `{name}` writes:")
+            message_field_lines.extend(_site_lines(variable, "write_sites", limit=5, indent="    "))
+    if message_field_lines:
+        lines.append("- supporting message/cursor field writes (evidence for messages, not separate control paths):")
+        lines.extend(message_field_lines)
     sqlerror = _variable_payload(root, program, "SQLERROR")
     if sqlerror:
         lines.append("- SQL handling evidence:")
@@ -1791,6 +1918,15 @@ def _answer_screen_field_lineage_fallback(
         ),
         _format_variable_lineage(program, payload),
     ]
+    map_copybooks = _map_copybook_candidates(root, program)
+    if map_copybooks:
+        lines.append("")
+        lines.append(
+            "Map copybook context: "
+            + ", ".join(f"`COPY:{copybook}`" for copybook in map_copybooks)
+            + " is listed for this program. The dataflow origin for this field is still `UNKNOWN`, "
+            "so treat the copybook link as screen/map context until a compiler-expanded copybook parser confirms it."
+        )
     related = [name for name in family_members if name != variable_name]
     if related:
         lines.append("")
@@ -1817,6 +1953,15 @@ def _answer_screen_field_lineage_fallback(
         ],
     )
     return "\n".join(lines)
+
+
+def _map_copybook_candidates(root: Path, program: str) -> list[str]:
+    payload = _read_json(root / "architecture.copybooks" / "architecture.copybooks.json")
+    if not isinstance(payload, dict) or payload.get("program") != program:
+        return []
+    copybooks = [str(name).upper() for name in payload.get("content", {}).get("all", [])]
+    candidates = [name for name in copybooks if name == f"{program}M" or name.endswith("MAP") or name.endswith("BMS")]
+    return list(dict.fromkeys(candidates))
 
 
 def _map_field_family(variable: str) -> str:

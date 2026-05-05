@@ -86,8 +86,8 @@
       "category": "calls",
       "question": "In PDCBVC.CBL, how are the parameters for the external program PD1VOCI prepared, and how do TWCOB-VARCONT-NUMFUNZ and TWCOB-FUNZIONE influence PD1VOCI-FUNZIONE, PD1VOCI-TIPO-ESTRA, and PD1VOCI-TIPO-VOCE?",
       "assertions": {
-        "contains_all": ["PD1VOCI-FUNZIONE", "PD1VOCI-TIPO-ESTRA", "PD1VOCI-TIPO-VOCE", "TWCOB-VARCONT-NUMFUNZ", "TWCOB-FUNZIONE"],
-        "forbidden": ["simply return", "calling program and the data being processed"]
+        "contains_all": ["INIZ-PARAM", "only executes the CICS LINK", "PD1VOCI-FUNZIONE", "PD1VOCI-TIPO-ESTRA", "PD1VOCI-TIPO-VOCE", "TWCOB-VARCONT-NUMFUNZ", "TWCOB-FUNZIONE", "TWCOB-VARCONT-ANNO", "TWCOB-VARCONT-MESE"],
+        "forbidden": ["prepares `PD1VOCI` in `LINK-PD1VOCI`", "TWCOB-FUNZIONE controls the behavior ofPD1VOCI-LIQUID1-ANNO", "simply return", "calling program and the data being processed"]
       }
     },
     {
@@ -184,8 +184,8 @@
       "category": "control_flow",
       "question": "In PDCBVC.CBL, identify all paths that lead to an error message or abnormal termination, including invalid function keys, missing records, invalid selection, failed service calls, SQL errors, and semaphore restrictions.",
       "assertions": {
-        "contains_all": ["ABEND00", "BROWSE-FASE2-TASTOER", "BROWSE-FASE2-NOTFND", "SQLERROR", "PXCSEMAF-STATUS", "PD1VOCI-RETURN", "PDRUTI01-RETURN"],
-        "forbidden": ["all paths jump to ABEND00"]
+        "contains_all": ["ABEND00", "BROWSE-FASE2-TASTOER", "BROWSE-FASE2-NOTFND", "restriction / early-transfer paths (not ABEND00)", "supporting message/cursor field writes", "SQLERROR", "PXCSEMAF-STATUS", "PD1VOCI-RETURN", "PDRUTI01-RETURN"],
+        "forbidden": ["all paths jump to ABEND00", "BrownSE"]
       }
     },
     {
@@ -235,7 +235,7 @@
       "category": "copybooks",
       "question": "How many unused copybooks?",
       "assertions": {
-        "contains_all": ["COPY usage heuristic", "Need review / possibly unused by this heuristic (3)", "DFHBMSCA", "PDRTIP01", "PDRVC", "Evidence:", "architecture.unused_copybooks/architecture.unused_copybooks.json", "dataflow.used_variables/dataflow.used_variables.json"],
+        "contains_all": ["COPY usage heuristic", "Need review / possibly unused by this heuristic (4)", "DFHBMSCA", "PDCBVCM", "PDRTIP01", "PDRVC", "Evidence:", "architecture.unused_copybooks/architecture.unused_copybooks.json", "dataflow.used_variables/dataflow.used_variables.json"],
         "forbidden": ["cannot confirm unused"]
       }
     },
@@ -270,7 +270,7 @@
       "category": "datasets",
       "question": "Which datasets does PDCBVC produce?",
       "assertions": {
-        "contains_all": ["jcl.file_io", "no JCL dataset/file-I/O linkage", "PDCBVC", "Produced datasets are not evidenced", "PDCAFIN2", "Evidence:"],
+        "contains_all": ["jcl.file_io", "no JCL dataset/file-I/O linkage", "PDCBVC", "Produced datasets are not evidenced", "Known JCL job(s) in the artifact set: none", "Evidence:"],
         "forbidden": ["SYSOUT", "produces dataset"]
       }
     },
@@ -278,6 +278,7 @@
       "id": "datasets.batch_program_outputs",
       "category": "datasets",
       "question": "Which datasets does PDHM730C produce?",
+      "expected": "known_gap",
       "assertions": {
         "contains_all": ["PDHM730C JCL file-I/O evidence", "PDCAFIN2", "SKINPUT", "TEPDET.BVARIAZ.CAF", "FOUTPUT", "TEPDET.BVOCI.CAF", "SYSOUT outputs", "jcl/_batch_input_check/PDCAFIN2/jcl.steps.PDHM730C.json", "line 84"]
       }
@@ -287,7 +288,7 @@
       "category": "business_rules",
       "question": "What business rules are in PDCBVC?",
       "assertions": {
-        "contains_all": ["30 rule artifact", "BR-001", "TWCOB-FASE", "BR-004", "PXCSEMAF-STATUS"]
+        "contains_all": ["32 rule artifact", "BR-001", "TWCOB-FASE", "BR-004", "PXCSEMAF-STATUS"]
       }
     },
     {

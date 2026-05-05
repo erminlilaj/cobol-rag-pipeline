@@ -353,7 +353,23 @@ def _looks_like_explicit_program_reference(question: str, candidate: str) -> boo
     markers = (f"file {c}", f"program {c}", f"code {c}", f"{c} file", f"{c} program")
     if any(marker in q for marker in markers):
         return True
-    return c.startswith(("pd", "px", "pr")) and any(term in q for term in ("what does", "explain", "summarize"))
+    return c.startswith(("pd", "px", "pr")) and any(
+        term in q
+        for term in (
+            "what does",
+            "explain",
+            "summarize",
+            "which dataset",
+            "which datasets",
+            "what dataset",
+            "what datasets",
+            "produce",
+            "produces",
+            "produced",
+            "file i/o",
+            "file io",
+        )
+    )
 
 
 def _looks_like_unknown_variable_question(q: str, token: str) -> bool:
@@ -397,7 +413,26 @@ def _looks_like_unknown_copybook_question(q: str, token: str) -> bool:
 def _looks_like_unknown_program_question(q: str, token: str) -> bool:
     if not token.startswith(("PD", "PX", "PR")):
         return False
-    return any(term in q for term in ("file", "program", "code", "what does", "explain", "summarize"))
+    return any(
+        term in q
+        for term in (
+            "file",
+            "program",
+            "code",
+            "what does",
+            "explain",
+            "summarize",
+            "which dataset",
+            "which datasets",
+            "what dataset",
+            "what datasets",
+            "produce",
+            "produces",
+            "produced",
+            "file i/o",
+            "file io",
+        )
+    )
 
 
 def _looks_like_variable_name(token: str) -> bool:
@@ -472,6 +507,8 @@ _IGNORED_ENTITY_TOKENS = {
     "COPY",
     "COPYBOOK",
     "DATA",
+    "DATASET",
+    "DATASETS",
     "DB2",
     "DOES",
     "FILE",
@@ -497,6 +534,9 @@ _IGNORED_ENTITY_TOKENS = {
     "PRESSED",
     "PRESSES",
     "PRESSING",
+    "PRODUCE",
+    "PRODUCED",
+    "PRODUCES",
     "PROGRAM",
     "QUESTION",
     "SQL",

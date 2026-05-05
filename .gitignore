@@ -7,3 +7,16 @@ __pycache__/
 .ruff_cache/
 .env
 .codex
+
+# Generated/local RAG artifacts
+data/inbox/*.knowledge-base_rag/
+eval/
+src/*.egg-info/
+
+# Local research/report scratch files
+Agent.md
+COBOL_REKT_MERGE_IMPROVEMENT_PLAN.md
+FUSION_REPORT_HUMAN.md
+FUSION_RESEARCH.md
+RAG_PIPELINE_IMPROVEMENT_PLAN.md
+prompts/

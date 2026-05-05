@@ -20,6 +20,10 @@ def answer_from_final_scripts(question: str) -> str | None:
     if root is None:
         return None
 
+    unknown_program_answer = _answer_unknown_program_if_explicit(root, question)
+    if unknown_program_answer:
+        return unknown_program_answer
+
     program = _program_for_question(root, question)
     if program is None:
         return None
@@ -179,6 +183,66 @@ def _program_for_question(root: Path, question: str) -> str | None:
     return _primary_program_from_root(root) or candidate
 
 
+def _answer_unknown_program_if_explicit(root: Path, question: str) -> str | None:
+    candidate = program_from_question(question)
+    if not candidate:
+        return None
+    if not _looks_like_explicit_program_reference(question, candidate):
+        return None
+    core_programs = _core_programs_from_root(root)
+    if candidate in core_programs or program_has_jcl_evidence(root, candidate):
+        return None
+
+    indexed = sorted(core_programs)
+    close = _closest_program(candidate, indexed)
+    lines = [f"I do not have indexed analysis for `{candidate}`."]
+    if indexed:
+        lines.append(f"Indexed program(s) currently available: {', '.join(indexed)}.")
+    if close:
+        lines.append(f"Closest indexed name: `{close}`. Ask about `{close}` if that is what you meant.")
+    lines.append("Generate and index that program's analysis artifacts first, then ask again.")
+    return "\n".join(lines)
+
+
+def _looks_like_explicit_program_reference(question: str, candidate: str) -> bool:
+    q = question.lower()
+    c = candidate.lower()
+    normalized = re.sub(r"[^a-z0-9]+", " ", q).strip()
+    if normalized == c:
+        return True
+    if f"{c}.cbl" in q:
+        return True
+    if any(marker in q for marker in (f"file {c}", f"program {c}", f"code {c}", f"{c} file", f"{c} program")):
+        return True
+    return c.startswith(("pd", "px", "pr")) and any(term in q for term in ("what does", "explain", "summarize"))
+
+
+def _closest_program(candidate: str, programs: list[str]) -> str | None:
+    if not programs:
+        return None
+    distances = sorted((_edit_distance(candidate, program), program) for program in programs)
+    distance, program = distances[0]
+    return program if distance <= 2 else None
+
+
+def _edit_distance(left: str, right: str) -> int:
+    if left == right:
+        return 0
+    previous = list(range(len(right) + 1))
+    for i, left_char in enumerate(left, start=1):
+        current = [i]
+        for j, right_char in enumerate(right, start=1):
+            current.append(
+                min(
+                    previous[j] + 1,
+                    current[j - 1] + 1,
+                    previous[j - 1] + (left_char != right_char),
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
 def _default_program_from_root(root: Path) -> str | None:
     primary = _primary_program_from_root(root)
     if primary:
@@ -332,6 +396,9 @@ def _asks_about_program_overview(q: str, question: str, program: str) -> bool:
             "overview",
             "purpose",
             f"what is {program.lower()}",
+            f"what does {program.lower()} do",
+            f"what does the file {program.lower()} do",
+            f"what does the program {program.lower()} do",
         )
     )
 

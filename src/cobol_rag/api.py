@@ -112,6 +112,7 @@ def get_config_endpoint() -> Any:
         },
         "answers": {
             "require_citations": settings.answers.require_citations,
+            "llm_polish_final_scripts": settings.answers.llm_polish_final_scripts,
         }
     }
 

@@ -282,6 +282,42 @@
       }
     },
     {
+      "id": "entity.unknown_variable",
+      "category": "entity_validation",
+      "question": "What does FUNZA do?",
+      "assertions": {
+        "contains_all": ["I do not have indexed dataflow evidence for variable `FUNZA`", "Closest indexed variable: `FUNZ`", "will not infer"],
+        "forbidden": ["hypothetical", "common practices", "likely that FUNZA"]
+      }
+    },
+    {
+      "id": "entity.known_variable",
+      "category": "entity_validation",
+      "question": "What does FUNZ do?",
+      "assertions": {
+        "contains_all": ["PDCBVC variable `FUNZ`", "origin: WORKING-STORAGE", "line 705", "line 707"],
+        "forbidden": ["hypothetical", "common practices"]
+      }
+    },
+    {
+      "id": "entity.unknown_program",
+      "category": "entity_validation",
+      "question": "What is file PB3210N about?",
+      "assertions": {
+        "contains_all": ["I do not have indexed analysis for `PB3210N`", "Indexed program(s) currently available: PDCBVC"],
+        "forbidden": ["controls the flow of data", "can be inferred"]
+      }
+    },
+    {
+      "id": "entity.call_target_not_indexed_program",
+      "category": "entity_validation",
+      "question": "What does PD1VOCI do?",
+      "assertions": {
+        "contains_all": ["not indexed as a standalone program", "call target", "COMMAREA=WPD1VOCI", "COPY member"],
+        "forbidden": ["Generate and index that program's analysis artifacts first, then ask again."]
+      }
+    },
+    {
       "id": "rag.program_purpose",
       "category": "rag_llm",
       "question": "What is the purpose of program PDCBVC?",

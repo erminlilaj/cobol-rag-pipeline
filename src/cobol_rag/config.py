@@ -61,6 +61,7 @@ class AnswerConfig:
     require_citations: bool = True
     show_sources: bool = True
     system_prompt_path: str | None = None
+    llm_polish_final_scripts: bool = False
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,12 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         _set_nested(result, ("retrieval", "top_k"), int(top_k))
     if context_window := os.getenv("COBOL_RAG_LLM_CONTEXT_WINDOW"):
         _set_nested(result, ("llm", "context_window"), int(context_window))
+    if polish := os.getenv("COBOL_RAG_LLM_POLISH_FINAL_SCRIPTS"):
+        _set_nested(
+            result,
+            ("answers", "llm_polish_final_scripts"),
+            polish.strip().lower() in {"1", "true", "yes", "on"},
+        )
     return result
 
 

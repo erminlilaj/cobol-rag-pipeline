@@ -8,6 +8,7 @@ from pathlib import Path
 from cobol_rag.config import AppConfig
 from cobol_rag.final_scripts_answers import answer_from_final_scripts
 from cobol_rag.index import configure_llamaindex, open_index
+from cobol_rag.question_router import preflight_entity_answer
 from cobol_rag.retrieve import RetrievalResult, retrieve
 
 
@@ -33,9 +34,17 @@ def answer_query(
     if local_answer:
         return QueryAnswer(question=question, answer=local_answer, sources=[])
 
+    entity_answer = preflight_entity_answer(current_question)
+    if entity_answer:
+        return QueryAnswer(question=question, answer=entity_answer, sources=[])
+
     final_scripts_answer = answer_from_final_scripts(current_question)
     if final_scripts_answer:
-        return QueryAnswer(question=question, answer=final_scripts_answer, sources=[])
+        return QueryAnswer(
+            question=question,
+            answer=_maybe_polish_structured_answer(current_question, final_scripts_answer, config),
+            sources=[],
+        )
 
     metadata_answer = _try_program_metadata_answer(current_question)
     if metadata_answer:
@@ -193,6 +202,40 @@ Answer:
             "evidence and show useful snippets."
         )
     return str(response.text).strip()
+
+
+def _maybe_polish_structured_answer(question: str, evidence_answer: str, config: AppConfig) -> str:
+    if not config.answers.llm_polish_final_scripts:
+        return evidence_answer
+
+    prompt = f"""You are the configured COBOL RAG LLM: {config.llm.model}.
+
+Rewrite the evidence answer below into a clear, concise answer for the user.
+
+Rules:
+- Use only the evidence answer. Do not add facts, assumptions, COBOL general knowledge, or guessed meanings.
+- Preserve concrete names, line numbers, citations, counts, and "not indexed" / "not evidenced" limitations exactly.
+- If the evidence answer says something is missing or unknown, keep that limitation.
+- Keep the answer compact and practical.
+
+Question:
+{question}
+
+Evidence answer:
+{evidence_answer}
+
+Final answer:
+"""
+    try:
+        runtime = configure_llamaindex(config)
+        response = runtime.llm.complete(prompt)
+    except Exception:
+        return evidence_answer
+
+    text = str(response.text).strip()
+    if not text:
+        return evidence_answer
+    return text
 
 
 def _try_program_metadata_answer(question: str) -> str | None:
@@ -492,6 +535,8 @@ def _build_prompt(question: str, sources: list[RetrievalResult]) -> str:
 Rules:
 - Answer only from the retrieved sources.
 - If the sources do not contain the answer, say that the indexed sources do not contain enough information.
+- If the user names a program, variable, paragraph, copybook, file, or table that is not present in the sources,
+  say it is not present in the indexed evidence. Do not explain it from general COBOL knowledge.
 - Keep the answer concise.
 - Mention source ids inline when useful, but do not invent source ids.
 

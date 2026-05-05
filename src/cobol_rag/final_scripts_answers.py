@@ -30,15 +30,6 @@ def answer_from_final_scripts(question: str) -> str | None:
 
     q = question.lower()
 
-    variable_answer = _answer_variable_reference(root, program, question)
-    if variable_answer:
-        return variable_answer
-
-    if _asks_about_program_overview(q, question, program):
-        answer = _answer_program_overview(root, program)
-        if answer:
-            return answer
-
     if _asks_about_copybooks(q) and "unused" in q:
         answer = _answer_copybooks(root, program, q)
         if answer:
@@ -62,6 +53,10 @@ def answer_from_final_scripts(question: str) -> str | None:
     answer = _answer_structured_behavior(root, program, question)
     if answer:
         return answer
+
+    variable_answer = _answer_variable_reference(root, program, question)
+    if variable_answer:
+        return variable_answer
 
     if _asks_about_calls(q):
         answer = _answer_calls(root, program)
@@ -93,6 +88,11 @@ def answer_from_final_scripts(question: str) -> str | None:
 
     if _asks_about_business_rules(q):
         answer = _answer_business_rules(root, program)
+        if answer:
+            return answer
+
+    if _asks_about_program_overview(q, question, program):
+        answer = _answer_program_overview(root, program)
         if answer:
             return answer
 
@@ -195,6 +195,8 @@ def _answer_unknown_program_if_explicit(root: Path, question: str) -> str | None
         return None
     core_programs = _core_programs_from_root(root)
     if candidate in core_programs or program_has_jcl_evidence(root, candidate):
+        return None
+    if _token_exists_in_final_scripts(root, candidate):
         return None
 
     indexed = sorted(core_programs)
@@ -302,6 +304,20 @@ def _programs_from_root(root: Path) -> set[str]:
             if program and program != "__GLOBAL__":
                 programs.add(program)
     return programs
+
+
+def _token_exists_in_final_scripts(root: Path, token: str) -> bool:
+    token = token.upper()
+    if not token:
+        return False
+    pattern = re.compile(rf"\b{re.escape(token)}\b", flags=re.IGNORECASE)
+    for path in root.glob("**/*.json"):
+        try:
+            if pattern.search(path.read_text(encoding="utf-8", errors="ignore")):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _asks_about_lines_or_counts(q: str) -> bool:
@@ -573,7 +589,9 @@ def _line_from_site_list(payload: dict[str, Any], key: str) -> Any | None:
 def _variables_in_question(question: str) -> list[str]:
     ignored = {
         "PDCBVC", "COBOL", "CBL", "BROWSE-FASE1", "BROWSE-FASE2", "ENTER",
-        "PF1", "PF2", "PF3", "PF4", "PF7", "PF8", "PF9",
+        "PF1", "PF2", "PF3", "PF4", "PF7", "PF8", "PF9", "CONTROL-FLOW", "WHEN", "WHETHER", "WHICH",
+        "WHERE", "WHAT", "WITH", "WRITTEN", "PRESSES", "PRESSED", "PRESSING",
+        "USER", "INTERACTIONS", "MAINTAINED", "CALCULATED",
     }
     names: list[str] = []
     for token in re.findall(r"\b[A-Z][A-Z0-9-]{2,}\b", question.upper()):
@@ -599,14 +617,23 @@ def _variable_reference_tokens(question: str) -> list[str]:
         "DOES",
         "FILE",
         "FUNCTION",
+        "INTERACTIONS",
+        "MAINTAINED",
         "METHOD",
+        "PRESSED",
+        "PRESSES",
+        "PRESSING",
         "PROGRAM",
         "REPOSITORY",
         "STORES",
         "STORE",
+        "USER",
         "WHAT",
+        "WHEN",
+        "WHETHER",
         "WHERE",
         "WHICH",
+        "WRITTEN",
     }
     tokens = [
         token
@@ -629,6 +656,8 @@ def _looks_like_variable_reference_question(q: str) -> bool:
             "field",
             "calculated",
             "computed",
+            "feed",
+            "feeds",
             "set",
             "used",
             "modified",
@@ -1030,6 +1059,8 @@ def _asks_about_variable_behavior(q: str) -> bool:
             "modified",
             "origin",
             "value of",
+            "feed",
+            "feeds",
         )
     ) and bool(_variables_in_question(q))
 
@@ -1606,7 +1637,7 @@ def _answer_screen_field_lineage(root: Path, program: str, question: str) -> str
     content = artifact.get("content", {})
     fields = content.get("fields", [])
     if not isinstance(fields, list) or not fields:
-        return None
+        return _answer_screen_field_lineage_fallback(root, program, question, content)
 
     by_name = {str(item.get("field", "")).upper(): item for item in fields if isinstance(item, dict)}
     tokens = [
@@ -1656,6 +1687,70 @@ def _answer_screen_field_lineage(root: Path, program: str, question: str) -> str
     ]
     _append_evidence(lines, [_cite("screen_field_lineage/screen_field_lineage.json", detail="fields")])
     return "\n".join(lines)
+
+
+def _answer_screen_field_lineage_fallback(
+    root: Path,
+    program: str,
+    question: str,
+    lineage_content: dict[str, Any],
+) -> str | None:
+    variables = _known_variables(root, program)
+    tokens = [
+        token
+        for token in re.findall(r"\b[A-Z][A-Z0-9-]{2,}\b", question.upper())
+        if token in variables
+    ]
+    if not tokens:
+        return None
+    variable_name = tokens[0]
+    payload = _variable_payload(root, program, variable_name)
+    if not payload:
+        return None
+
+    family = _map_field_family(variable_name)
+    family_members = sorted(name for name in variables if _map_field_family(name) == family)
+    lines = [
+        f"{program} screen/map field `{variable_name}` evidence:",
+        (
+            "`screen_field_lineage` is present but has no field records for this run, "
+            "so this answer falls back to `dataflow.variable` evidence."
+        ),
+        _format_variable_lineage(program, payload),
+    ]
+    related = [name for name in family_members if name != variable_name]
+    if related:
+        lines.append("")
+        lines.append(f"Same BMS-style field family `{family}` from dataflow variables: {', '.join(family_members)}.")
+        lines.append("Related family members can represent input/output/length/attribute variants, but origin is only proven when the dataflow artifact says so.")
+        for name in related[:8]:
+            related_payload = _variable_payload(root, program, name)
+            if not related_payload:
+                continue
+            content = related_payload.get("content", {})
+            lines.append(
+                f"- `{name}`: origin {content.get('origin', '?')}; "
+                f"modified in {_join_or_none(content.get('modified_in', []))}; "
+                f"used in {_join_or_none(content.get('used_in', []))}"
+            )
+    if lineage_content.get("limitations"):
+        lines.append("")
+        lines.append("Lineage limitation: " + str(lineage_content.get("limitations", [""])[0]))
+    _append_evidence(
+        lines,
+        [
+            _cite("screen_field_lineage/screen_field_lineage.json", detail="fields_count=0"),
+            _cite(f"dataflow.variable/dataflow.variable.{variable_name}.json", detail="fallback variable evidence"),
+        ],
+    )
+    return "\n".join(lines)
+
+
+def _map_field_family(variable: str) -> str:
+    variable = variable.upper()
+    if len(variable) > 1 and variable[-1] in {"I", "O", "L", "A", "F"}:
+        return variable[:-1]
+    return variable
 
 
 def _screen_variables(root: Path, program: str) -> list[dict[str, Any]]:

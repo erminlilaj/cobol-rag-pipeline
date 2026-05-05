@@ -739,12 +739,22 @@ def _citation(path: str, *, line: Any | None = None, detail: str | None = None) 
 
 
 def _read_json(path: Path) -> Any | None:
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+    candidates = [path]
+    if len(path.parents) >= 2:
+        # Support both layouts:
+        #   root/quality.dead_code/quality.dead_code.json
+        #   root/quality.dead_code.json
+        flat_candidate = path.parent.parent / path.name
+        if flat_candidate not in candidates:
+            candidates.append(flat_candidate)
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            return json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+    return None
 
 
 def _relative_artifact_path(root: Path, path: Path) -> str:

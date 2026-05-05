@@ -36,7 +36,11 @@ def answer_query(
 
     entity_answer = preflight_entity_answer(current_question)
     if entity_answer:
-        return QueryAnswer(question=question, answer=entity_answer, sources=[])
+        return QueryAnswer(
+            question=question,
+            answer=_maybe_polish_structured_answer(current_question, entity_answer, config),
+            sources=[],
+        )
 
     final_scripts_answer = answer_from_final_scripts(current_question)
     if final_scripts_answer:

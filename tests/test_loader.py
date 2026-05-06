@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from cobol_rag.config import AppConfig
+from cobol_rag.config import load_config
 from cobol_rag.loaders.generic_json import GenericJsonLoader
 from cobol_rag.loaders.rag_documents import RagDocumentsLoader
 from cobol_rag.query import (
@@ -25,6 +26,12 @@ from cobol_rag.retrieve import (
 
 def _source(text: str, **metadata) -> RetrievalResult:
     return RetrievalResult(score=1.0, text=text, metadata=metadata)
+
+
+def test_default_config_loads_chunk_type_boost_path():
+    config = load_config()
+
+    assert config.retrieval.chunk_type_boosts_path == "config/chunk_type_boosts.yaml"
 
 
 def test_rag_documents_loader_preserves_source_aware_metadata(tmp_path: Path):

@@ -543,7 +543,8 @@ def _intent_score(intent: str, result: RetrievalResult, config: AppConfig) -> fl
 
 def _configured_chunk_type_boosts(intent: str, config: AppConfig) -> dict[str, float]:
     path = (
-        config.raw.get("retrieval", {}).get("chunk_type_boosts_path")
+        config.retrieval.chunk_type_boosts_path
+        or config.raw.get("retrieval", {}).get("chunk_type_boosts_path")
         or config.raw.get("chunk_type_boosts_path")
         or "config/chunk_type_boosts.yaml"
     )

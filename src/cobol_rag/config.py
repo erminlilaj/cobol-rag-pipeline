@@ -54,6 +54,7 @@ class RetrievalConfig:
     similarity_cutoff: float | None = None
     mode: str = "vector"
     bm25_top_k: int = 12
+    chunk_type_boosts_path: str = "config/chunk_type_boosts.yaml"
 
 
 @dataclass(frozen=True)

@@ -133,10 +133,18 @@ def load_gold(path: Path) -> dict[str, Any]:
 def detect_environment(config: AppConfig) -> dict[str, Any]:
     final_scripts_root = find_final_scripts_root()
     manifest_path = config.paths.manifest_dir / f"{config.index.collection}.json"
+    collection_name = str(config.index.collection).lower()
+    chroma_dir = str(config.paths.chroma_dir).lower()
+    combined_rag_index = (
+        "combined" in collection_name
+        or "combined" in chroma_dir
+        or (manifest_path.exists() and "combined" in manifest_path.name.lower())
+    )
     return {
         "final_scripts": final_scripts_root is not None,
         "final_scripts_root": str(final_scripts_root) if final_scripts_root else "",
         "rag_index": manifest_path.exists() or config.paths.chroma_dir.exists(),
+        "combined_rag_index": combined_rag_index,
         "manifest_path": str(manifest_path),
         "ollama": ollama_available(config),
         "llm_model": config.llm.model,

@@ -336,6 +336,60 @@
         "contains_all": ["PDCBVC"],
         "contains_any": [["browse", "CICS", "program", "accounting", "voice"]]
       }
+    },
+    {
+      "id": "fusion.calls.cross_source_parameters",
+      "category": "fusion",
+      "question": "Which programs does PDCBVC call and with which parameters?",
+      "requirements": ["rag_index"],
+      "required_chunk_types": ["architecture.call_parameters", "cobol_rekt.call_contract"],
+      "assertions": {
+        "contains_all": ["PD1VOCI", "WPD1VOCI", "LENGTH", "Sources used"],
+        "forbidden": ["PDCBVCM is an external program"]
+      }
+    },
+    {
+      "id": "fusion.ui_navigation_pf_keys",
+      "category": "fusion",
+      "question": "Which PF keys does PDCBVC handle?",
+      "requirements": ["rag_index"],
+      "required_chunk_types": ["ui.cics.navigation"],
+      "assertions": {
+        "contains_all": ["DFHPF1", "DFHPF7", "DFHPF8", "Sources used"],
+        "forbidden": ["PD0UTI02", "PD0UTI03"]
+      }
+    },
+    {
+      "id": "fusion.twcob_fase_dataflow",
+      "category": "fusion",
+      "question": "Where is TWCOB-FASE read or written?",
+      "requirements": ["rag_index"],
+      "required_chunk_types": ["dataflow.variable"],
+      "assertions": {
+        "contains_all": ["TWCOB-FASE", "line", "Sources used"],
+        "forbidden": ["not present in the indexed evidence"]
+      }
+    },
+    {
+      "id": "fusion.sql_includes",
+      "category": "fusion",
+      "question": "Which SQL includes are used by PDCBVC?",
+      "requirements": ["rag_index"],
+      "required_chunk_types": ["architecture.sqlinclude"],
+      "assertions": {
+        "contains_all": ["SQLCA", "PDPSQLER", "PDWSQLER", "Sources used"]
+      }
+    },
+    {
+      "id": "fusion.copybook_conflict_caveat",
+      "category": "fusion",
+      "question": "Can I trust the PDCBVC copybook count if MAPA and cobol-rekt disagree?",
+      "requirements": ["rag_index"],
+      "required_chunk_types": ["integration.conflicts"],
+      "assertions": {
+        "contains_all": ["conflict", "source", "Sources used"],
+        "forbidden": ["single compiler-level truth"]
+      }
     }
   ]
 }

@@ -39,6 +39,21 @@ ALLOWED_METADATA_FIELDS = {
     "indexable",
     "schema_version",
     "pipeline_version",
+    "source_system",
+    "source_chunk_type",
+    "original_chunk_type",
+    "coverage_dimension",
+    "entity_type",
+    "entity_key",
+    "target",
+    "call_type",
+    "command",
+    "variable",
+    "paragraph",
+    "line",
+    "source_line",
+    "factory_source_id",
+    "factory_content_hash",
 }
 
 
@@ -165,10 +180,33 @@ class RagDocumentsLoader:
         )
         if doc_type:
             result["chunk_type"] = doc_type
+            result.setdefault("source_chunk_type", doc_type)
+
+        record_id = self._record_id(record)
+        if record_id:
+            result.setdefault("chunk_id", record_id)
 
         title = self._scalar(record.get("title")) or self._scalar(nested.get("title"))
         if title:
             result["title"] = title
+
+        for key in (
+            "source_system",
+            "source_chunk_type",
+            "coverage_dimension",
+            "entity_type",
+            "entity_key",
+            "target",
+            "call_type",
+            "command",
+            "variable",
+            "paragraph",
+            "line",
+            "source_line",
+        ):
+            value = self._scalar(record.get(key))
+            if value:
+                result[key] = value
 
         for key, value in nested.items():
             if key == "source_id":
@@ -184,6 +222,7 @@ class RagDocumentsLoader:
             if key == "type":
                 if self._scalar(value):
                     result.setdefault("chunk_type", value)
+                    result.setdefault("source_chunk_type", value)
                 continue
             if key in ALLOWED_METADATA_FIELDS and isinstance(value, SCALAR_METADATA_TYPES):
                 result[key] = value

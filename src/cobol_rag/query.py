@@ -91,7 +91,15 @@ def answer_query(
             sources=[],
         )
 
-    direct_answer = _try_dead_code_answer(current_question, sources)
+    direct_answer = (
+        _try_conflict_provenance_answer(current_question, sources)
+        or _try_business_rules_answer(current_question, sources)
+        or _try_ui_navigation_answer(current_question, sources)
+        or _try_variable_dataflow_answer(current_question, sources)
+        or _try_sql_includes_answer(current_question, sources)
+        or _try_jcl_file_answer(current_question, sources)
+        or _try_dead_code_answer(current_question, sources)
+    )
     if direct_answer:
         return QueryAnswer(question=question, answer=direct_answer, sources=sources)
 
@@ -176,8 +184,16 @@ def _is_cobol_question(question: str) -> bool:
         "table",
         "control flow",
         "dataflow",
+        "data flow",
         "working-storage",
         "linkage",
+        "business rule",
+        "pf key",
+        "pf keys",
+        "function key",
+        "eibaid",
+        "provenance",
+        "conflict",
     }
     return any(term in text for term in cobol_terms)
 
@@ -380,6 +396,158 @@ def _is_dead_code_question(question: str) -> bool:
             "unreachable",
         )
     )
+
+
+def _try_business_rules_answer(question: str, sources: list[RetrievalResult]) -> str | None:
+    q = question.lower()
+    if not any(term in q for term in ("business rule", "business rules", "rule ", "rules ", "br-")):
+        return None
+    evidence = [source for source in sources if _chunk_type(source) in {"business_rule", "business_rule.rag"}]
+    if not evidence:
+        return None
+    lines = ["Business-rule evidence found:"]
+    for source in evidence[:8]:
+        title = source.metadata.get("title") or source.metadata.get("chunk_id") or _chunk_type(source)
+        lines.append(f"\n{title}:")
+        lines.extend(f"- {line}" for line in _first_nonempty_lines(source.text, limit=5))
+    return _append_provenance_note("\n".join(lines), evidence)
+
+
+def _try_ui_navigation_answer(question: str, sources: list[RetrievalResult]) -> str | None:
+    q = question.lower()
+    if not any(term in q for term in ("pf key", "pf keys", "function key", "function keys", "enter", "eibaid", "navigation")):
+        return None
+    evidence = [source for source in sources if _chunk_type(source) in {"ui.cics.navigation", "screen.key_dispatch"}]
+    if not evidence:
+        return None
+    lines = ["UI/navigation evidence found:"]
+    for source in evidence[:6]:
+        title = source.metadata.get("title") or source.metadata.get("chunk_id") or _chunk_type(source)
+        lines.append(f"\n{title}:")
+        lines.extend(f"- {line}" for line in _first_nonempty_lines(source.text, limit=8))
+    return _append_provenance_note("\n".join(lines), evidence)
+
+
+def _try_variable_dataflow_answer(question: str, sources: list[RetrievalResult]) -> str | None:
+    q = question.lower()
+    if not any(term in q for term in ("dataflow", "data flow", "read", "write", "where is", "where are", "variable")):
+        return None
+    requested = _extract_identifier(question)
+    evidence = [
+        source
+        for source in sources
+        if _chunk_type(source) in {"dataflow.variable", "dataflow.used_variables"}
+        and (not requested or requested.upper() in (source.text + " " + str(source.metadata)).upper())
+    ]
+    if not evidence:
+        return None
+    subject = f" for `{requested.upper()}`" if requested else ""
+    lines = [f"Variable dataflow evidence{subject}:"]
+    for source in evidence[:6]:
+        title = source.metadata.get("title") or source.metadata.get("variable") or source.metadata.get("chunk_id") or _chunk_type(source)
+        lines.append(f"\n{title}:")
+        lines.extend(f"- {line}" for line in _first_nonempty_lines(source.text, limit=8))
+    return _append_provenance_note("\n".join(lines), evidence)
+
+
+def _try_sql_includes_answer(question: str, sources: list[RetrievalResult]) -> str | None:
+    q = question.lower()
+    if not any(term in q for term in ("sql include", "sql includes", "sqlca", "db2 include")):
+        return None
+    evidence = [source for source in sources if _chunk_type(source) == "architecture.sqlinclude"]
+    if not evidence:
+        return None
+    lines = ["SQL include evidence found:"]
+    for source in evidence[:8]:
+        lines.extend(f"- {line}" for line in _first_nonempty_lines(source.text, limit=5))
+    return _append_provenance_note("\n".join(lines), evidence)
+
+
+def _try_jcl_file_answer(question: str, sources: list[RetrievalResult]) -> str | None:
+    q = question.lower()
+    if not any(term in q for term in ("jcl", "dataset", "datasets", "file i/o", "file io", "batch job", "job ")):
+        return None
+    evidence = [
+        source
+        for source in sources
+        if _chunk_type(source).startswith("jcl.")
+        or _chunk_type(source) in {"global.jcl_program_map.summary", "file_io", "jcl.file_io"}
+    ]
+    if not evidence:
+        return None
+    lines = ["JCL/file evidence found:"]
+    for source in evidence[:8]:
+        title = source.metadata.get("title") or source.metadata.get("chunk_id") or _chunk_type(source)
+        lines.append(f"\n{title}:")
+        lines.extend(f"- {line}" for line in _first_nonempty_lines(source.text, limit=6))
+    return _append_provenance_note("\n".join(lines), evidence)
+
+
+def _try_conflict_provenance_answer(question: str, sources: list[RetrievalResult]) -> str | None:
+    q = question.lower()
+    if not any(term in q for term in ("conflict", "provenance", "source system", "trust", "confidence", "why different", "limitation")):
+        return None
+    evidence = [
+        source
+        for source in sources
+        if _chunk_type(source) in {"integration.conflicts", "integration.entity_link"}
+        or source.metadata.get("coverage_dimension") in {"conflict_report", "quality_confidence"}
+    ]
+    if not evidence:
+        return None
+    lines = ["Conflict/provenance evidence found:"]
+    for source in evidence[:6]:
+        title = source.metadata.get("title") or source.metadata.get("chunk_id") or _chunk_type(source)
+        lines.append(f"\n{title}:")
+        lines.extend(f"- {line}" for line in _first_nonempty_lines(source.text, limit=6))
+    return _append_provenance_note("\n".join(lines), evidence)
+
+
+def _chunk_type(source: RetrievalResult) -> str:
+    raw = (
+        source.metadata.get("source_chunk_type")
+        or source.metadata.get("original_chunk_type")
+        or source.metadata.get("chunk_type")
+        or source.metadata.get("type")
+        or ""
+    )
+    chunk_type = str(raw)
+    for prefix in ("cobol_rekt.", "mapa_hamza.", "mapa."):
+        if chunk_type.startswith(prefix):
+            chunk_type = chunk_type[len(prefix):]
+            break
+    if chunk_type.startswith("screen_"):
+        return chunk_type.replace("_", ".")
+    if chunk_type.startswith("dataflow_"):
+        return chunk_type.replace("_", ".", 1)
+    return chunk_type
+
+
+def _extract_identifier(question: str) -> str | None:
+    matches = re.findall(r"\b[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+\b", question.upper())
+    return matches[0] if matches else None
+
+
+def _append_provenance_note(answer: str, sources: list[RetrievalResult]) -> str:
+    by_source: dict[str, set[str]] = {}
+    for source in sources:
+        source_system = str(source.metadata.get("source_system") or "indexed")
+        by_source.setdefault(source_system, set()).add(_chunk_type(source) or str(source.metadata.get("chunk_type", "source")))
+    if not by_source:
+        return answer
+    lines = [answer.rstrip(), "", "Sources used:"]
+    for source_system, chunk_types in sorted(by_source.items()):
+        label = {
+            "mapa_hamza": "MAPA/Hamza",
+            "cobol_rekt": "cobol-rekt",
+            "cobol-rekt": "cobol-rekt",
+            "integration": "integration",
+            "combined": "integration",
+        }.get(source_system, source_system)
+        lines.append(f"- {label}: {', '.join(sorted(chunk_types))}")
+    if any(source.metadata.get("entity_key") for source in sources):
+        lines.append("Confidence note: linked evidence shares an exact cross-source entity key.")
+    return "\n".join(lines)
 
 
 def _merge_sources(*groups: list[RetrievalResult]) -> list[RetrievalResult]:

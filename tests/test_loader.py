@@ -10,6 +10,7 @@ from cobol_rag.loaders.generic_json import GenericJsonLoader
 from cobol_rag.loaders.rag_documents import RagDocumentsLoader
 from cobol_rag.query import (
     answer_query,
+    _question_entities,
     _try_business_rules_answer,
     _try_conflict_provenance_answer,
     _try_sql_includes_answer,
@@ -195,6 +196,11 @@ def test_retrieval_intent_detects_program_overview_variants():
     assert _detect_intent("what the hell is PDCBVC?") == "program_summary"
 
 
+def test_question_entities_ignore_action_words():
+    assert "PRESSES" not in _question_entities("What does BROWSE-FASE2 do when the user presses ENTER?")
+    assert "BROWSE-FASE2" in _question_entities("What does BROWSE-FASE2 do when the user presses ENTER?")
+
+
 def test_control_flow_expansion_targets_pagination_and_selection():
     pagination = _expanded_query_for_intent(
         "How does PDCBVC calculate the total number of pages for the browse result?",
@@ -209,6 +215,28 @@ def test_control_flow_expansion_targets_pagination_and_selection():
     assert "PD1VOCI-TABVOX-NUMERO" in pagination
     assert "BROWSE-FASE2-SEL" in selection
     assert "SCELTAI" in selection
+
+
+def test_answer_query_abstains_when_required_pagination_facts_are_missing(monkeypatch):
+    monkeypatch.setattr("cobol_rag.query.answer_from_final_scripts", lambda _question: None)
+    monkeypatch.setattr("cobol_rag.query.preflight_entity_answer", lambda _question: None)
+    monkeypatch.setattr("cobol_rag.query._rag_runtime_available", lambda _base_url: True)
+    monkeypatch.setattr(
+        "cobol_rag.query.retrieve",
+        lambda *_args, **_kwargs: [
+            _source(
+                "Program: PDCBVC\nBROWSE-FASE2-PF8 handles a key.",
+                chunk_type="screen.key_dispatch",
+                source_system="mapa_hamza",
+                program="PDCBVC",
+            )
+        ],
+    )
+
+    answer = answer_query("How does PDCBVC calculate the total number of pages for the browse result?", AppConfig())
+
+    assert "do not have enough indexed evidence" in answer.answer
+    assert "CALCOLA-NPAG" in answer.answer
 
 
 def test_direct_answer_handlers_emit_provenance():
@@ -285,7 +313,8 @@ def test_answer_query_does_not_shortcut_final_scripts_when_rag_is_grounded(monke
 
     class FakeLlm:
         def complete(self, prompt):
-            assert "structured shortcut" not in prompt
+            assert "structured shortcut" in prompt
+            assert "Use this as evidence, not as a prewritten answer." in prompt
             return SimpleNamespace(text="RAG-generated answer from retrieved evidence")
 
     monkeypatch.setattr(

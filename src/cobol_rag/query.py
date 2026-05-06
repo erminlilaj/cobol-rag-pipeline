@@ -95,9 +95,18 @@ def answer_query(
             sources=[],
         )
 
+    sources = _merge_sources(
+        _privileged_evidence_sources(current_question, final_scripts_answer, metadata_answer),
+        sources,
+    )
+
     grounding_error = _validate_retrieved_evidence(current_question, sources)
     if grounding_error:
         return QueryAnswer(question=question, answer=grounding_error, sources=sources)
+
+    sufficiency_error = _validate_intent_evidence(current_question, sources)
+    if sufficiency_error:
+        return QueryAnswer(question=question, answer=sufficiency_error, sources=sources)
 
     resources = open_index(config)
     prompt = _build_prompt(question=current_question, sources=sources)
@@ -195,6 +204,102 @@ def _validate_retrieved_evidence(question: str, sources: list[RetrievalResult]) 
     )
 
 
+def _privileged_evidence_sources(
+    question: str,
+    final_scripts_answer: str | None,
+    metadata_answer: str | None,
+) -> list[RetrievalResult]:
+    """Expose final_scripts output as RAG evidence instead of returning it directly."""
+    sources: list[RetrievalResult] = []
+    program = _program_from_question(question) or "PDCBVC"
+    if final_scripts_answer and not _is_guardrail_answer(final_scripts_answer):
+        sources.append(
+            RetrievalResult(
+                score=1.0,
+                text=(
+                    "Privileged structured evidence from final_scripts.\n"
+                    "Use this as evidence, not as a prewritten answer.\n\n"
+                    f"{final_scripts_answer}"
+                ),
+                metadata={
+                    "program": program,
+                    "source_system": "mapa_hamza",
+                    "chunk_type": "privileged.final_scripts",
+                    "source_chunk_type": "privileged.final_scripts",
+                    "title": f"{program} final_scripts evidence",
+                    "source_id": f"final_scripts:{content_hash_text(question)}",
+                    "coverage_dimension": "privileged_structured_evidence",
+                },
+            )
+        )
+    if metadata_answer:
+        sources.append(
+            RetrievalResult(
+                score=1.0,
+                text=f"Privileged metadata evidence from final_scripts.\n\n{metadata_answer}",
+                metadata={
+                    "program": program,
+                    "source_system": "mapa_hamza",
+                    "chunk_type": "privileged.metadata",
+                    "source_chunk_type": "privileged.metadata",
+                    "title": f"{program} metadata evidence",
+                    "source_id": f"metadata:{content_hash_text(question)}",
+                    "coverage_dimension": "privileged_structured_evidence",
+                },
+            )
+        )
+    return sources
+
+
+def content_hash_text(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _validate_intent_evidence(question: str, sources: list[RetrievalResult]) -> str | None:
+    intent = _detect_intent(question)
+    haystack = _evidence_haystack(sources)
+    chunk_types = {_chunk_type(source) for source in sources}
+    program = _program_from_sources(sources) or _program_from_question(question) or "the indexed program"
+
+    def missing(reason: str) -> str:
+        return (
+            f"I do not have enough indexed evidence to answer this from RAG for {program}. "
+            f"Missing evidence: {reason}. I will not guess from unrelated retrieved chunks."
+        )
+
+    if intent == "program_summary":
+        if not ("program.summary" in chunk_types or "program_summary" in chunk_types or "PRIVILEGED STRUCTURED EVIDENCE" in haystack):
+            return missing("a `program.summary` or equivalent structured overview chunk")
+    if intent == "error_paths":
+        if "ABEND" in question.upper() and "ABEND00" not in haystack:
+            return missing("retrieved error/control-flow evidence mentioning `ABEND00`")
+        if not (chunk_types & {"error_path", "quality.error_paths.rich", "controlflow.cfg", "privileged.final_scripts"}):
+            return missing("an `error_path`, `controlflow.cfg`, or structured final_scripts error-path source")
+    if intent == "control_flow":
+        q = question.lower()
+        if any(term in q for term in ("page", "pages", "browse result", "npagt")):
+            if not all(term in haystack for term in ("CALCOLA-NPAG", "NPAGT")):
+                return missing("pagination facts mentioning `CALCOLA-NPAG` and `NPAGT`")
+        if any(term in q for term in ("select", "selected", "row", "progressivo", "sceltai")):
+            if not any(term in haystack for term in ("BROWSE-FASE2-SEL", "SCELTAI")):
+                return missing("selection-validation facts mentioning `BROWSE-FASE2-SEL` or `SCELTAI`")
+        if any(term in q for term in ("twcob-funzione", "twcob-id-sistema", "semaf", "pxcsemaf", "ip")):
+            if not any(term in haystack for term in ("READ-TAB-SEMAF", "PXCSEMAF-STATUS", "XCTL-LIV4")):
+                return missing("semaphore-flow facts mentioning `READ-TAB-SEMAF`, `PXCSEMAF-STATUS`, or `XCTL-LIV4`")
+        if "enter" in q:
+            if not any(term in haystack for term in ("DFHENTER", "BROWSE-FASE2-ENTER")):
+                return missing("ENTER-key flow facts mentioning `DFHENTER` or `BROWSE-FASE2-ENTER`")
+    if intent == "external_programs":
+        if not (chunk_types & {"architecture.call_parameters", "architecture.calls", "architecture.call", "call_contract", "privileged.final_scripts"}):
+            return missing("call/COMMAREA evidence such as `architecture.call_parameters` or `call_contract`")
+    if intent == "variable_dataflow":
+        if not (chunk_types & {"dataflow.variable", "dataflow.used_variables", "privileged.final_scripts"}):
+            return missing("variable dataflow evidence")
+    return None
+
+
 def _question_entities(question: str) -> list[str]:
     """Extract COBOL-like entities that must be grounded in retrieved evidence."""
     ignored = {
@@ -224,12 +329,17 @@ def _question_entities(question: str) -> list[str]:
         "LINK",
         "PATH",
         "PATHS",
+        "PRESSED",
+        "PRESSES",
+        "PRESSING",
+        "PROGRESSIVO",
         "PROGRAM",
         "READ",
         "RESULT",
         "SCREEN",
         "SELECTS",
         "TABLE",
+        "THE",
         "THERE",
         "TOTAL",
         "USED",

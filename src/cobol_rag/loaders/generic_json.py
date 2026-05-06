@@ -32,16 +32,10 @@ class GenericJsonLoader:
         )
 
     def can_load(self, path: Path) -> bool:
-        return path.is_file() and path.suffix.lower() == ".json"
+        return path.is_file() and path.suffix.lower() in {".json", ".jsonl"}
 
     def load(self, path: Path) -> list[LoadedDocument]:
-        try:
-            with path.open("r", encoding="utf-8") as file:
-                data = json.load(file)
-        except json.JSONDecodeError as error:
-            raise LoaderError(f"Invalid JSON in {path}: {error}") from error
-
-        records = data if isinstance(data, list) else [data]
+        records = self._read_records(path)
         loaded = []
         for index, record in enumerate(records):
             text = self._extract_text(record)
@@ -63,6 +57,33 @@ class GenericJsonLoader:
             )
         return loaded
 
+    def _read_records(self, path: Path) -> list[Any]:
+        if path.suffix.lower() == ".jsonl":
+            return self._read_jsonl(path)
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        except json.JSONDecodeError as error:
+            raise LoaderError(f"Invalid JSON in {path}: {error}") from error
+
+        return data if isinstance(data, list) else [data]
+
+    def _read_jsonl(self, path: Path) -> list[Any]:
+        records = []
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                for line_number, line in enumerate(file, start=1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError as error:
+                        raise LoaderError(f"Invalid JSONL in {path} line {line_number}: {error}") from error
+        except OSError as error:
+            raise LoaderError(f"Could not read {path}: {error}") from error
+        return records
+
     def _extract_text(self, record: Any) -> str:
         if isinstance(record, dict):
             for field in self.text_fields:
@@ -77,8 +98,37 @@ class GenericJsonLoader:
     def _extract_metadata(self, record: Any) -> dict[str, Any]:
         if not isinstance(record, dict):
             return {}
-        return {
+        result = {
             field: record.get(field)
             for field in self.metadata_fields
             if field in record
+        }
+        nested = record.get("metadata")
+        nested = nested if isinstance(nested, dict) else {}
+        if "type" in record and "chunk_type" not in result:
+            result["chunk_type"] = record["type"]
+        if "id" in record and "chunk_id" not in result:
+            result["chunk_id"] = record["id"]
+        for key in (
+            "source_system",
+            "source_chunk_type",
+            "coverage_dimension",
+            "entity_type",
+            "entity_key",
+            "target",
+            "call_type",
+            "variable",
+            "paragraph",
+            "line",
+            "title",
+            "source_kind",
+        ):
+            if key in record and key not in result:
+                result[key] = record[key]
+            if key in nested and key not in result:
+                result[key] = nested[key]
+        return {
+            key: value
+            for key, value in result.items()
+            if isinstance(value, str | int | float | bool)
         }

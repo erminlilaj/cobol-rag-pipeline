@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from cobol_rag.config import AppConfig
 from cobol_rag.index import open_index
@@ -29,17 +32,17 @@ def retrieve(
 
     if mode == "bm25":
         results = _bm25_only(retrieval_query, config, max(effective_k * 2, config.retrieval.bm25_top_k))
-        return _intent_rerank(query, results, effective_k)
+        return _rerank_and_expand(query, results, effective_k, config)
 
     if mode == "hybrid":
         bm25_path = _find_bm25_path(config)
         if bm25_path is not None:
             results = _hybrid(retrieval_query, config, effective_k, chunk_types, bm25_path)
-            return _intent_rerank(query, results, effective_k)
+            return _rerank_and_expand(query, results, effective_k, config)
 
     # vector-only (or hybrid with no bm25 index found)
     results = _vector(retrieval_query, config, max(effective_k * 2, config.retrieval.bm25_top_k), chunk_types)
-    return _intent_rerank(query, results, effective_k)
+    return _rerank_and_expand(query, results, effective_k, config)
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +86,9 @@ def _make_filters(chunk_types: list[str] | None):
             filters=[
                 MetadataFilter(key="chunk_type", value=ct, operator=FilterOperator.EQ)
                 for ct in chunk_types
+            ] + [
+                MetadataFilter(key="source_chunk_type", value=ct, operator=FilterOperator.EQ)
+                for ct in chunk_types
             ],
             condition=FilterCondition.OR,
         )
@@ -124,7 +130,10 @@ def _hybrid(
 
     # Over-retrieve on the vector side so RRF has good candidates
     vector_k = max(top_k * 2, config.retrieval.bm25_top_k)
-    vector_results = _vector(query, config, vector_k, chunk_types)
+    try:
+        vector_results = _vector(query, config, vector_k, chunk_types)
+    except Exception:
+        vector_results = []
 
     bm25_index = load_bm25_index(bm25_path)
     chunks_dir = bm25_path.parent
@@ -185,19 +194,56 @@ def _intent_rerank(
     query: str,
     results: list[RetrievalResult],
     top_k: int,
+    config: AppConfig,
 ) -> list[RetrievalResult]:
     intent = _detect_intent(query)
     if intent == "general" or not results:
         return results[:top_k]
 
     scored = [
-        (_intent_score(intent, result) + _normalized_base_score(result), index, result)
+        (
+            _intent_score(intent, result, config)
+            + _exact_identifier_score(query, result)
+            + _coverage_dimension_score(query, result)
+            + _normalized_base_score(result),
+            index,
+            result,
+        )
         for index, result in enumerate(results)
     ]
     scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
 
     ranked = [result for _score, _index, result in scored]
-    canonical_types = {
+    canonical_types = _canonical_chunk_types(intent, config)
+    if canonical_types:
+        canonical = [
+            result
+            for result in ranked
+            if _base_chunk_type(result) in canonical_types
+            or str(result.metadata.get("chunk_type", "")) in canonical_types
+            or str(result.metadata.get("source_chunk_type", "")) in canonical_types
+        ]
+        if canonical:
+            return canonical[:top_k]
+
+    return ranked[:top_k]
+
+
+def _rerank_and_expand(
+    query: str,
+    results: list[RetrievalResult],
+    top_k: int,
+    config: AppConfig,
+) -> list[RetrievalResult]:
+    ranked = _intent_rerank(query, results, top_k, config)
+    return _expand_entity_companions(ranked, config)
+
+
+def _canonical_chunk_types(intent: str, config: AppConfig) -> set[str] | None:
+    configured = _configured_chunk_type_boosts(intent, config)
+    if configured:
+        return _expanded_chunk_type_aliases(set(configured))
+    canonical = {
         "copybooks": {
             "architecture.copybooks",
             "global.copybook_usage",
@@ -244,23 +290,86 @@ def _intent_rerank(
             "program.summary",
             "paragraph_logic",
         },
+        "business_rules": {
+            "business_rule",
+            "business_rule.rag",
+        },
+        "ui_navigation": {
+            "ui.cics.navigation",
+            "screen.key_dispatch",
+        },
+        "variable_dataflow": {
+            "dataflow.variable",
+            "dataflow.used_variables",
+        },
+        "control_flow": {
+            "controlflow.cfg",
+            "workflow",
+            "paragraph_logic",
+            "screen.key_dispatch",
+            "screen.pagination",
+            "screen.row_build",
+            "screen.selection",
+        },
+        "error_paths": {
+            "error_path",
+            "quality.error_paths.rich",
+            "business_rule",
+            "business_rule.rag",
+            "paragraph_logic",
+        },
     }.get(intent)
-    if canonical_types:
-        canonical = [
-            result
-            for result in ranked
-            if result.metadata.get("chunk_type") in canonical_types
-        ]
-        if canonical:
-            return canonical[:top_k]
+    return _expanded_chunk_type_aliases(canonical) if canonical else None
 
-    return ranked[:top_k]
+
+def _expanded_chunk_type_aliases(chunk_types: set[str]) -> set[str]:
+    expanded: set[str] = set()
+    for chunk_type in chunk_types:
+        expanded.add(chunk_type)
+        expanded.add(f"cobol_rekt.{chunk_type}")
+        expanded.add(f"mapa_hamza.{chunk_type}")
+        expanded.add(chunk_type.replace(".", "_"))
+        expanded.add(f"cobol_rekt.{chunk_type.replace('.', '_')}")
+        expanded.add(f"mapa_hamza.{chunk_type.replace('.', '_')}")
+    return expanded
+
+
+def _base_chunk_type(result: RetrievalResult) -> str:
+    raw = (
+        result.metadata.get("source_chunk_type")
+        or result.metadata.get("original_chunk_type")
+        or result.metadata.get("chunk_type")
+        or result.metadata.get("type")
+        or ""
+    )
+    chunk_type = str(raw)
+    for prefix in ("cobol_rekt.", "mapa_hamza.", "mapa."):
+        if chunk_type.startswith(prefix):
+            chunk_type = chunk_type[len(prefix):]
+            break
+    if chunk_type.startswith("screen_"):
+        return chunk_type.replace("_", ".")
+    if chunk_type.startswith("dataflow_"):
+        return chunk_type.replace("_", ".", 1)
+    return chunk_type
 
 
 def _detect_intent(query: str) -> str:
     q = query.lower()
     if any(term in q for term in ("unused", "dead code", "inactive", "commented-out", "commented out", "unreachable")):
         return "dead_code"
+    if any(term in q for term in ("business rule", "business rules", "rule ", "rules ", "br-")):
+        return "business_rules"
+    if any(term in q for term in ("pf key", "pf keys", "function key", "function keys", "enter key", "eibaid", "navigation")):
+        return "ui_navigation"
+    if any(term in q for term in ("dataflow", "data flow", "read or write", "read/write", "where is", "where are")) and (
+        "variable" in q or re.search(r"\b[A-Za-z][A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\b", query)
+    ):
+        return "variable_dataflow"
+    if any(term in q for term in ("error path", "error paths", "abend", "sql error", "invalid selection", "invalid key")):
+        return "error_paths"
+    if any(term in q for term in ("how does", "how is", "when does", "under what condition", "sequence", "control flow", "workflow", "paragraph logic")):
+        return "control_flow"
     if "copybook" in q or "copy book" in q:
         return "copybooks"
     if any(term in q for term in ("hardcoded", "hard-coded", "static value", "static values", "forced value")):
@@ -286,6 +395,11 @@ def _expanded_query_for_intent(query: str, intent: str) -> str:
         "datasets_tables": "datasets tables resources DB2 SQL CICS files queues maps mapsets transaction ids",
         "dead_code": "dead code unused copybooks commented-out inactive unreachable negative evidence",
         "comments": "comments commented-out inactive code source comments",
+        "business_rules": "business rules BR condition action category severity scope evidence",
+        "ui_navigation": "PF key ENTER EIBAID CICS navigation paragraph map BMS",
+        "variable_dataflow": "dataflow variable read sites write sites control sites line numbers paragraph",
+        "control_flow": "control flow workflow paragraph logic condition sequence branch transition",
+        "error_paths": "error path abnormal termination abend SQLERROR invalid selection invalid key message",
     }
     extra = expansions.get(intent)
     if not extra:
@@ -293,9 +407,15 @@ def _expanded_query_for_intent(query: str, intent: str) -> str:
     return f"{query}\n{extra}"
 
 
-def _intent_score(intent: str, result: RetrievalResult) -> float:
-    chunk_type = str(result.metadata.get("chunk_type", ""))
+def _intent_score(intent: str, result: RetrievalResult, config: AppConfig) -> float:
+    chunk_type = _base_chunk_type(result)
     text = result.text.lower()
+    configured = _configured_chunk_type_boosts(intent, config)
+    if configured:
+        score = _chunk_boost(chunk_type, configured)
+        score += _chunk_boost(str(result.metadata.get("chunk_type", "")), configured)
+        score += _chunk_boost(str(result.metadata.get("source_chunk_type", "")), configured)
+        return score
 
     if intent == "copybooks":
         score = _chunk_boost(chunk_type, {
@@ -421,8 +541,144 @@ def _intent_score(intent: str, result: RetrievalResult) -> float:
     return 0.0
 
 
+def _configured_chunk_type_boosts(intent: str, config: AppConfig) -> dict[str, float]:
+    path = (
+        config.raw.get("retrieval", {}).get("chunk_type_boosts_path")
+        or config.raw.get("chunk_type_boosts_path")
+        or "config/chunk_type_boosts.yaml"
+    )
+    boosts_path = Path(path)
+    if not boosts_path.exists():
+        return {}
+    try:
+        payload = yaml.safe_load(boosts_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+    intent_config = payload.get(intent)
+    if not isinstance(intent_config, dict):
+        return {}
+    chunk_types = intent_config.get("chunk_types")
+    if not isinstance(chunk_types, dict):
+        return {}
+    return {
+        str(key): float(value)
+        for key, value in chunk_types.items()
+        if isinstance(value, int | float)
+    }
+
+
 def _chunk_boost(chunk_type: str, boosts: dict[str, float]) -> float:
     return boosts.get(chunk_type, 0.0)
+
+
+def _query_identifiers(query: str) -> set[str]:
+    raw = re.findall(r"\b[A-Za-z][A-Za-z0-9_.-]{2,}\b", query.upper())
+    stop = {
+        "AND", "ARE", "CALL", "CICS", "COBOL", "DOES", "FROM", "HOW",
+        "KEY", "KEYS", "PROGRAM", "RULE", "RULES", "THE", "WHAT", "WHEN",
+        "WHERE", "WHICH", "WITH",
+    }
+    return {token.strip(".") for token in raw if token.strip(".") not in stop}
+
+
+def _exact_identifier_score(query: str, result: RetrievalResult) -> float:
+    identifiers = _query_identifiers(query)
+    if not identifiers:
+        return 0.0
+    haystack_parts = [result.text]
+    for key in (
+        "entity_key",
+        "program",
+        "target",
+        "variable",
+        "paragraph",
+        "title",
+        "chunk_id",
+        "source_id",
+        "source_path",
+        "chunk_type",
+        "source_chunk_type",
+    ):
+        value = result.metadata.get(key)
+        if value:
+            haystack_parts.append(str(value))
+    haystack = "\n".join(haystack_parts).upper()
+    score = 0.0
+    for identifier in identifiers:
+        if identifier in haystack:
+            score += 0.08
+    return min(score, 0.48)
+
+
+def _coverage_dimension_score(query: str, result: RetrievalResult) -> float:
+    dimension = str(result.metadata.get("coverage_dimension", ""))
+    if not dimension:
+        return 0.0
+    q = query.lower()
+    if dimension == "static_inventory" and any(term in q for term in ("what", "which", "list", "count", "how many")):
+        return 0.05
+    if dimension == "deep_logic" and any(term in q for term in ("how", "when", "condition", "sequence", "why", "trigger")):
+        return 0.12
+    if dimension == "cross_program" and any(term in q for term in ("across", "global", "who calls", "which programs", "relationships")):
+        return 0.08
+    if dimension in {"quality_confidence", "conflict_report"} and any(term in q for term in ("trust", "conflict", "different", "complete", "confidence", "limitation")):
+        return 0.10
+    return 0.0
+
+
+def _expand_entity_companions(
+    results: list[RetrievalResult],
+    config: AppConfig,
+    per_entity_limit: int = 3,
+) -> list[RetrievalResult]:
+    entity_keys = [
+        str(result.metadata.get("entity_key"))
+        for result in results
+        if result.metadata.get("entity_key")
+    ]
+    if not entity_keys:
+        return results
+
+    seen_source_ids = {str(result.metadata.get("source_id", "")) for result in results}
+    expanded = list(results)
+    try:
+        resources = open_index(config)
+    except Exception:
+        return results
+
+    for entity_key in dict.fromkeys(entity_keys):
+        source_systems = {
+            str(result.metadata.get("source_system", ""))
+            for result in results
+            if result.metadata.get("entity_key") == entity_key
+        }
+        try:
+            payload = resources.chroma_collection.get(
+                where={"entity_key": entity_key},
+                include=["documents", "metadatas"],
+            )
+        except Exception:
+            continue
+        candidates = []
+        documents = payload.get("documents") or []
+        metadatas = payload.get("metadatas") or []
+        for text, metadata in zip(documents, metadatas, strict=False):
+            metadata = dict(metadata or {})
+            source_id = str(metadata.get("source_id", ""))
+            if source_id in seen_source_ids:
+                continue
+            candidates.append(RetrievalResult(score=None, text=str(text or ""), metadata=metadata))
+        candidates.sort(
+            key=lambda item: (
+                str(item.metadata.get("source_system", "")) not in source_systems,
+                str(item.metadata.get("coverage_dimension", "")) == "deep_logic",
+            ),
+            reverse=True,
+        )
+        for candidate in candidates[:per_entity_limit]:
+            seen_source_ids.add(str(candidate.metadata.get("source_id", "")))
+            expanded.append(candidate)
+    return expanded
 
 
 def _normalized_base_score(result: RetrievalResult) -> float:

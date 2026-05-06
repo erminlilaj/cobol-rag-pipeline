@@ -28,6 +28,7 @@ retrieval:
   similarity_cutoff: null
   mode: "hybrid" # vector | bm25 | hybrid
   bm25_top_k: 12
+  chunk_type_boosts_path: "config/chunk_type_boosts.yaml"
 
 answers:
   require_citations: true

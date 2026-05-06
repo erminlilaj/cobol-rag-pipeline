@@ -1,0 +1,61 @@
+external_programs:
+  chunk_types:
+    architecture.call_parameters: 0.30
+    architecture.calls: 0.26
+    architecture.call: 0.22
+    call_contract: 0.30
+    external_program_calls: 0.28
+    integration.entity_link: 0.12
+
+business_rules:
+  chunk_types:
+    business_rule: 0.24
+    business_rule.rag: 0.22
+
+ui_navigation:
+  chunk_types:
+    ui.cics.navigation: 0.26
+    screen.key_dispatch: 0.18
+
+variable_dataflow:
+  chunk_types:
+    dataflow.variable: 0.28
+    dataflow.used_variables: 0.20
+    dataflow.literal_assignments: 0.10
+
+datasets_tables:
+  chunk_types:
+    architecture.db2_table: 0.24
+    architecture.sqlinclude: 0.18
+    global.db2_table_usage: 0.18
+    global.db2_table_usage.summary: 0.16
+    datasets_tables_resources: 0.22
+    jcl.file_io: 0.20
+    global.jcl_program_map.summary: 0.16
+
+copybooks:
+  chunk_types:
+    architecture.copybooks: 0.24
+    architecture.copybook_fields: 0.18
+    copybook_fields: 0.18
+    global.copybook_usage.summary: 0.18
+    global.copybook_usage: 0.16
+    cobol_analysis_health: 0.16
+
+control_flow:
+  chunk_types:
+    controlflow.cfg: 0.22
+    workflow: 0.20
+    paragraph_logic: 0.20
+    screen.key_dispatch: 0.18
+    screen.pagination: 0.18
+    screen.row_build: 0.18
+    screen.selection: 0.18
+
+error_paths:
+  chunk_types:
+    error_path: 0.26
+    quality.error_paths.rich: 0.20
+    business_rule: 0.12
+    business_rule.rag: 0.12
+    paragraph_logic: 0.10

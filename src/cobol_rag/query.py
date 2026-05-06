@@ -37,10 +37,20 @@ def answer_query(
     if local_answer:
         return QueryAnswer(question=question, answer=local_answer, sources=[])
 
-    if not _is_cobol_question(current_question):
+    route = _route_question(current_question, config)
+    if route == "GENERAL":
         return QueryAnswer(
             question=question,
             answer=_answer_general_question(question, current_question, config),
+            sources=[],
+        )
+    if route == "AMBIGUOUS":
+        return QueryAnswer(
+            question=question,
+            answer=(
+                "I am not sure whether you mean a general question or a question about the indexed COBOL code. "
+                "If it is about code, please name the program, variable, paragraph, copybook, or call target."
+            ),
             sources=[],
         )
 
@@ -512,9 +522,133 @@ def _try_local_answer(question: str) -> str | None:
             "and control flow. If Ollama is running, I can generate a polished answer; if not, I can still show the best "
             "retrieved evidence."
         )
+    if normalized in {"are you a model", "are you an ai", "are you ai", "are you a language model"}:
+        return (
+            "Yes. I am an AI assistant connected to this COBOL RAG workspace. For code questions, I use the indexed "
+            "analysis evidence; for general questions, I answer normally."
+        )
     if text in {"thanks", "thank you", "ok", "okay"}:
         return "You are welcome. Send me a COBOL question whenever you are ready."
     return None
+
+
+def _route_question(question: str, config: AppConfig) -> str:
+    deterministic = _deterministic_route(question)
+    if deterministic:
+        return deterministic
+    return _llm_route_question(question, config)
+
+
+def _deterministic_route(question: str) -> str | None:
+    q = question.strip().lower()
+    normalized = q.strip(" ?.!").strip()
+
+    general_patterns = (
+        "weather",
+        "temperature",
+        "forecast",
+        "what time",
+        "current time",
+        "today's date",
+        "what is python",
+        "what is java",
+        "what is cobol",
+        "define cobol",
+        "explain cobol",
+    )
+    if any(pattern in q for pattern in general_patterns):
+        if not _has_indexed_code_anchor(question):
+            return "GENERAL"
+
+    if _has_indexed_code_anchor(question):
+        return "CODE"
+
+    ambiguous_patterns = {
+        "what does it do",
+        "what does this do",
+        "explain it",
+        "explain this",
+        "is it used",
+        "where is it used",
+        "how does it work",
+        "what are the inputs",
+        "what are the outputs",
+    }
+    if normalized in ambiguous_patterns:
+        return "AMBIGUOUS"
+
+    if _is_cobol_question(question):
+        return "CODE"
+    return None
+
+
+def _has_indexed_code_anchor(question: str) -> bool:
+    upper = question.upper()
+    if re.search(r"\bPDCBVC\b", upper):
+        return True
+    if re.search(r"\b[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+\b", upper):
+        return True
+    if re.search(r"\b(?:PD|PX|PR|PB)[A-Z0-9]{3,}\b", upper):
+        return True
+    if re.search(r"\b(?:ABEND\d+|PF\d+|DFHPF\d+|DFHENTER)\b", upper):
+        return True
+    code_terms = (
+        "copybook",
+        "copy book",
+        "commarea",
+        "cics",
+        "xctl",
+        "db2",
+        "sql include",
+        "jcl",
+        "paragraph",
+        "dataflow",
+        "control flow",
+    )
+    return any(term in question.lower() for term in code_terms)
+
+
+def _llm_route_question(question: str, config: AppConfig) -> str:
+    prompt = f"""You are a routing classifier for a COBOL RAG assistant.
+
+Classify the user question as exactly one of:
+
+GENERAL:
+- general world knowledge
+- assistant identity
+- weather, time, greetings
+- programming concepts not asking about indexed code
+
+CODE:
+- asks about indexed COBOL programs, variables, paragraphs, copybooks, CICS, DB2, JCL, ABEND, PF keys, COMMAREA, dataflow, control flow
+- mentions concrete identifiers like PDCBVC, TWCOB-FASE, PD1FS00, BROWSE-FASE2
+
+AMBIGUOUS:
+- likely a follow-up but lacks enough context
+- vague questions like "what does it do?", "explain this", or "is it used?" without a known entity
+
+Return only GENERAL, CODE, or AMBIGUOUS.
+
+Question:
+{question}
+"""
+    try:
+        runtime = configure_llamaindex(config)
+        response = runtime.llm.complete(prompt)
+    except Exception:
+        return "GENERAL"
+    label = str(response.text).strip().upper()
+    if "CODE" == label:
+        return "CODE"
+    if "AMBIGUOUS" == label:
+        return "AMBIGUOUS"
+    if "GENERAL" == label:
+        return "GENERAL"
+    if "CODE" in label and "GENERAL" not in label:
+        return "CODE"
+    if "AMBIGUOUS" in label:
+        return "AMBIGUOUS"
+    return "GENERAL"
 
 
 def _is_cobol_question(question: str) -> bool:

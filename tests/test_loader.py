@@ -10,11 +10,13 @@ from cobol_rag.loaders.generic_json import GenericJsonLoader
 from cobol_rag.loaders.rag_documents import RagDocumentsLoader
 from cobol_rag.query import (
     answer_query,
+    _deterministic_route,
     _entity_present_in_text,
     _extract_grounding_facts,
     _grounded_fallback_answer,
     _looks_off_evidence_answer,
     _question_entities,
+    _route_question,
     _try_business_rules_answer,
     _try_conflict_provenance_answer,
     _try_sql_includes_answer,
@@ -200,6 +202,52 @@ def test_retrieval_intent_detects_program_overview_variants():
     assert _detect_intent("what the hell is PDCBVC?") == "program_summary"
     assert _detect_intent("what is file PDCBVC about?") == "program_summary"
     assert _detect_intent("what is the logic inside the file PDCBVC?") == "control_flow"
+
+
+def test_question_router_separates_general_code_and_ambiguous():
+    assert _deterministic_route("how is the weather today?") == "GENERAL"
+    assert _deterministic_route("what is COBOL?") == "GENERAL"
+    assert _deterministic_route("what is PDCBVC?") == "CODE"
+    assert _deterministic_route("where is TWCOB-FASE used?") == "CODE"
+    assert _deterministic_route("what does it do?") == "AMBIGUOUS"
+
+
+def test_llm_router_used_for_unclear_middle_cases(monkeypatch):
+    class FakeLlm:
+        def complete(self, prompt):
+            assert "Return only GENERAL, CODE, or AMBIGUOUS." in prompt
+            return SimpleNamespace(text="AMBIGUOUS")
+
+    monkeypatch.setattr(
+        "cobol_rag.query.configure_llamaindex",
+        lambda _config: SimpleNamespace(llm=FakeLlm()),
+    )
+
+    assert _route_question("can you explain the thing?", AppConfig()) == "AMBIGUOUS"
+
+
+def test_answer_query_general_weather_does_not_retrieve(monkeypatch):
+    monkeypatch.setattr(
+        "cobol_rag.query._answer_general_question",
+        lambda _full, _current, _config: "general weather response",
+    )
+
+    def fail_retrieve(*_args, **_kwargs):
+        raise AssertionError("general question should not retrieve from RAG")
+
+    monkeypatch.setattr("cobol_rag.query.retrieve", fail_retrieve)
+
+    answer = answer_query("how is the weather today?", AppConfig())
+
+    assert answer.answer == "general weather response"
+    assert answer.sources == []
+
+
+def test_answer_query_ambiguous_requests_clarification():
+    answer = answer_query("what does it do?", AppConfig())
+
+    assert "not sure whether you mean" in answer.answer
+    assert answer.sources == []
 
 
 def test_retrieval_intent_detects_pf_number_questions():

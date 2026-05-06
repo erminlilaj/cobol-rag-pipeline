@@ -54,6 +54,12 @@ ALLOWED_METADATA_FIELDS = {
     "source_line",
     "factory_source_id",
     "factory_content_hash",
+    "source_bundle_path",
+    "original_chunk_id",
+    "sha256",
+    "truncated_for_embedding",
+    "left_source_system",
+    "right_source_system",
 }
 
 

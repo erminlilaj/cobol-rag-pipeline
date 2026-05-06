@@ -19,6 +19,7 @@ from cobol_rag.retrieve import (
     _base_chunk_type,
     _exact_identifier_score,
     _expand_entity_companions,
+    _record_identity,
 )
 
 
@@ -44,6 +45,11 @@ def test_rag_documents_loader_preserves_source_aware_metadata(tmp_path: Path):
             "call_type": "LINK",
             "source_id": "source-provided",
             "content_hash": "source-hash",
+            "source_bundle_path": "cobol-rekt/knowledge-base_rag/PDCBVC",
+            "original_chunk_id": "rekt-42",
+            "sha256": "abc123",
+            "left_source_system": "mapa_hamza",
+            "right_source_system": "cobol_rekt",
         },
     }
     path.write_text(json.dumps(record) + "\n", encoding="utf-8")
@@ -60,6 +66,11 @@ def test_rag_documents_loader_preserves_source_aware_metadata(tmp_path: Path):
     assert meta["entity_key"] == "PDCBVC|PD1VOCI|LINK"
     assert meta["target"] == "PD1VOCI"
     assert meta["call_type"] == "LINK"
+    assert meta["source_bundle_path"] == "cobol-rekt/knowledge-base_rag/PDCBVC"
+    assert meta["original_chunk_id"] == "rekt-42"
+    assert meta["sha256"] == "abc123"
+    assert meta["left_source_system"] == "mapa_hamza"
+    assert meta["right_source_system"] == "cobol_rekt"
     assert meta["factory_source_id"] == "source-provided"
     assert meta["content_hash"] != "source-hash"
 
@@ -132,6 +143,41 @@ def test_entity_expansion_fetches_companion_chunks(monkeypatch):
     expanded = _expand_entity_companions([base], AppConfig())
 
     assert [item.metadata["source_id"] for item in expanded] == ["mapa-1", "rekt-1"]
+
+
+def test_entity_expansion_keeps_companions_without_source_id(monkeypatch):
+    base = _source(
+        "MAPA call inventory",
+        source_system="mapa_hamza",
+        chunk_type="architecture.call",
+        entity_key="PDCBVC|PD1VOCI|LINK",
+    )
+
+    class FakeCollection:
+        def get(self, **_kwargs):
+            return {
+                "documents": ["cobol-rekt call contract"],
+                "metadatas": [
+                    {
+                        "source_system": "cobol_rekt",
+                        "chunk_type": "cobol_rekt.call_contract",
+                        "source_chunk_type": "call_contract",
+                        "coverage_dimension": "deep_logic",
+                        "entity_key": "PDCBVC|PD1VOCI|LINK",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        "cobol_rag.retrieve.open_index",
+        lambda _config: SimpleNamespace(chroma_collection=FakeCollection()),
+    )
+
+    expanded = _expand_entity_companions([base], AppConfig())
+
+    assert len(expanded) == 2
+    assert expanded[1].metadata["source_system"] == "cobol_rekt"
+    assert _record_identity(expanded[0]) != _record_identity(expanded[1])
 
 
 def test_direct_answer_handlers_emit_provenance():

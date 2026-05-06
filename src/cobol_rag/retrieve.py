@@ -639,7 +639,7 @@ def _expand_entity_companions(
     if not entity_keys:
         return results
 
-    seen_source_ids = {str(result.metadata.get("source_id", "")) for result in results}
+    seen_record_keys = {_record_identity(result) for result in results}
     expanded = list(results)
     try:
         resources = open_index(config)
@@ -664,10 +664,11 @@ def _expand_entity_companions(
         metadatas = payload.get("metadatas") or []
         for text, metadata in zip(documents, metadatas, strict=False):
             metadata = dict(metadata or {})
-            source_id = str(metadata.get("source_id", ""))
-            if source_id in seen_source_ids:
+            candidate = RetrievalResult(score=None, text=str(text or ""), metadata=metadata)
+            record_key = _record_identity(candidate)
+            if record_key in seen_record_keys:
                 continue
-            candidates.append(RetrievalResult(score=None, text=str(text or ""), metadata=metadata))
+            candidates.append(candidate)
         candidates.sort(
             key=lambda item: (
                 str(item.metadata.get("source_system", "")) not in source_systems,
@@ -676,9 +677,28 @@ def _expand_entity_companions(
             reverse=True,
         )
         for candidate in candidates[:per_entity_limit]:
-            seen_source_ids.add(str(candidate.metadata.get("source_id", "")))
+            seen_record_keys.add(_record_identity(candidate))
             expanded.append(candidate)
     return expanded
+
+
+def _record_identity(result: RetrievalResult) -> str:
+    for key in (
+        "source_id",
+        "chunk_id",
+        "factory_record_id",
+        "original_chunk_id",
+        "content_hash",
+    ):
+        value = result.metadata.get(key)
+        if value:
+            return f"{key}:{value}"
+    entity_key = result.metadata.get("entity_key")
+    if entity_key:
+        source_system = result.metadata.get("source_system", "")
+        chunk_type = result.metadata.get("chunk_type") or result.metadata.get("source_chunk_type", "")
+        return f"entity:{entity_key}:{source_system}:{chunk_type}"
+    return f"text:{result.text[:160]}"
 
 
 def _normalized_base_score(result: RetrievalResult) -> float:

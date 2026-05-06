@@ -121,21 +121,21 @@ fi
 
 resolve_path() {
   local path="$1"
-  python - "$path" <<'PY'
+  "$PYTHON_BIN" - "$path" <<'PY'
 from pathlib import Path
 import sys
 print(Path(sys.argv[1]).expanduser().resolve())
 PY
 }
 
-PROGRAM_UPPER="$(printf '%s' "$PROGRAM" | tr '[:lower:]' '[:upper:]')"
-PROGRAM_LOWER="$(printf '%s' "$PROGRAM" | tr '[:upper:]' '[:lower:]')"
-ANALYSIS_REPO_ABS="$(resolve_path "$ANALYSIS_REPO")"
-
 PYTHON_BIN="python3"
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   PYTHON_BIN="python"
 fi
+
+PROGRAM_UPPER="$(printf '%s' "$PROGRAM" | tr '[:lower:]' '[:upper:]')"
+PROGRAM_LOWER="$(printf '%s' "$PROGRAM" | tr '[:upper:]' '[:lower:]')"
+ANALYSIS_REPO_ABS="$(resolve_path "$ANALYSIS_REPO")"
 
 if [[ "$MODE" == "combined" ]]; then
   SOURCE_JSONL="$ANALYSIS_REPO_ABS/artifacts/final/final_scripts/output/combined/rag_index/${PROGRAM_UPPER}_combined.jsonl"

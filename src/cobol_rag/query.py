@@ -53,11 +53,19 @@ def answer_query(
             answer=_maybe_polish_structured_answer(current_question, entity_answer, config),
             sources=[],
         )
+    if final_scripts_answer and _should_prefer_final_scripts(current_question):
+        return QueryAnswer(
+            question=question,
+            answer=_maybe_polish_structured_answer(current_question, final_scripts_answer, config),
+            sources=[],
+        )
+    if metadata_answer and _should_prefer_final_scripts(current_question):
+        return QueryAnswer(question=question, answer=metadata_answer, sources=[])
 
     sources: list[RetrievalResult] = []
     if _rag_runtime_available(config.embedding.base_url):
         try:
-            sources = retrieve(question, config=config, top_k=top_k, chunk_types=chunk_types)
+            sources = retrieve(current_question, config=config, top_k=top_k, chunk_types=chunk_types)
         except Exception:
             sources = []
     if not sources and not _rag_runtime_available(config.embedding.base_url):
@@ -155,6 +163,45 @@ def _is_guardrail_answer(answer: str) -> bool:
         or "not indexed as a standalone program" in text
         or "do not have indexed analysis" in text
     )
+
+
+def _should_prefer_final_scripts(question: str) -> bool:
+    q = question.lower()
+    if "business rule" in q or "business rules" in q:
+        return False
+    deterministic_terms = (
+        "what is",
+        "what does",
+        "overview",
+        "summary",
+        "purpose",
+        "copybook",
+        "copy book",
+        "copy member",
+        "abend",
+        "commarea",
+        "communication area",
+        "linking to",
+        "link to",
+        "call",
+        "calls",
+        "parameter",
+        "parameters",
+        "variable",
+        "defined",
+        "modified",
+        "used",
+        "where is",
+        "where does",
+        "line",
+        "lines",
+        "count",
+        "how many",
+        "dead code",
+        "unused code",
+        "commented",
+    )
+    return any(term in q for term in deterministic_terms)
 
 
 def _current_question(question: str) -> str:

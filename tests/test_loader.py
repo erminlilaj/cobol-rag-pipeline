@@ -237,6 +237,39 @@ def test_answer_query_uses_rag_before_final_scripts(monkeypatch):
     assert answer.sources
 
 
+def test_answer_query_retrieves_with_current_question_only(monkeypatch):
+    seen: dict[str, str] = {}
+    monkeypatch.setattr("cobol_rag.query.answer_from_final_scripts", lambda _question: None)
+    monkeypatch.setattr("cobol_rag.query.preflight_entity_answer", lambda _question: None)
+    monkeypatch.setattr("cobol_rag.query._rag_runtime_available", lambda _base_url: True)
+
+    def fake_retrieve(question, *_args, **_kwargs):
+        seen["question"] = question
+        return [
+            _source(
+                "content.condition: X\ncontent.action: JUMP",
+                chunk_type="business_rule",
+                source_system="mapa_hamza",
+            )
+        ]
+
+    monkeypatch.setattr("cobol_rag.query.retrieve", fake_retrieve)
+
+    answer = answer_query(
+        "Use this conversation history only to resolve follow-up references.\n"
+        "Conversation history:\n"
+        "User: Which paths can lead to ABEND00?\n"
+        "Assistant: ABEND00 answer\n"
+        "Current question:\n"
+        "What business rules apply to PDCBVC?",
+        AppConfig(),
+    )
+
+    assert seen["question"] == "What business rules apply to PDCBVC?"
+    assert "ABEND00" not in seen["question"]
+    assert "Business-rule evidence found" in answer.answer
+
+
 def test_answer_query_falls_back_when_rag_unavailable(monkeypatch):
     monkeypatch.setattr("cobol_rag.query.answer_from_final_scripts", lambda _question: "structured fallback")
     monkeypatch.setattr("cobol_rag.query.preflight_entity_answer", lambda _question: None)

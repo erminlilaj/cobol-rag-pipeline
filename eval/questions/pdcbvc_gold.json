@@ -48,6 +48,15 @@
       }
     },
     {
+      "id": "copybooks.roles",
+      "category": "copybooks",
+      "question": "Which copybooks are included by PDCBVC.CBL, and what role does each one play in the program?",
+      "assertions": {
+        "contains_all": ["COPY members (12)", "DFHAID", "CICS AID key constants", "DFHBMSCA", "BMS map attribute", "PD1FS00 service/session", "PD1VOCI accounting-voice", "PDCBVCM", "map/BMS screen fields", "PDRTWA2", "TWA/state context", "PXCSEMAF", "PDAGGVIP"],
+        "forbidden": ["customer information", "booking travel", "flight number", "vehicle rentals", "hotel room", "car rental"]
+      }
+    },
+    {
       "id": "metadata.call_count",
       "category": "metadata",
       "question": "How many outgoing calls does PDCBVC have?",
@@ -100,6 +109,24 @@
       }
     },
     {
+      "id": "control.phase_dispatch_variant",
+      "category": "control_flow",
+      "question": "How does PDCBVC decide whether to start from BROWSE-FASE1 or BROWSE-FASE2, and which TWA field controls this decision?",
+      "assertions": {
+        "contains_all": ["TWCOB-FASE", "TWCOB-FASE = '1'", "BROWSE-FASE1", "TWCOB-FASE = '2'", "BROWSE-FASE2", "ABEND00"],
+        "forbidden": ["set to 2 in the BROWSE-FASE1 paragraph"]
+      }
+    },
+    {
+      "id": "control.ip_function_restriction",
+      "category": "control_flow",
+      "question": "What happens when TWCOB-FUNZIONE is one of I, A, C, D, or P and TWCOB-ID-SISTEMA = 'IP'?",
+      "assertions": {
+        "contains_all": ["READ-TAB-SEMAF", "PXCSEMAF-STATUS = 1", "TWCOB-AREA-MSG", "XCTL-LIV4", "PXCSEMAF-OUTCOME", "ABEND00"],
+        "forbidden": ["username and password", "book a flight", "hotel room", "car rental", "travel tip"]
+      }
+    },
+    {
       "id": "control.browse_fase1_sequence",
       "category": "control_flow",
       "question": "In PDCBVC.CBL, explain the full sequence of operations performed during BROWSE-FASE1 before the map PDCBVC1 is sent to the terminal.",
@@ -132,6 +159,15 @@
       "assertions": {
         "contains_all": ["WCTPAG", "TWCOB-VARCONT-NPAGINA", "BROWSE-FASE2-ENTER", "BROWSE-FASE2-PF7", "BROWSE-FASE2-PF8"],
         "forbidden": ["TWCOB-VARCONT-NUMFUNZ and TWCOB-FUNZIONE variables to control pagination"]
+      }
+    },
+    {
+      "id": "control.page_total_calculation",
+      "category": "control_flow",
+      "question": "How does PDCBVC calculate the total number of pages for the browse result?",
+      "assertions": {
+        "contains_all": ["CALCOLA-NPAG", "PD1VOCI-TABVOX-NUMERO", "MAX-RIGHE", "NPAGT", "RESTO", "RESTO > 0", "does not use `TWCOB-VARCONT-NUMFUNZ`"],
+        "forbidden": ["TWCOB-VARCONT-NUMFUNZ + 2", "multiplied by 5", "(TWCOB-VARCONT-NUMFUNZ + 2) * 5"]
       }
     },
     {
@@ -210,6 +246,42 @@
       "question": "Where is TWCOB-VARCONT-NPAGINA set and used?",
       "assertions": {
         "contains_all": ["TWCOB-VARCONT-NPAGINA", "origin: COMMAREA", "BROWSE-FASE1", "BROWSE-FASE2-VISUAL", "MUOVI-DATI"]
+      }
+    },
+    {
+      "id": "dataflow.pdrtwa2_to_pd1voci",
+      "category": "dataflow",
+      "question": "Which fields from PDRTWA2 are copied into the PD1VOCI copybook before the CICS LINK?",
+      "assertions": {
+        "contains_all": ["PDRTWA2", "TWCOB-VARCONT-VOCE-LIV4", "PD1VOCI-COD-VOCE", "TWCOB-TIPO-DIP", "PD1VOCI-CODDIP-TIPO", "TWCOB-FUNZIONE", "PD1VOCI-TIPO-VARIAZ", "TWCOB-VARCONT-ANNO", "PD1VOCI-LIQUID1"],
+        "forbidden": ["prepared by the PDCBVC program in the LINK-PD1VOCI step"]
+      }
+    },
+    {
+      "id": "dataflow.numfunz_pd1voci_mapping",
+      "category": "dataflow",
+      "question": "How does TWCOB-VARCONT-NUMFUNZ change the value of PD1VOCI-FUNZIONE and PD1VOCI-TIPO-VOCE?",
+      "assertions": {
+        "contains_all": ["NUMFUNZ `1`", "PD1VOCI-FUNZIONE = '11'", "NUMFUNZ `6`", "PD1VOCI-FUNZIONE = '12'", "NUMFUNZ `2`", "PD1VOCI-TIPO-VOCE = '1'", "NUMFUNZ `5`", "PD1VOCI-TIPO-VOCE = '4'"],
+        "forbidden": ["NUMFUNZ is equal to '1', it sets PD1VOCI-FUNZIONE to '11' and PD1VOCI-TIPO-VOCE to '1'", "NUMFUNZ is equal to '6', it sets PD1VOCI-FUNZIONE to '12' and PD1VOCI-TIPO-VOCE to '3'"]
+      }
+    },
+    {
+      "id": "dataflow.pd1fs00_session",
+      "category": "dataflow",
+      "question": "When does PDCBVC call PD1FS00, and what information does it obtain from the PD1FS00 copybook?",
+      "assertions": {
+        "contains_all": ["PREP-LINK-PD1FS00", "LINK-PD1FS00", "PD1FS00-FUNZIONE", "PD1FS00-SESS-SISTEMA", "COMMAREA=WPD1FS00", "PD1FS00-SESS-ANNO", "PD1FS00-SESS-MESE", "PD1FS00-SESS-TMENS", "PD1FS00-SESS-FLAG"],
+        "forbidden": ["TWCOB-VARCONT-NUMFUNZ and TWCOB-FUNZIONE to determine which fields to move into PD1FS00"]
+      }
+    },
+    {
+      "id": "dataflow.session_status_display",
+      "category": "dataflow",
+      "question": "How does PDCBVC display the session status on the map, and which values of PD1FS00-SESS-FLAG correspond to Aperta, Chiusa, and Liquidata?",
+      "assertions": {
+        "contains_all": ["PD1FS00-SESS-FLAG = '1'", "Aperta", "PD1FS00-SESS-FLAG = '2'", "Chiusa", "PD1FS00-SESS-FLAG = '3'", "Liquidata", "MDSESSO", "MSESSIO"],
+        "forbidden": ["does not provide any information", "additional analysis or testing"]
       }
     },
     {

@@ -32,7 +32,7 @@ retrieval:
 answers:
   require_citations: true
   show_sources: true
-  llm_polish_final_scripts: true
+  llm_polish_final_scripts: false
 
 loaders:
   generic_json:

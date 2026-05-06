@@ -955,12 +955,24 @@ def _answer_structured_behavior(root: Path, program: str, question: str) -> str 
     q = question.lower()
     if _asks_about_phase_decision(q):
         return _answer_phase_decision(root, program)
+    if _asks_about_ip_function_condition(q):
+        return _answer_ip_function_condition(root, program)
     if _asks_about_error_paths(q):
         return _answer_error_paths(root, program)
     if _asks_about_semaphore(q):
         return _answer_semaphore_flow(root, program)
+    if _asks_about_session_status(q):
+        return _answer_session_status(root, program)
+    if _asks_about_page_total_calculation(q):
+        return _answer_page_total_calculation(root, program)
     if _asks_about_browse_fase1_sequence(q):
         return _answer_paragraph_sequence(root, program, "BROWSE-FASE1", stop_at="SEND-PDCBVC1")
+    if _asks_about_pdrtwa2_to_pd1voci(q):
+        return _answer_pdrtwa2_to_pd1voci(root, program)
+    if _asks_about_numfunz_pd1voci_mapping(q):
+        return _answer_pd1voci_numfunz_mapping(root, program)
+    if _asks_about_pd1fs00_session(q):
+        return _answer_pd1fs00_session(root, program)
     call_target = _call_target_in_question(root, program, question)
     if call_target and _asks_about_call_details(q):
         return _answer_call_preparation(root, program, call_target)
@@ -989,8 +1001,16 @@ def _answer_structured_behavior(root: Path, program: str, question: str) -> str 
 
 def _asks_about_phase_decision(q: str) -> bool:
     return (
-        "twcob-fase" in q
-        and any(term in q for term in ("browse-fase1", "browse-fase2", "unexpected", "decide", "whether"))
+        ("twcob-fase" in q or ("browse-fase1" in q and "browse-fase2" in q))
+        and any(term in q for term in ("browse-fase1", "browse-fase2", "unexpected", "decide", "whether", "start"))
+    )
+
+
+def _asks_about_ip_function_condition(q: str) -> bool:
+    return (
+        "twcob-funzione" in q
+        and "twcob-id-sistema" in q
+        and "'ip'" in q
     )
 
 
@@ -1023,6 +1043,32 @@ def _asks_about_call_details(q: str) -> bool:
             "link",
             "xctl",
         )
+    )
+
+
+def _asks_about_pdrtwa2_to_pd1voci(q: str) -> bool:
+    return "pdrtwa2" in q and "pd1voci" in q
+
+
+def _asks_about_numfunz_pd1voci_mapping(q: str) -> bool:
+    if "prepare" in q or "prepared" in q or "parameter" in q:
+        return False
+    return "twcob-varcont-numfunz" in q and "pd1voci" in q and any(
+        term in q for term in ("change", "sets", "value", "funzione", "tipo-voce", "mapping")
+    )
+
+
+def _asks_about_pd1fs00_session(q: str) -> bool:
+    return "pd1fs00" in q and any(term in q for term in ("obtain", "obtains", "session", "sess", "information"))
+
+
+def _asks_about_session_status(q: str) -> bool:
+    return "pd1fs00-sess-flag" in q or all(term in q for term in ("aperta", "chiusa", "liquidata"))
+
+
+def _asks_about_page_total_calculation(q: str) -> bool:
+    return any(term in q for term in ("total number of pages", "number of pages", "calculate", "calculated")) and any(
+        term in q for term in ("browse result", "npagt", "resto", "page", "pages")
     )
 
 
@@ -1140,6 +1186,42 @@ def _answer_phase_decision(root: Path, program: str) -> str | None:
     return "\n".join(lines)
 
 
+def _answer_ip_function_condition(root: Path, program: str) -> str | None:
+    edges = _cfg_edges(root, program)
+    condition_edges = [
+        edge for edge in edges
+        if "TWCOB-FUNZIONE" in str(edge.get("condition", ""))
+        and "TWCOB-ID-SISTEMA" in str(edge.get("condition", ""))
+        and "'IP'" in str(edge.get("condition", ""))
+    ]
+    if not condition_edges:
+        return None
+
+    lines = [
+        f"{program} handles `TWCOB-FUNZIONE` in `I/A/C/D/P` with `TWCOB-ID-SISTEMA = 'IP'` as a semaphore restriction path:"
+    ]
+    for edge in condition_edges:
+        condition = edge.get("condition") or "unconditional"
+        lines.append(f"- `{edge.get('from')}` -> `{edge.get('to')}` when `{condition}` ({edge.get('evidence', '')})")
+    lines.append(
+        "- Meaning: in `BROWSE-FASE1`, these insert/update-style functions trigger `READ-TAB-SEMAF` before continuing."
+    )
+    lines.append(
+        "- If `PXCSEMAF-STATUS = 1`, the program moves the restriction message to `TWCOB-AREA-MSG` and transfers to `XCTL-LIV4`; this is a restriction/early-transfer path, not normal browse continuation."
+    )
+    lines.append(
+        "- If the semaphore service itself returns `PXCSEMAF-OUTCOME NOT = SPACE`, `READ-TAB-SEMAF` performs `ABEND00`."
+    )
+    _append_evidence(
+        lines,
+        [
+            _cite("controlflow.cfg/controlflow.cfg.json", detail="IP function/semaphore edges"),
+            _cite("dataflow.literal_assignments/dataflow.literal_assignments.json", detail="TWCOB-AREA-MSG/PXCSEMAF assignments"),
+        ],
+    )
+    return "\n".join(lines)
+
+
 def _answer_semaphore_flow(root: Path, program: str) -> str | None:
     edges = _cfg_edges(root, program)
     read_edges = [edge for edge in edges if edge.get("to") == "READ-TAB-SEMAF"]
@@ -1188,6 +1270,177 @@ def _answer_semaphore_flow(root: Path, program: str) -> str | None:
             _cite("controlflow.cfg/controlflow.cfg.json", detail="READ-TAB-SEMAF edges"),
             _cite("dataflow.literal_assignments/dataflow.literal_assignments.json", detail="PXCSEMAF assignments"),
             _cite("architecture.call_parameters/architecture.call_parameters.json", line=(call or {}).get("line_start"), detail="PXRSEMAF"),
+        ],
+    )
+    return "\n".join(lines)
+
+
+def _answer_pdrtwa2_to_pd1voci(root: Path, program: str) -> str | None:
+    call = _call_by_target(root, program, "PD1VOCI")
+    if not call:
+        return None
+    lines = [
+        f"{program} prepares `PD1VOCI` from TWA/COMMAREA fields before the CICS LINK.",
+        (
+            "`PDRTWA2` is the TWA/context COPY member, but the available dataflow evidence records the concrete "
+            "`TWCOB-*` source fields rather than proving every source field's copybook origin."
+        ),
+        "- evidenced source-to-target moves in `INIZ-PARAM`:",
+        "  - `TWCOB-VARCONT-VOCE-LIV4` -> `PD1VOCI-COD-VOCE`.",
+        "  - `TWCOB-TIPO-DIP` -> `PD1VOCI-CODDIP-TIPO`.",
+        "  - `TWCOB-SP-MATR` -> `PD1VOCI-CODDIP-MATR`.",
+        "  - `TWCOB-SP-PAD` -> `PD1VOCI-CODDIP-PAD`.",
+        "  - `TWCOB-FUNZIONE` -> `PD1VOCI-TIPO-VARIAZ`.",
+        "  - `TWCOB-VARCONT-ANNO` / `MESE` / `TMENS` -> `PD1VOCI-LIQUID1-*` period fields.",
+        "- literal/conditional fields prepared for the call include `PD1VOCI-TIPO-GEST`, `PD1VOCI-FUNZIONE`, `PD1VOCI-TIPO-ESTRA`, and `PD1VOCI-TIPO-VOCE`.",
+    ]
+    for variable in (
+        "PD1VOCI-COD-VOCE",
+        "PD1VOCI-CODDIP-TIPO",
+        "PD1VOCI-CODDIP-MATR",
+        "PD1VOCI-CODDIP-PAD",
+        "PD1VOCI-TIPO-VARIAZ",
+        "PD1VOCI-LIQUID1-ANNO",
+        "PD1VOCI-LIQUID1-MESE",
+        "PD1VOCI-LIQUID1-TIPO",
+    ):
+        lines.extend(_variable_write_site_lines(root, program, variable, min_line=426, max_line=477, limit=2, indent="  "))
+    _append_evidence(
+        lines,
+        [
+            _cite("dataflow.variable/*.json", detail="PD1VOCI write sites"),
+            _cite("architecture.copybooks/architecture.copybooks.json", detail="PDRTWA2 listed as state_context"),
+            _cite("architecture.call_parameters/architecture.call_parameters.json", line=call.get("line_start"), detail="PD1VOCI"),
+        ],
+    )
+    return "\n".join(lines)
+
+
+def _answer_pd1voci_numfunz_mapping(root: Path, program: str) -> str | None:
+    funzione = _variable_payload(root, program, "PD1VOCI-FUNZIONE")
+    tipo_voce = _variable_payload(root, program, "PD1VOCI-TIPO-VOCE")
+    if not funzione and not tipo_voce:
+        return None
+    lines = [
+        f"{program} uses `TWCOB-VARCONT-NUMFUNZ` in `INIZ-PARAM` / `INIZ-PARAM-010` to influence `PD1VOCI`:",
+        "- `PD1VOCI-FUNZIONE`:",
+        "  - NUMFUNZ `1` -> `PD1VOCI-FUNZIONE = '11'`.",
+        "  - NUMFUNZ `6` -> `PD1VOCI-FUNZIONE = '12'`.",
+        "  - `TWCOB-FUNZIONE = 'I'` -> `PD1VOCI-FUNZIONE = '02'` and `PD1VOCI-TIPO-ESTRA = 'A'`.",
+        "  - otherwise -> `PD1VOCI-FUNZIONE = '11'`.",
+        "- `PD1VOCI-TIPO-VOCE`:",
+        "  - NUMFUNZ `2` -> `PD1VOCI-TIPO-VOCE = '1'`.",
+        "  - NUMFUNZ `3` -> `PD1VOCI-TIPO-VOCE = '3'`.",
+        "  - NUMFUNZ `4` -> `PD1VOCI-TIPO-VOCE = '2'`.",
+        "  - NUMFUNZ `5` -> `PD1VOCI-TIPO-VOCE = '4'`.",
+        "  - otherwise -> `PD1VOCI-TIPO-VOCE = '0'`.",
+        "- So NUMFUNZ does not map `1 -> TIPO-VOCE '1'` or `6 -> TIPO-VOCE '3'`; those were hallucinated mappings.",
+    ]
+    if funzione:
+        lines.append("- `PD1VOCI-FUNZIONE` write evidence:")
+        lines.extend(_site_lines(funzione, "write_sites", limit=6, indent="  "))
+    if tipo_voce:
+        lines.append("- `PD1VOCI-TIPO-VOCE` write evidence:")
+        lines.extend(_site_lines(tipo_voce, "write_sites", limit=6, indent="  "))
+    _append_evidence(
+        lines,
+        [
+            _cite("dataflow.variable/dataflow.variable.PD1VOCI-FUNZIONE.json", detail="write sites"),
+            _cite("dataflow.variable/dataflow.variable.PD1VOCI-TIPO-VOCE.json", detail="write sites"),
+        ],
+    )
+    return "\n".join(lines)
+
+
+def _answer_pd1fs00_session(root: Path, program: str) -> str | None:
+    call = _call_by_target(root, program, "PD1FS00")
+    if not call:
+        return None
+    lines = [
+        f"{program} calls `PD1FS00` through `PREP-LINK-PD1FS00` / `LINK-PD1FS00`:",
+        "- `PREP-LINK-PD1FS00` prepares the request and is performed from browse flow before display/data preparation.",
+    ]
+    for variable in ("PD1FS00-FUNZIONE", "PD1FS00-SESS-SISTEMA"):
+        lines.extend(_variable_write_site_lines(root, program, variable, min_line=400, max_line=420, limit=3, indent="  "))
+    lines.append(
+        f"- CICS LINK line {call.get('line_start')}: COMMAREA={call.get('commarea')} LENGTH={call.get('length')}."
+    )
+    lines.append("- session information read after the service call:")
+    for variable in (
+        "PD1FS00-SESS-ANNO",
+        "PD1FS00-SESS-MESE",
+        "PD1FS00-SESS-TMENS",
+        "PD1FS00-SESS-FLAG",
+        "PD1FS00-RETURN",
+    ):
+        payload = _variable_payload(root, program, variable)
+        if payload:
+            lines.append(f"  - `{variable}`:")
+            lines.extend(_site_lines(payload, "read_sites", limit=4, indent="    "))
+    _append_evidence(
+        lines,
+        [
+            _cite("architecture.call_parameters/architecture.call_parameters.json", line=call.get("line_start"), detail="PD1FS00"),
+            _cite("dataflow.variable/*.json", detail="PD1FS00 session field sites"),
+        ],
+    )
+    return "\n".join(lines)
+
+
+def _answer_session_status(root: Path, program: str) -> str | None:
+    flag = _variable_payload(root, program, "PD1FS00-SESS-FLAG")
+    if not flag:
+        return None
+    lines = [
+        f"{program} displays session status in `MUOVI-TESTATA-00` using `PD1FS00-SESS-FLAG`:",
+        "- `PD1FS00-SESS-FLAG = '1'` -> moves `Aperta` to `MDSESSO`.",
+        "- `PD1FS00-SESS-FLAG = '2'` -> moves `Chiusa` to `MDSESSO`.",
+        "- `PD1FS00-SESS-FLAG = '3'` -> moves `Liquidata` to `MDSESSO`.",
+        "- The formatted session fields are also moved into map output fields such as `MSESSIO` and `MDSESSO`.",
+        "- flag control evidence:",
+    ]
+    lines.extend(_site_lines(flag, "control_sites", limit=6, indent="  "))
+    for variable in ("MSESSIO", "MDSESSO"):
+        payload = _variable_payload(root, program, variable)
+        if payload:
+            lines.append(f"- `{variable}` writes:")
+            lines.extend(_site_lines(payload, "write_sites", limit=6, indent="  "))
+    _append_evidence(
+        lines,
+        [
+            _cite("dataflow.variable/dataflow.variable.PD1FS00-SESS-FLAG.json", detail="flag controls"),
+            _cite("dataflow.variable/dataflow.variable.MDSESSO.json", detail="displayed status writes"),
+        ],
+    )
+    return "\n".join(lines)
+
+
+def _answer_page_total_calculation(root: Path, program: str) -> str | None:
+    sites = _paragraph_variable_sites(root, program, "CALCOLA-NPAG")
+    if not sites:
+        return None
+    lines = [
+        f"{program} calculates total browse pages in `CALCOLA-NPAG`:",
+        "- It divides `PD1VOCI-TABVOX-NUMERO` by `MAX-RIGHE`, giving `NPAGT` and remainder `RESTO`.",
+        "- If `NPAGT < 1`, it adds 1 to `NPAGT` and exits, so an empty/small result still has one page.",
+        "- If `RESTO > 0`, it adds 1 to `NPAGT`, which is the usual ceiling division behavior.",
+        "- It does not use `TWCOB-VARCONT-NUMFUNZ` for the page total.",
+        "- evidence in `CALCOLA-NPAG`:",
+    ]
+    seen: set[tuple[str, str]] = set()
+    for site in sites:
+        key = (str(site.get("line")), str(site.get("statement")))
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"  - line {site.get('line')}: {site.get('statement')}")
+        if len(seen) >= 12:
+            break
+    _append_evidence(
+        lines,
+        [
+            _cite("controlflow.cfg/controlflow.cfg.json", detail="CALCOLA-NPAG edges"),
+            _cite("dataflow.variable/*.json", detail="CALCOLA-NPAG variable sites"),
         ],
     )
     return "\n".join(lines)
@@ -1826,10 +2079,48 @@ def _answer_copybooks(root: Path, program: str, q: str) -> str | None:
         )
         return "\n".join(lines)
     lines = [f"{program} COPY members ({len(all_copybooks)}): {', '.join(all_copybooks)}."]
-    for category, names in classified.items():
-        lines.append(f"- {category}: {', '.join(names)}")
+    lines.append("- role/context from available artifacts:")
+    for copybook in all_copybooks:
+        lines.append(f"  - `{copybook}`: {_copybook_role(root, program, str(copybook), classified)}")
+    if classified:
+        lines.append("- classification groups:")
+        for category, names in classified.items():
+            lines.append(f"  - {category}: {', '.join(names)}")
     _append_evidence(lines, [_cite("architecture.copybooks/architecture.copybooks.json", detail="content.classified")])
     return "\n".join(lines)
+
+
+def _copybook_role(root: Path, program: str, copybook: str, classified: dict[str, Any]) -> str:
+    name = copybook.upper()
+    categories = [category for category, names in classified.items() if name in {str(item).upper() for item in names}]
+    category_text = f"category `{', '.join(categories)}`" if categories else "listed COPY member"
+    variable_prefixes = {
+        "PD1FS00": "PD1FS00 service/session COMMAREA fields, including return and session status fields.",
+        "PD1VOCI": "PD1VOCI accounting-voice COMMAREA/table fields used before and after the CICS LINK.",
+        "PDCBVCM": "PDCBVC map/BMS screen fields such as selection/message/display fields.",
+        "PDRUTI01": "PD0UTI01 utility COMMAREA fields used for formatting values.",
+        "PXCSEMAF": "PXRSEMAF semaphore request/response area for `PDAGGVIP`.",
+        "PDIABEND": "abnormal-termination/ABEND support area.",
+        "PDRTWA2": "TWA/state context fields used through `TWCOB-*` data.",
+        "PDSAVTW2": "saved TWA/state context support.",
+        "DFHAID": "CICS AID key constants such as ENTER/PF keys.",
+        "DFHBMSCA": "CICS BMS map attribute constants; no direct field reference is proven in the current dataflow artifacts.",
+        "PDRTIP01": "business COPY member listed by architecture; no specific field role is proven in the current dataflow artifacts.",
+        "PDRVC": "business/state COPY member listed by architecture; no specific field role is proven in the current dataflow artifacts.",
+    }
+    if name in variable_prefixes:
+        return f"{variable_prefixes[name]} ({category_text})"
+
+    matching = []
+    dataflow_dir = root / "dataflow.variable"
+    if dataflow_dir.exists():
+        for path in dataflow_dir.glob(f"dataflow.variable.{name}-*.json"):
+            matching.append(path.stem.replace("dataflow.variable.", ""))
+            if len(matching) >= 4:
+                break
+    if matching:
+        return f"fields referenced in dataflow: {', '.join(matching)}. ({category_text})"
+    return f"{category_text}; no more specific role is proven by the current artifacts."
 
 
 def _answer_screen_field_lineage(root: Path, program: str, question: str) -> str | None:

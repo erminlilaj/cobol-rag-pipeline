@@ -45,6 +45,10 @@ def answer_query(
         )
 
     final_scripts_answer = answer_from_final_scripts(current_question)
+    if not final_scripts_answer:
+        normalized_evidence_question = _normalized_question_for_structured_evidence(current_question)
+        if normalized_evidence_question != current_question:
+            final_scripts_answer = answer_from_final_scripts(normalized_evidence_question)
     metadata_answer = _try_program_metadata_answer(current_question)
     entity_answer = preflight_entity_answer(current_question)
     sources: list[RetrievalResult] = []
@@ -228,6 +232,14 @@ def _looks_off_evidence_answer(question: str, answer: str, sources: list[Retriev
         "cobol-rekt add",
         "cobol-rekt report",
         "code snippet you provided",
+        "step-by-step reasoning",
+        "add after the",
+        "required addition to the program flow",
+        "recommendations",
+        "centralize error handling",
+        "review page logic",
+        "enhance reliability",
+        "improve maintainability",
         "larger program or system",
         "specific details of the program are not provided",
         "it is not clear what this program does",
@@ -250,6 +262,18 @@ def _looks_off_evidence_answer(question: str, answer: str, sources: list[Retriev
 
 def _external_links_or_markdown_links(answer: str) -> bool:
     return bool(re.search(r"\[[^\]]+\]\(https?://", answer) or re.search(r"https?://\S+", answer))
+
+
+def _normalized_question_for_structured_evidence(question: str) -> str:
+    program = _program_from_question(question)
+    if not program:
+        return question
+    q = question.lower()
+    if "file" in q and any(term in q for term in ("what", "about", "does", "purpose", "overview")):
+        return f"what is {program}?"
+    if "logic" in q and "file" in q:
+        return f"what is the control flow logic inside {program}?"
+    return question
 
 
 def _privileged_evidence_sources(

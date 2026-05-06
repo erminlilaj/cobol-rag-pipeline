@@ -357,13 +357,15 @@ def _base_chunk_type(result: RetrievalResult) -> str:
 
 def _detect_intent(query: str) -> str:
     q = query.lower()
+    if any(term in q for term in ("logic inside", "inside the file", "inside file")) and "logic" in q:
+        return "control_flow"
     if _looks_like_program_overview_question(query):
         return "program_summary"
     if any(term in q for term in ("unused", "dead code", "inactive", "commented-out", "commented out", "unreachable")):
         return "dead_code"
     if any(term in q for term in ("business rule", "business rules", "rule ", "rules ", "br-")):
         return "business_rules"
-    if any(term in q for term in ("pf key", "pf keys", "function key", "function keys", "enter key", "eibaid", "navigation")):
+    if any(term in q for term in ("pf key", "pf keys", "function key", "function keys", "enter key", "eibaid", "navigation")) or re.search(r"\bpf\d+\b", q):
         return "ui_navigation"
     if any(term in q for term in ("dataflow", "data flow", "read or write", "read/write", "where is", "where are")) and (
         "variable" in q or re.search(r"\b[A-Za-z][A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\b", query)
@@ -400,7 +402,7 @@ def _expanded_query_for_intent(query: str, intent: str) -> str:
         "dead_code": "dead code unused copybooks commented-out inactive unreachable negative evidence",
         "comments": "comments commented-out inactive code source comments",
         "business_rules": "business rules BR condition action category severity scope evidence",
-        "ui_navigation": "PF key ENTER EIBAID CICS navigation paragraph map BMS",
+        "ui_navigation": "PF key PF1 PF2 PF3 PF4 PF7 PF8 PF9 ENTER EIBAID DFHPF1 DFHPF2 DFHPF3 DFHPF4 DFHPF7 DFHPF8 DFHPF9 CICS navigation paragraph map BMS",
         "variable_dataflow": "dataflow variable read sites write sites control sites line numbers paragraph",
         "control_flow": "control flow workflow paragraph logic condition sequence branch transition",
         "error_paths": "error path abnormal termination abend SQLERROR invalid selection invalid key message",
@@ -415,6 +417,8 @@ def _expanded_query_for_intent(query: str, intent: str) -> str:
         extra = f"{extra or ''} READ-TAB-SEMAF PXCSEMAF-STATUS PXCSEMAF-OUTCOME XCTL-LIV4 TWCOB-AREA-MSG"
     if intent == "control_flow" and any(term in q for term in ("enter", "eibaid")):
         extra = f"{extra or ''} DFHENTER BROWSE-FASE2-ENTER PREP-LINK-PD1FS00 INIZ-PARAM LINK-PD1VOCI"
+    if intent == "ui_navigation" and re.search(r"\bpf\d+\b", q):
+        extra = f"{extra or ''} ui.cics.navigation screen.key_dispatch DFHPF1 DFHPF2 DFHPF3 DFHPF4 DFHPF7 DFHPF8 DFHPF9 XCTL-LIV1 XCTL-LIV2 XCTL-LIV3 XCTL-LIV4 XCTL-LIV0"
     if not extra:
         return query
     return f"{query}\n{extra}"

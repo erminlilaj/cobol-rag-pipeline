@@ -198,6 +198,16 @@ def test_entity_expansion_keeps_companions_without_source_id(monkeypatch):
 def test_retrieval_intent_detects_program_overview_variants():
     assert _detect_intent("what pdcbvc?") == "program_summary"
     assert _detect_intent("what the hell is PDCBVC?") == "program_summary"
+    assert _detect_intent("what is file PDCBVC about?") == "program_summary"
+    assert _detect_intent("what is the logic inside the file PDCBVC?") == "control_flow"
+
+
+def test_retrieval_intent_detects_pf_number_questions():
+    assert _detect_intent("Compare PF1, PF2, PF3, PF4, PF7, PF8, and PF9 behavior.") == "ui_navigation"
+    expanded = _expanded_query_for_intent("Compare PF1, PF2, PF3, PF4, PF7, PF8, and PF9 behavior.", "ui_navigation")
+
+    assert "DFHPF1" in expanded
+    assert "screen.key_dispatch" in expanded
 
 
 def test_question_entities_ignore_action_words():
@@ -253,6 +263,16 @@ def test_off_evidence_validator_rejects_external_generic_answer():
     assert _looks_off_evidence_answer(
         "is there unused copybooks in PDCBVC?",
         "PDCBVC is a program that is used to perform a specific task. It is not clear what this program does.",
+        sources,
+    )
+    assert _looks_off_evidence_answer(
+        "Which paths can lead to ABEND00?",
+        "Recommendations: Centralize Error Handling and Review Page Logic to enhance reliability.",
+        sources,
+    )
+    assert _looks_off_evidence_answer(
+        "When does PDCBVC call PD1FS00?",
+        "Step-by-step reasoning: Add after the CICS LINK an evaluation of PD1FS00-RETURN.",
         sources,
     )
 

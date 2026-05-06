@@ -399,6 +399,9 @@ def _evidence_haystack(sources: list[RetrievalResult]) -> str:
 def _entity_present_in_text(entity: str, haystack: str) -> bool:
     if "-" in entity:
         pattern = rf"(?<![A-Z0-9-]){re.escape(entity)}(?![A-Z0-9-])"
+        prefix_pattern = rf"(?<![A-Z0-9-]){re.escape(entity)}-[A-Z0-9]+"
+        if re.search(prefix_pattern, haystack):
+            return True
     else:
         pattern = rf"(?<![A-Z0-9]){re.escape(entity)}(?![A-Z0-9])"
     return re.search(pattern, haystack) is not None
@@ -1075,6 +1078,10 @@ Rules:
 - For variable/field questions, mention only reads, writes, controlling conditions, or origins explicitly present.
 - For calculations, include the exact operands/formula only if the retrieved facts or sources show them.
 - Prefer the compact extracted facts below over raw flattened JSON text when they are available.
+- If a source is marked `privileged.final_scripts` or `privileged.metadata`, treat it as the highest-trust
+  structured evidence, but still write a fresh answer rather than copying it verbatim.
+- If raw sources conflict with privileged structured evidence, prefer the privileged structured evidence and mention
+  the conflict only when it is explicit in the retrieved sources.
 - Keep the answer concise.
 - Mention source ids inline when useful, but do not invent source ids.
 
@@ -1140,6 +1147,12 @@ def _extract_grounding_facts(sources: list[RetrievalResult], per_source_limit: i
         source_id = source.metadata.get("source_id", f"source-{index}")
         chunk_type = source.metadata.get("chunk_type") or source.metadata.get("source_chunk_type") or "source"
         picked: list[str] = []
+        if str(chunk_type).startswith("privileged."):
+            lines = _first_nonempty_lines(source.text, limit=36)
+            if lines:
+                fact_lines.append(f"[{index}] {chunk_type} {source_id}")
+                fact_lines.extend(f"- {line}" for line in lines)
+            continue
         for raw_line in source.text.splitlines():
             line = raw_line.strip()
             if not line:

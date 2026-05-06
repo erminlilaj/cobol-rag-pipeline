@@ -10,6 +10,8 @@ from cobol_rag.loaders.generic_json import GenericJsonLoader
 from cobol_rag.loaders.rag_documents import RagDocumentsLoader
 from cobol_rag.query import (
     answer_query,
+    _entity_present_in_text,
+    _extract_grounding_facts,
     _question_entities,
     _try_business_rules_answer,
     _try_conflict_provenance_answer,
@@ -199,6 +201,31 @@ def test_retrieval_intent_detects_program_overview_variants():
 def test_question_entities_ignore_action_words():
     assert "PRESSES" not in _question_entities("What does BROWSE-FASE2 do when the user presses ENTER?")
     assert "BROWSE-FASE2" in _question_entities("What does BROWSE-FASE2 do when the user presses ENTER?")
+
+
+def test_entity_grounding_accepts_paragraph_prefix_evidence():
+    haystack = "DFHENTER routes to BROWSE-FASE2-ENTER.".upper()
+
+    assert _entity_present_in_text("BROWSE-FASE2", haystack)
+
+
+def test_fact_extraction_promotes_privileged_evidence():
+    facts = _extract_grounding_facts(
+        [
+            _source(
+                "Privileged structured evidence from final_scripts.\n"
+                "PDCBVC calls PD1FS00 in PREP-LINK-PD1FS00.\n"
+                "PD1FS00-SESS-FLAG '1' means Aperta.",
+                chunk_type="privileged.final_scripts",
+                source_system="mapa_hamza",
+                program="PDCBVC",
+                source_id="final_scripts:test",
+            )
+        ]
+    )
+
+    assert "Privileged structured evidence" in facts
+    assert "PD1FS00-SESS-FLAG '1' means Aperta" in facts
 
 
 def test_control_flow_expansion_targets_pagination_and_selection():

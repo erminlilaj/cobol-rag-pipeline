@@ -12,6 +12,8 @@ from cobol_rag.query import (
     answer_query,
     _entity_present_in_text,
     _extract_grounding_facts,
+    _grounded_fallback_answer,
+    _looks_off_evidence_answer,
     _question_entities,
     _try_business_rules_answer,
     _try_conflict_provenance_answer,
@@ -226,6 +228,48 @@ def test_fact_extraction_promotes_privileged_evidence():
 
     assert "Privileged structured evidence" in facts
     assert "PD1FS00-SESS-FLAG '1' means Aperta" in facts
+
+
+def test_off_evidence_validator_rejects_external_generic_answer():
+    sources = [
+        _source(
+            "Privileged structured evidence from final_scripts.\nPDCBVC has 15 commented-out code/data items.",
+            chunk_type="privileged.final_scripts",
+            source_system="mapa_hamza",
+            program="PDCBVC",
+        )
+    ]
+
+    assert _looks_off_evidence_answer(
+        "give me some examples of dead code",
+        "See [Source 1](https://github.com/oss-specs/specs/blob/master/pdf/PDCBVC.pdf).",
+        sources,
+    )
+    assert _looks_off_evidence_answer(
+        "is there unused copybooks in PDCBVC?",
+        "Run git checkout -b new-branch-name to create a branch.",
+        sources,
+    )
+
+
+def test_grounded_fallback_uses_evidence_not_generic_text():
+    sources = [
+        _source(
+            "Privileged structured evidence from final_scripts.\n"
+            "PDCBVC dead-code evidence: commented-out code/data: 15 item(s).\n"
+            "line 75: 03 LUNG PIC S9(4) COMP VALUE +32000.",
+            chunk_type="privileged.final_scripts",
+            source_system="mapa_hamza",
+            program="PDCBVC",
+            source_id="final_scripts:dead",
+        )
+    ]
+
+    answer = _grounded_fallback_answer("give me some examples of dead code", sources)
+
+    assert "commented-out code/data: 15" in answer
+    assert "line 75" in answer
+    assert "github.com" not in answer
 
 
 def test_control_flow_expansion_targets_pagination_and_selection():

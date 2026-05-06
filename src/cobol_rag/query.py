@@ -118,9 +118,16 @@ def answer_query(
             answer=_offline_fallback_answer(config.llm.model, sources),
             sources=sources,
         )
+    answer_text = str(response.text).strip()
+    if _looks_off_evidence_answer(current_question, answer_text, sources):
+        return QueryAnswer(
+            question=question,
+            answer=_grounded_fallback_answer(current_question, sources),
+            sources=sources,
+        )
     return QueryAnswer(
         question=question,
-        answer=str(response.text).strip(),
+        answer=answer_text,
         sources=sources,
     )
 
@@ -202,6 +209,44 @@ def _validate_retrieved_evidence(question: str, sources: list[RetrievalResult]) 
         "The retrieved chunks do not explicitly mention the requested entity, so I will not infer an answer from "
         "similar-looking control-flow or dataflow evidence."
     )
+
+
+def _looks_off_evidence_answer(question: str, answer: str, sources: list[RetrievalResult]) -> bool:
+    if not answer.strip():
+        return True
+    text = answer.lower()
+    forbidden_patterns = (
+        "https://",
+        "http://",
+        "github.com/",
+        "git clone",
+        "git checkout",
+        "git branch",
+        "new branch",
+        "install cobol-rekt",
+        "cobol-rekt init",
+        "cobol-rekt add",
+        "cobol-rekt report",
+        "code snippet you provided",
+        "larger program or system",
+        "specific details of the program are not provided",
+        "i don't understand what you mean by",
+        "i do not understand what you mean by",
+        "can you provide more context",
+        "official website",
+        "package manager",
+    )
+    if any(pattern in text for pattern in forbidden_patterns):
+        return True
+
+    if _external_links_or_markdown_links(answer):
+        return True
+
+    return False
+
+
+def _external_links_or_markdown_links(answer: str) -> bool:
+    return bool(re.search(r"\[[^\]]+\]\(https?://", answer) or re.search(r"https?://\S+", answer))
 
 
 def _privileged_evidence_sources(
@@ -1039,6 +1084,41 @@ def _offline_fallback_answer(model: str, sources: list[RetrievalResult]) -> str:
     return "\n".join(lines).strip()
 
 
+def _grounded_fallback_answer(question: str, sources: list[RetrievalResult]) -> str:
+    facts = _extract_grounding_facts(sources, per_source_limit=10)
+    if facts:
+        lines = [
+            "I found indexed evidence for this question, but the generated prose was not grounded enough, so here are the supported facts:",
+            "",
+        ]
+        fact_lines = [line for line in facts.splitlines() if line.strip()]
+        lines.extend(fact_lines[:32])
+        lines.append("")
+        lines.append(_compact_provenance_line(sources))
+        return "\n".join(lines).strip()
+    return _offline_fallback_answer("configured LLM", sources)
+
+
+def _compact_provenance_line(sources: list[RetrievalResult]) -> str:
+    by_source: dict[str, set[str]] = {}
+    for source in sources:
+        source_system = str(source.metadata.get("source_system") or "indexed")
+        by_source.setdefault(source_system, set()).add(_chunk_type(source) or str(source.metadata.get("chunk_type", "source")))
+    if not by_source:
+        return "Sources used: indexed evidence."
+    parts = []
+    for source_system, chunk_types in sorted(by_source.items()):
+        label = {
+            "mapa_hamza": "MAPA/Hamza",
+            "cobol_rekt": "cobol-rekt",
+            "cobol-rekt": "cobol-rekt",
+            "integration": "integration",
+            "combined": "integration",
+        }.get(source_system, source_system)
+        parts.append(f"{label}: {', '.join(sorted(chunk_types))}")
+    return "Sources used: " + "; ".join(parts) + "."
+
+
 def _build_prompt(question: str, sources: list[RetrievalResult]) -> str:
     intent = _detect_intent(question)
     entities = _question_entities(question)
@@ -1082,6 +1162,9 @@ Rules:
   structured evidence, but still write a fresh answer rather than copying it verbatim.
 - If raw sources conflict with privileged structured evidence, prefer the privileged structured evidence and mention
   the conflict only when it is explicit in the retrieved sources.
+- Do not include external URLs, Git commands, installation steps, or generic tool documentation unless those exact
+  facts appear in the retrieved sources.
+- Do not say the user provided a code snippet. The only context you have is the retrieved evidence.
 - Keep the answer concise.
 - Mention source ids inline when useful, but do not invent source ids.
 

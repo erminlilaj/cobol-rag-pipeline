@@ -357,6 +357,8 @@ def _base_chunk_type(result: RetrievalResult) -> str:
 
 def _detect_intent(query: str) -> str:
     q = query.lower()
+    if _looks_like_program_overview_question(query):
+        return "program_summary"
     if any(term in q for term in ("unused", "dead code", "inactive", "commented-out", "commented out", "unreachable")):
         return "dead_code"
     if any(term in q for term in ("business rule", "business rules", "rule ", "rules ", "br-")):
@@ -369,7 +371,7 @@ def _detect_intent(query: str) -> str:
         return "variable_dataflow"
     if any(term in q for term in ("error path", "error paths", "abend", "sql error", "invalid selection", "invalid key")):
         return "error_paths"
-    if any(term in q for term in ("how does", "how is", "when does", "under what condition", "sequence", "control flow", "workflow", "paragraph logic")):
+    if any(term in q for term in ("how does", "how is", "when does", "under what condition", "sequence", "control flow", "workflow", "paragraph logic", "what happens", "presses enter", "pressed enter", "selects a row", "selected progressivo", "progressivo", "number of pages", "total number of pages", "browse result")):
         return "control_flow"
     if "copybook" in q or "copy book" in q:
         return "copybooks"
@@ -389,6 +391,7 @@ def _detect_intent(query: str) -> str:
 
 
 def _expanded_query_for_intent(query: str, intent: str) -> str:
+    q = query.lower()
     expansions = {
         "copybooks": "copybooks_used total_copybooks resolved_copybooks stubbed_copybook_count stubbed_copybooks copybook resolution found missing",
         "static_values": "static values forced values hardcoded literals assignments constants",
@@ -401,11 +404,41 @@ def _expanded_query_for_intent(query: str, intent: str) -> str:
         "variable_dataflow": "dataflow variable read sites write sites control sites line numbers paragraph",
         "control_flow": "control flow workflow paragraph logic condition sequence branch transition",
         "error_paths": "error path abnormal termination abend SQLERROR invalid selection invalid key message",
+        "program_summary": "program summary overview purpose size paragraphs statements calls copybooks comments discovered MAPA",
     }
     extra = expansions.get(intent)
+    if intent == "control_flow" and any(term in q for term in ("page", "pages", "browse result", "npagt", "resto", "max-righe")):
+        extra = f"{extra or ''} screen.pagination CALCOLA-NPAG NPAGT RESTO MAX-RIGHE PD1VOCI-TABVOX-NUMERO DIVIDE REMAINDER"
+    if intent == "control_flow" and any(term in q for term in ("select", "selected", "row", "progressivo", "sceltai")):
+        extra = f"{extra or ''} screen.selection BROWSE-FASE2-SEL SCELTAI WPROGR WPROGREC WCTRIG NOTFND"
+    if intent == "control_flow" and any(term in q for term in ("twcob-funzione", "twcob-id-sistema", "semaf", "pxcsemaf", "ip")):
+        extra = f"{extra or ''} READ-TAB-SEMAF PXCSEMAF-STATUS PXCSEMAF-OUTCOME XCTL-LIV4 TWCOB-AREA-MSG"
+    if intent == "control_flow" and any(term in q for term in ("enter", "eibaid")):
+        extra = f"{extra or ''} DFHENTER BROWSE-FASE2-ENTER PREP-LINK-PD1FS00 INIZ-PARAM LINK-PD1VOCI"
     if not extra:
         return query
     return f"{query}\n{extra}"
+
+
+def _looks_like_program_overview_question(query: str) -> bool:
+    q = query.lower().strip(" ?!.")
+    has_program_identifier = bool(re.search(r"\b(?:PD|PX|PR|PB)[A-Z0-9]{3,}\b", query.upper()))
+    if not has_program_identifier:
+        return False
+    overview_markers = (
+        "what is",
+        "what's",
+        "what the hell is",
+        "what the fuck is",
+        "explain",
+        "overview",
+        "summary",
+        "purpose",
+        "about",
+    )
+    if any(marker in q for marker in overview_markers):
+        return True
+    return bool(re.fullmatch(r"what\s+(?:is\s+)?(?:the\s+)?[a-z0-9]+", q))
 
 
 def _intent_score(intent: str, result: RetrievalResult, config: AppConfig) -> float:

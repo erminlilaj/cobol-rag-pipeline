@@ -47,12 +47,6 @@ def answer_query(
     final_scripts_answer = answer_from_final_scripts(current_question)
     metadata_answer = _try_program_metadata_answer(current_question)
     entity_answer = preflight_entity_answer(current_question)
-    if entity_answer and _is_guardrail_answer(entity_answer):
-        return QueryAnswer(
-            question=question,
-            answer=_maybe_polish_structured_answer(current_question, entity_answer, config),
-            sources=[],
-        )
     sources: list[RetrievalResult] = []
     if _rag_runtime_available(config.embedding.base_url):
         try:
@@ -104,18 +98,6 @@ def answer_query(
     grounding_error = _validate_retrieved_evidence(current_question, sources)
     if grounding_error:
         return QueryAnswer(question=question, answer=grounding_error, sources=sources)
-
-    direct_answer = (
-        _try_conflict_provenance_answer(current_question, sources)
-        or _try_business_rules_answer(current_question, sources)
-        or _try_ui_navigation_answer(current_question, sources)
-        or _try_sql_includes_answer(current_question, sources)
-        or _try_variable_dataflow_answer(current_question, sources)
-        or _try_jcl_file_answer(current_question, sources)
-        or _try_dead_code_answer(current_question, sources)
-    )
-    if direct_answer:
-        return QueryAnswer(question=question, answer=direct_answer, sources=sources)
 
     resources = open_index(config)
     prompt = _build_prompt(question=current_question, sources=sources)

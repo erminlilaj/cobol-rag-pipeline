@@ -19,8 +19,10 @@ from cobol_rag.query import (
 from cobol_rag.retrieve import (
     RetrievalResult,
     _base_chunk_type,
+    _detect_intent,
     _exact_identifier_score,
     _expand_entity_companions,
+    _expanded_query_for_intent,
     _record_identity,
 )
 
@@ -188,6 +190,27 @@ def test_entity_expansion_keeps_companions_without_source_id(monkeypatch):
     assert _record_identity(expanded[0]) != _record_identity(expanded[1])
 
 
+def test_retrieval_intent_detects_program_overview_variants():
+    assert _detect_intent("what pdcbvc?") == "program_summary"
+    assert _detect_intent("what the hell is PDCBVC?") == "program_summary"
+
+
+def test_control_flow_expansion_targets_pagination_and_selection():
+    pagination = _expanded_query_for_intent(
+        "How does PDCBVC calculate the total number of pages for the browse result?",
+        "control_flow",
+    )
+    selection = _expanded_query_for_intent(
+        "When the user selects a row, how does PDCBVC validate the selected progressivo?",
+        "control_flow",
+    )
+
+    assert "CALCOLA-NPAG" in pagination
+    assert "PD1VOCI-TABVOX-NUMERO" in pagination
+    assert "BROWSE-FASE2-SEL" in selection
+    assert "SCELTAI" in selection
+
+
 def test_direct_answer_handlers_emit_provenance():
     business = _try_business_rules_answer(
         "What business rules apply?",
@@ -223,17 +246,23 @@ def test_answer_query_uses_rag_before_final_scripts(monkeypatch):
         "cobol_rag.query.retrieve",
         lambda *_args, **_kwargs: [
             _source(
-                "content.condition: X\ncontent.action: JUMP",
+                "Program: PDCBVC\ncontent.condition: X\ncontent.action: JUMP",
                 chunk_type="business_rule",
                 source_system="mapa_hamza",
                 program="PDCBVC",
             )
         ],
     )
+    monkeypatch.setattr(
+        "cobol_rag.query.open_index",
+        lambda _config: SimpleNamespace(
+            runtime=SimpleNamespace(llm=SimpleNamespace(complete=lambda _prompt: SimpleNamespace(text="RAG business-rule answer")))
+        ),
+    )
 
     answer = answer_query("What business rules apply to PDCBVC?", AppConfig())
 
-    assert "Business-rule evidence found" in answer.answer
+    assert answer.answer == "RAG business-rule answer"
     assert "structured fallback" not in answer.answer
     assert answer.sources
 
@@ -303,7 +332,7 @@ def test_answer_query_retrieves_with_current_question_only(monkeypatch):
         seen["question"] = question
         return [
             _source(
-                "content.condition: X\ncontent.action: JUMP",
+                "Program: PDCBVC\ncontent.condition: X\ncontent.action: JUMP",
                 chunk_type="business_rule",
                 source_system="mapa_hamza",
                 program="PDCBVC",
@@ -311,6 +340,12 @@ def test_answer_query_retrieves_with_current_question_only(monkeypatch):
         ]
 
     monkeypatch.setattr("cobol_rag.query.retrieve", fake_retrieve)
+    monkeypatch.setattr(
+        "cobol_rag.query.open_index",
+        lambda _config: SimpleNamespace(
+            runtime=SimpleNamespace(llm=SimpleNamespace(complete=lambda _prompt: SimpleNamespace(text="RAG business-rule answer")))
+        ),
+    )
 
     answer = answer_query(
         "Use this conversation history only to resolve follow-up references.\n"
@@ -324,7 +359,7 @@ def test_answer_query_retrieves_with_current_question_only(monkeypatch):
 
     assert seen["question"] == "What business rules apply to PDCBVC?"
     assert "ABEND00" not in seen["question"]
-    assert "Business-rule evidence found" in answer.answer
+    assert answer.answer == "RAG business-rule answer"
 
 
 def test_answer_query_falls_back_when_rag_unavailable(monkeypatch):

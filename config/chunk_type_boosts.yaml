@@ -71,3 +71,12 @@ error_paths:
     business_rule: 0.12
     business_rule.rag: 0.12
     paragraph_logic: 0.10
+
+program_summary:
+  chunk_types:
+    integration.source_balance: 0.24
+    program.summary: 0.30
+    program_summary: 0.26
+    cobol_analysis_health: 0.12
+    architecture.calls: 0.10
+    architecture.copybooks: 0.10

@@ -203,6 +203,7 @@ def _intent_rerank(
     scored = [
         (
             _intent_score(intent, result, config)
+            + _integration_context_score(intent, result)
             + _exact_identifier_score(query, result)
             + _coverage_dimension_score(query, result)
             + _normalized_base_score(result),
@@ -539,6 +540,37 @@ def _intent_score(intent: str, result: RetrievalResult, config: AppConfig) -> fl
         return score
 
     return 0.0
+
+
+def _integration_context_score(intent: str, result: RetrievalResult) -> float:
+    chunk_type = _base_chunk_type(result)
+    raw_chunk_type = str(result.metadata.get("chunk_type", ""))
+    source_system = str(result.metadata.get("source_system", ""))
+    coverage = str(result.metadata.get("coverage_dimension", ""))
+    text = result.text.lower()
+
+    if not (
+        raw_chunk_type.startswith("integration.")
+        or chunk_type.startswith("integration.")
+        or source_system in {"combined", "integration"}
+        or coverage in {"source_balance", "conflict_report", "cross_source_context"}
+    ):
+        return 0.0
+
+    score = 0.08
+    if intent == "external_programs" and any(term in raw_chunk_type for term in ("call", "commarea")):
+        score += 0.14
+    elif intent == "variable_dataflow" and "variable" in raw_chunk_type:
+        score += 0.14
+    elif intent in {"control_flow", "error_paths"} and any(term in raw_chunk_type for term in ("paragraph", "path", "error")):
+        score += 0.14
+    elif intent == "copybooks" and "copybook" in raw_chunk_type:
+        score += 0.14
+    elif intent in {"program_summary", "general"} and "source_balance" in raw_chunk_type:
+        score += 0.12
+    if "mapa" in text and ("cobol-rekt" in text or "cobol_rekt" in text):
+        score += 0.05
+    return score
 
 
 def _configured_chunk_type_boosts(intent: str, config: AppConfig) -> dict[str, float]:

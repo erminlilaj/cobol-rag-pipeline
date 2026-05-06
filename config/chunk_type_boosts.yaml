@@ -1,5 +1,7 @@
 external_programs:
   chunk_types:
+    integration.call_context: 0.34
+    integration.source_balance: 0.18
     architecture.call_parameters: 0.30
     architecture.calls: 0.26
     architecture.call: 0.22
@@ -14,11 +16,14 @@ business_rules:
 
 ui_navigation:
   chunk_types:
+    integration.paragraph_context: 0.18
     ui.cics.navigation: 0.26
     screen.key_dispatch: 0.18
 
 variable_dataflow:
   chunk_types:
+    integration.variable_context: 0.34
+    integration.source_balance: 0.14
     dataflow.variable: 0.28
     dataflow.used_variables: 0.20
     dataflow.literal_assignments: 0.10
@@ -35,6 +40,8 @@ datasets_tables:
 
 copybooks:
   chunk_types:
+    integration.copybook_context: 0.30
+    integration.source_balance: 0.18
     architecture.copybooks: 0.24
     architecture.copybook_fields: 0.18
     copybook_fields: 0.18
@@ -44,6 +51,8 @@ copybooks:
 
 control_flow:
   chunk_types:
+    integration.paragraph_context: 0.32
+    integration.source_balance: 0.12
     controlflow.cfg: 0.22
     workflow: 0.20
     paragraph_logic: 0.20
@@ -54,6 +63,9 @@ control_flow:
 
 error_paths:
   chunk_types:
+    integration.error_context: 0.32
+    integration.paragraph_context: 0.18
+    integration.source_balance: 0.12
     error_path: 0.26
     quality.error_paths.rich: 0.20
     business_rule: 0.12

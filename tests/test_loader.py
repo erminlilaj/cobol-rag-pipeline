@@ -226,6 +226,7 @@ def test_answer_query_uses_rag_before_final_scripts(monkeypatch):
                 "content.condition: X\ncontent.action: JUMP",
                 chunk_type="business_rule",
                 source_system="mapa_hamza",
+                program="PDCBVC",
             )
         ],
     )
@@ -235,6 +236,61 @@ def test_answer_query_uses_rag_before_final_scripts(monkeypatch):
     assert "Business-rule evidence found" in answer.answer
     assert "structured fallback" not in answer.answer
     assert answer.sources
+
+
+def test_answer_query_does_not_shortcut_final_scripts_when_rag_is_grounded(monkeypatch):
+    monkeypatch.setattr("cobol_rag.query.answer_from_final_scripts", lambda _question: "structured shortcut")
+    monkeypatch.setattr("cobol_rag.query.preflight_entity_answer", lambda _question: None)
+    monkeypatch.setattr("cobol_rag.query._rag_runtime_available", lambda _base_url: True)
+    monkeypatch.setattr(
+        "cobol_rag.query.retrieve",
+        lambda *_args, **_kwargs: [
+            _source(
+                "Program: PDCBVC\nType: program.summary\nPDCBVC overview from indexed RAG evidence.",
+                chunk_type="program.summary",
+                source_system="mapa_hamza",
+                program="PDCBVC",
+            )
+        ],
+    )
+
+    class FakeLlm:
+        def complete(self, prompt):
+            assert "structured shortcut" not in prompt
+            return SimpleNamespace(text="RAG-generated answer from retrieved evidence")
+
+    monkeypatch.setattr(
+        "cobol_rag.query.open_index",
+        lambda _config: SimpleNamespace(runtime=SimpleNamespace(llm=FakeLlm())),
+    )
+
+    answer = answer_query("What is PDCBVC?", AppConfig())
+
+    assert answer.answer == "RAG-generated answer from retrieved evidence"
+    assert "structured shortcut" not in answer.answer
+    assert answer.sources
+
+
+def test_answer_query_rejects_ungrounded_named_target(monkeypatch):
+    monkeypatch.setattr("cobol_rag.query.answer_from_final_scripts", lambda _question: None)
+    monkeypatch.setattr("cobol_rag.query.preflight_entity_answer", lambda _question: None)
+    monkeypatch.setattr("cobol_rag.query._rag_runtime_available", lambda _base_url: True)
+    monkeypatch.setattr(
+        "cobol_rag.query.retrieve",
+        lambda *_args, **_kwargs: [
+            _source(
+                "DFHPF1 -> XCTL-LIV1\nDFHPF2 -> XCTL-LIV2",
+                chunk_type="ui.cics.navigation",
+                source_system="mapa_hamza",
+                program="PDCBVC",
+            )
+        ],
+    )
+
+    answer = answer_query("Which paths can lead to rome?", AppConfig())
+
+    assert "do not have indexed evidence for `ROME`" in answer.answer
+    assert "similar-looking control-flow" in answer.answer
 
 
 def test_answer_query_retrieves_with_current_question_only(monkeypatch):
@@ -250,6 +306,7 @@ def test_answer_query_retrieves_with_current_question_only(monkeypatch):
                 "content.condition: X\ncontent.action: JUMP",
                 chunk_type="business_rule",
                 source_system="mapa_hamza",
+                program="PDCBVC",
             )
         ]
 

@@ -12,7 +12,7 @@ from cobol_rag.config import AppConfig
 from cobol_rag.final_scripts_answers import answer_from_final_scripts
 from cobol_rag.index import configure_llamaindex, open_index
 from cobol_rag.question_router import preflight_entity_answer
-from cobol_rag.retrieve import RetrievalResult, retrieve
+from cobol_rag.retrieve import RetrievalResult, retrieve, _detect_intent
 
 
 @dataclass(frozen=True)
@@ -53,15 +53,6 @@ def answer_query(
             answer=_maybe_polish_structured_answer(current_question, entity_answer, config),
             sources=[],
         )
-    if final_scripts_answer and _should_prefer_final_scripts(current_question):
-        return QueryAnswer(
-            question=question,
-            answer=_maybe_polish_structured_answer(current_question, final_scripts_answer, config),
-            sources=[],
-        )
-    if metadata_answer and _should_prefer_final_scripts(current_question):
-        return QueryAnswer(question=question, answer=metadata_answer, sources=[])
-
     sources: list[RetrievalResult] = []
     if _rag_runtime_available(config.embedding.base_url):
         try:
@@ -110,6 +101,10 @@ def answer_query(
             sources=[],
         )
 
+    grounding_error = _validate_retrieved_evidence(current_question, sources)
+    if grounding_error:
+        return QueryAnswer(question=question, answer=grounding_error, sources=sources)
+
     direct_answer = (
         _try_conflict_provenance_answer(current_question, sources)
         or _try_business_rules_answer(current_question, sources)
@@ -123,20 +118,10 @@ def answer_query(
         return QueryAnswer(question=question, answer=direct_answer, sources=sources)
 
     resources = open_index(config)
-    prompt = _build_prompt(question=question, sources=sources)
+    prompt = _build_prompt(question=current_question, sources=sources)
     try:
         response = resources.runtime.llm.complete(prompt)
     except Exception as error:
-        fallback_answer = final_scripts_answer or metadata_answer or entity_answer
-        if fallback_answer:
-            return QueryAnswer(
-                question=question,
-                answer=_append_rag_context_note(
-                    _maybe_polish_structured_answer(current_question, fallback_answer, config),
-                    sources,
-                ),
-                sources=sources,
-            )
         return QueryAnswer(
             question=question,
             answer=_offline_fallback_answer(config.llm.model, sources),
@@ -202,6 +187,129 @@ def _should_prefer_final_scripts(question: str) -> bool:
         "commented",
     )
     return any(term in q for term in deterministic_terms)
+
+
+def _validate_retrieved_evidence(question: str, sources: list[RetrievalResult]) -> str | None:
+    """Refuse answers when the retrieved evidence does not ground named entities."""
+    entities = _question_entities(question)
+    if not entities:
+        return None
+
+    haystack = _evidence_haystack(sources)
+    missing = [
+        entity
+        for entity in entities
+        if not _entity_present_in_text(entity, haystack)
+    ]
+    if not missing:
+        return None
+
+    program = _program_from_sources(sources) or _program_from_question(question) or "the indexed program"
+    formatted = ", ".join(f"`{entity}`" for entity in missing)
+    return (
+        f"I do not have indexed evidence for {formatted} in {program}. "
+        "The retrieved chunks do not explicitly mention the requested entity, so I will not infer an answer from "
+        "similar-looking control-flow or dataflow evidence."
+    )
+
+
+def _question_entities(question: str) -> list[str]:
+    """Extract COBOL-like entities that must be grounded in retrieved evidence."""
+    ignored = {
+        "ABEND",
+        "ABOUT",
+        "AREA",
+        "ARE",
+        "CALL",
+        "CALCULATE",
+        "CALCULATES",
+        "CODE",
+        "COBOL",
+        "COMMAREA",
+        "CONDITION",
+        "CONDITIONS",
+        "COPYBOOK",
+        "DOES",
+        "FIELD",
+        "FIELDS",
+        "FROM",
+        "FUNCTION",
+        "HAPPENS",
+        "HOW",
+        "KEY",
+        "KEYS",
+        "LEAD",
+        "LINK",
+        "PATH",
+        "PATHS",
+        "PROGRAM",
+        "READ",
+        "RESULT",
+        "SCREEN",
+        "SELECTS",
+        "TABLE",
+        "THERE",
+        "TOTAL",
+        "USED",
+        "USER",
+        "VARIABLE",
+        "WHAT",
+        "WHEN",
+        "WHERE",
+        "WHICH",
+        "WITH",
+        "WRITE",
+        "WRITTEN",
+    }
+    entities: list[str] = []
+
+    patterns = [
+        r"\b[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+\b",
+        r"\bABEND\d+\b",
+        r"\bPF\d+\b",
+        r"\b(?:PD|PX|PR|PB|DFH|SQL|TWCOB|M1|W|FUNZ|SCELTA)[A-Z0-9]{1,}\b",
+    ]
+    for pattern in patterns:
+        entities.extend(re.findall(pattern, question.upper()))
+
+    lower_targets = []
+    for pattern in (
+        r"\b(?:lead|leads|go|goes|transfer|transfers|xctl)\s+to\s+([a-z][a-z0-9_-]{2,})\b",
+        r"\b(?:variable|field|paragraph|program|copybook|table)\s+([a-z][a-z0-9_-]{2,})\b",
+        r"\b(?:about|for)\s+([a-z][a-z0-9_-]{2,})\b",
+    ):
+        lower_targets.extend(match.upper() for match in re.findall(pattern, question))
+
+    entities.extend(lower_targets)
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for entity in entities:
+        cleaned = entity.strip().strip("`'\".,:;()[]{}").upper()
+        if not cleaned or cleaned in ignored:
+            continue
+        if len(cleaned) <= 2 and not cleaned.startswith("PF"):
+            continue
+        if cleaned not in seen:
+            seen.add(cleaned)
+            unique.append(cleaned)
+    return unique[:12]
+
+
+def _evidence_haystack(sources: list[RetrievalResult]) -> str:
+    parts: list[str] = []
+    for source in sources:
+        parts.append(source.text)
+        parts.extend(str(value) for value in source.metadata.values() if value is not None)
+    return "\n".join(parts).upper()
+
+
+def _entity_present_in_text(entity: str, haystack: str) -> bool:
+    if "-" in entity:
+        pattern = rf"(?<![A-Z0-9-]){re.escape(entity)}(?![A-Z0-9-])"
+    else:
+        pattern = rf"(?<![A-Z0-9]){re.escape(entity)}(?![A-Z0-9])"
+    return re.search(pattern, haystack) is not None
 
 
 def _current_question(question: str) -> str:
@@ -285,6 +393,8 @@ def _is_cobol_question(question: str) -> bool:
         "business rule",
         "pf key",
         "pf keys",
+        "path",
+        "paths",
         "function key",
         "eibaid",
         "provenance",
@@ -835,16 +945,25 @@ def _offline_fallback_answer(model: str, sources: list[RetrievalResult]) -> str:
 
 
 def _build_prompt(question: str, sources: list[RetrievalResult]) -> str:
+    intent = _detect_intent(question)
+    entities = _question_entities(question)
+    facts = _extract_grounding_facts(sources)
     context_blocks = []
     for index, source in enumerate(sources, start=1):
         source_id = source.metadata.get("source_id", f"source-{index}")
         source_path = source.metadata.get("source_path", "")
+        chunk_type = source.metadata.get("chunk_type") or source.metadata.get("source_chunk_type") or ""
+        source_system = source.metadata.get("source_system") or "indexed"
+        title = source.metadata.get("title") or ""
         context_blocks.append(
             "\n".join(
                 [
                     f"[Source {index}]",
                     f"source_id: {source_id}",
                     f"source_path: {source_path}",
+                    f"source_system: {source_system}",
+                    f"chunk_type: {chunk_type}",
+                    f"title: {title}",
                     "text:",
                     source.text,
                 ]
@@ -859,14 +978,87 @@ Rules:
 - If the sources do not contain the answer, say that the indexed sources do not contain enough information.
 - If the user names a program, variable, paragraph, copybook, file, or table that is not present in the sources,
   say it is not present in the indexed evidence. Do not explain it from general COBOL knowledge.
+- Treat exact identifiers as mandatory grounding. Do not answer about a similar identifier.
+- For control-flow/path questions, list only edges, conditions, or targets explicitly present in the sources.
+- For variable/field questions, mention only reads, writes, controlling conditions, or origins explicitly present.
+- For calculations, include the exact operands/formula only if the retrieved facts or sources show them.
+- Prefer the compact extracted facts below over raw flattened JSON text when they are available.
 - Keep the answer concise.
 - Mention source ids inline when useful, but do not invent source ids.
 
 Question:
 {question}
 
+Detected intent:
+{intent}
+
+Requested entities that must be grounded:
+{", ".join(entities) if entities else "none"}
+
+Compact extracted facts:
+{facts if facts else "none"}
+
 Retrieved sources:
 {context}
 
 Answer:
 """
+
+
+def _extract_grounding_facts(sources: list[RetrievalResult], per_source_limit: int = 16) -> str:
+    fact_lines: list[str] = []
+    fact_patterns = (
+        "content.condition",
+        "content.action",
+        "content.target",
+        "content.source",
+        "content.edge",
+        "content.edges",
+        "content.variable",
+        "content.variables_read",
+        "content.variables_modified",
+        "content.read",
+        "content.write",
+        "content.calls",
+        "content.command",
+        "content.paragraph",
+        "content.formula",
+        "content.evidence",
+        "condition:",
+        "target:",
+        "action:",
+        "edge:",
+        "evidence:",
+    )
+    code_patterns = (
+        " IF ",
+        " GO TO ",
+        " PERFORM ",
+        " MOVE ",
+        " DIVIDE ",
+        " ADD ",
+        " EXEC SQL",
+        " EXEC CICS",
+        " CICSLINK",
+        " CICSXCTL",
+        " CALL ",
+    )
+
+    for index, source in enumerate(sources, start=1):
+        source_id = source.metadata.get("source_id", f"source-{index}")
+        chunk_type = source.metadata.get("chunk_type") or source.metadata.get("source_chunk_type") or "source"
+        picked: list[str] = []
+        for raw_line in source.text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            lower = line.lower()
+            upper = f" {line.upper()} "
+            if any(pattern in lower for pattern in fact_patterns) or any(pattern in upper for pattern in code_patterns):
+                picked.append(line)
+            if len(picked) >= per_source_limit:
+                break
+        if picked:
+            fact_lines.append(f"[{index}] {chunk_type} {source_id}")
+            fact_lines.extend(f"- {line}" for line in picked)
+    return "\n".join(fact_lines[:180])

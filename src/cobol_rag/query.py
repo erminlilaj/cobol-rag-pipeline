@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from cobol_rag.config import AppConfig
@@ -34,26 +37,6 @@ def answer_query(
     if local_answer:
         return QueryAnswer(question=question, answer=local_answer, sources=[])
 
-    entity_answer = preflight_entity_answer(current_question)
-    if entity_answer:
-        return QueryAnswer(
-            question=question,
-            answer=_maybe_polish_structured_answer(current_question, entity_answer, config),
-            sources=[],
-        )
-
-    final_scripts_answer = answer_from_final_scripts(current_question)
-    if final_scripts_answer:
-        return QueryAnswer(
-            question=question,
-            answer=_maybe_polish_structured_answer(current_question, final_scripts_answer, config),
-            sources=[],
-        )
-
-    metadata_answer = _try_program_metadata_answer(current_question)
-    if metadata_answer:
-        return QueryAnswer(question=question, answer=metadata_answer, sources=[])
-
     if not _is_cobol_question(current_question):
         return QueryAnswer(
             question=question,
@@ -61,9 +44,30 @@ def answer_query(
             sources=[],
         )
 
-    try:
-        sources = retrieve(question, config=config, top_k=top_k, chunk_types=chunk_types)
-    except Exception:
+    final_scripts_answer = answer_from_final_scripts(current_question)
+    metadata_answer = _try_program_metadata_answer(current_question)
+    entity_answer = preflight_entity_answer(current_question)
+    if entity_answer and _is_guardrail_answer(entity_answer):
+        return QueryAnswer(
+            question=question,
+            answer=_maybe_polish_structured_answer(current_question, entity_answer, config),
+            sources=[],
+        )
+
+    sources: list[RetrievalResult] = []
+    if _rag_runtime_available(config.embedding.base_url):
+        try:
+            sources = retrieve(question, config=config, top_k=top_k, chunk_types=chunk_types)
+        except Exception:
+            sources = []
+    if not sources and not _rag_runtime_available(config.embedding.base_url):
+        fallback_answer = final_scripts_answer or metadata_answer or entity_answer
+        if fallback_answer:
+            return QueryAnswer(
+                question=question,
+                answer=_maybe_polish_structured_answer(current_question, fallback_answer, config),
+                sources=[],
+            )
         return QueryAnswer(
             question=question,
             answer=(
@@ -85,6 +89,13 @@ def answer_query(
         except Exception:
             pass
     if not sources:
+        fallback_answer = final_scripts_answer or metadata_answer or entity_answer
+        if fallback_answer:
+            return QueryAnswer(
+                question=question,
+                answer=_maybe_polish_structured_answer(current_question, fallback_answer, config),
+                sources=[],
+            )
         return QueryAnswer(
             question=question,
             answer="I could not find relevant indexed sources for this question.",
@@ -95,8 +106,8 @@ def answer_query(
         _try_conflict_provenance_answer(current_question, sources)
         or _try_business_rules_answer(current_question, sources)
         or _try_ui_navigation_answer(current_question, sources)
-        or _try_variable_dataflow_answer(current_question, sources)
         or _try_sql_includes_answer(current_question, sources)
+        or _try_variable_dataflow_answer(current_question, sources)
         or _try_jcl_file_answer(current_question, sources)
         or _try_dead_code_answer(current_question, sources)
     )
@@ -108,6 +119,16 @@ def answer_query(
     try:
         response = resources.runtime.llm.complete(prompt)
     except Exception as error:
+        fallback_answer = final_scripts_answer or metadata_answer or entity_answer
+        if fallback_answer:
+            return QueryAnswer(
+                question=question,
+                answer=_append_rag_context_note(
+                    _maybe_polish_structured_answer(current_question, fallback_answer, config),
+                    sources,
+                ),
+                sources=sources,
+            )
         return QueryAnswer(
             question=question,
             answer=_offline_fallback_answer(config.llm.model, sources),
@@ -120,11 +141,38 @@ def answer_query(
     )
 
 
+def _append_rag_context_note(answer: str, sources: list[RetrievalResult]) -> str:
+    """Show retrieval provenance when structured evidence is used as a fallback."""
+    if not sources or "Sources used:" in answer:
+        return answer
+    return _append_provenance_note(answer, sources)
+
+
+def _is_guardrail_answer(answer: str) -> bool:
+    text = answer.lower()
+    return (
+        "do not have indexed" in text
+        or "not indexed as a standalone program" in text
+        or "do not have indexed analysis" in text
+    )
+
+
 def _current_question(question: str) -> str:
     marker = "Current question:"
     if marker in question:
         return question.rsplit(marker, 1)[-1].strip()
     return question.strip()
+
+
+@lru_cache(maxsize=8)
+def _rag_runtime_available(base_url: str) -> bool:
+    url = base_url.rstrip("/") + "/api/tags"
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=0.75) as response:
+            return 200 <= response.status < 300
+    except (OSError, urllib.error.URLError):
+        return False
 
 
 def _try_local_answer(question: str) -> str | None:
@@ -195,7 +243,14 @@ def _is_cobol_question(question: str) -> bool:
         "provenance",
         "conflict",
     }
-    return any(term in text for term in cobol_terms)
+    if any(term in text for term in cobol_terms):
+        return True
+    if re.search(r"\b[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+\b", question):
+        return True
+    return any(
+        token.startswith(("W", "PD", "PB", "PR", "PX", "TWCOB", "SQL", "FUNZ", "M1", "SCELTA"))
+        for token in re.findall(r"\b[A-Z][A-Z0-9]{3,}\b", question.upper())
+    )
 
 
 def _answer_general_question(full_question: str, current_question: str, config: AppConfig) -> str:

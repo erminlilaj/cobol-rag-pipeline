@@ -378,7 +378,7 @@ def _detect_intent(query: str) -> str:
         return "external_programs"
     if "comment" in q:
         return "comments"
-    if any(term in q for term in ("dataset", "datasets", "table", "tables", "file", "files", "mapset", "mapsets", "queue", "queues", "transaction id")):
+    if any(term in q for term in ("dataset", "datasets", "table", "tables", "db2", "sql", "sql include", "sql includes", "sqlca", "file", "files", "mapset", "mapsets", "queue", "queues", "transaction id")):
         return "datasets_tables"
     if any(term in q for term in ("resource", "resources", "dependency", "dependencies", "cics")):
         return "dependencies"
@@ -392,7 +392,7 @@ def _expanded_query_for_intent(query: str, intent: str) -> str:
         "copybooks": "copybooks_used total_copybooks resolved_copybooks stubbed_copybook_count stubbed_copybooks copybook resolution found missing",
         "static_values": "static values forced values hardcoded literals assignments constants",
         "external_programs": "external program calls LINK XCTL COMMAREA LENGTH called programs program transfers",
-        "datasets_tables": "datasets tables resources DB2 SQL CICS files queues maps mapsets transaction ids",
+        "datasets_tables": "datasets tables resources DB2 SQL SQLCA SQL includes CICS files queues maps mapsets transaction ids",
         "dead_code": "dead code unused copybooks commented-out inactive unreachable negative evidence",
         "comments": "comments commented-out inactive code source comments",
         "business_rules": "business rules BR condition action category severity scope evidence",

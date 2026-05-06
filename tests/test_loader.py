@@ -9,6 +9,7 @@ from cobol_rag.config import load_config
 from cobol_rag.loaders.generic_json import GenericJsonLoader
 from cobol_rag.loaders.rag_documents import RagDocumentsLoader
 from cobol_rag.query import (
+    answer_query,
     _try_business_rules_answer,
     _try_conflict_provenance_answer,
     _try_sql_includes_answer,
@@ -212,3 +213,41 @@ def test_direct_answer_handlers_emit_provenance():
     for answer in (business, ui, dataflow, sql, conflict):
         assert answer is not None
         assert "Sources used:" in answer
+
+
+def test_answer_query_uses_rag_before_final_scripts(monkeypatch):
+    monkeypatch.setattr("cobol_rag.query.answer_from_final_scripts", lambda _question: "structured fallback")
+    monkeypatch.setattr("cobol_rag.query.preflight_entity_answer", lambda _question: None)
+    monkeypatch.setattr("cobol_rag.query._rag_runtime_available", lambda _base_url: True)
+    monkeypatch.setattr(
+        "cobol_rag.query.retrieve",
+        lambda *_args, **_kwargs: [
+            _source(
+                "content.condition: X\ncontent.action: JUMP",
+                chunk_type="business_rule",
+                source_system="mapa_hamza",
+            )
+        ],
+    )
+
+    answer = answer_query("What business rules apply to PDCBVC?", AppConfig())
+
+    assert "Business-rule evidence found" in answer.answer
+    assert "structured fallback" not in answer.answer
+    assert answer.sources
+
+
+def test_answer_query_falls_back_when_rag_unavailable(monkeypatch):
+    monkeypatch.setattr("cobol_rag.query.answer_from_final_scripts", lambda _question: "structured fallback")
+    monkeypatch.setattr("cobol_rag.query.preflight_entity_answer", lambda _question: None)
+    monkeypatch.setattr("cobol_rag.query._rag_runtime_available", lambda _base_url: True)
+
+    def raise_retrieval(*_args, **_kwargs):
+        raise RuntimeError("embedding unavailable")
+
+    monkeypatch.setattr("cobol_rag.query.retrieve", raise_retrieval)
+
+    answer = answer_query("Which copybooks are used by PDCBVC?", AppConfig())
+
+    assert answer.answer == "structured fallback"
+    assert answer.sources == []

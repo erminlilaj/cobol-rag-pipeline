@@ -250,6 +250,11 @@ def test_off_evidence_validator_rejects_external_generic_answer():
         "Run git checkout -b new-branch-name to create a branch.",
         sources,
     )
+    assert _looks_off_evidence_answer(
+        "is there unused copybooks in PDCBVC?",
+        "PDCBVC is a program that is used to perform a specific task. It is not clear what this program does.",
+        sources,
+    )
 
 
 def test_grounded_fallback_uses_evidence_not_generic_text():

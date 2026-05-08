@@ -16,17 +16,18 @@ from cobol_rag.final_scripts_artifacts import (
 
 
 def answer_from_final_scripts(question: str) -> str | None:
-    root = find_final_scripts_root()
-    if root is None:
+    configured_root = find_final_scripts_root()
+    if configured_root is None:
         return None
 
-    unknown_program_answer = _answer_unknown_program_if_explicit(root, question)
+    unknown_program_answer = _answer_unknown_program_if_explicit(configured_root, question)
     if unknown_program_answer:
         return unknown_program_answer
 
-    program = _program_for_question(root, question)
+    program = _program_for_question(configured_root, question)
     if program is None:
         return None
+    root = _resolve_program_artifact_root(configured_root, program)
 
     q = question.lower()
 
@@ -118,6 +119,44 @@ def find_final_scripts_root() -> Path | None:
         for candidate in candidates:
             if candidate.exists():
                 return candidate
+    return None
+
+
+def _resolve_program_artifact_root(root: Path, program: str) -> Path:
+    program = program.upper()
+    for candidate in _program_root_candidates(root, program):
+        if _root_contains_core_program(candidate, program):
+            return candidate
+    return root
+
+
+def _program_root_candidates(root: Path, program: str) -> list[Path]:
+    candidates = [root]
+    program_dir = _child_dir(root, program)
+    if program_dir:
+        candidates.extend([program_dir, program_dir / "artifacts"])
+
+    programs_dir = _child_dir(root, "programs")
+    if programs_dir:
+        nested_program_dir = _child_dir(programs_dir, program)
+        if nested_program_dir:
+            candidates.extend([nested_program_dir / "artifacts", nested_program_dir])
+
+    return [candidate for candidate in candidates if candidate.exists()]
+
+
+def _child_dir(parent: Path, name: str) -> Path | None:
+    exact = parent / name
+    if exact.is_dir():
+        return exact
+    wanted = name.upper()
+    try:
+        children = list(parent.iterdir())
+    except OSError:
+        return None
+    for child in children:
+        if child.is_dir() and child.name.upper() == wanted:
+            return child
     return None
 
 
@@ -283,6 +322,17 @@ def _primary_program_from_root(root: Path) -> str | None:
 
 
 def _core_programs_from_root(root: Path) -> set[str]:
+    programs = _core_programs_from_exact_root(root)
+    for artifact_root in _nested_artifact_roots(root):
+        programs.update(_core_programs_from_exact_root(artifact_root))
+    return programs
+
+
+def _root_contains_core_program(root: Path, program: str) -> bool:
+    return program.upper() in _core_programs_from_exact_root(root)
+
+
+def _core_programs_from_exact_root(root: Path) -> set[str]:
     programs: set[str] = set()
     for relative in (
         "program_summary/program.summary.json",
@@ -298,6 +348,35 @@ def _core_programs_from_root(root: Path) -> set[str]:
             if program and program != "__GLOBAL__":
                 programs.add(program)
     return programs
+
+
+def _nested_artifact_roots(root: Path) -> list[Path]:
+    roots: list[Path] = []
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return roots
+
+    for child in children:
+        if child.is_dir() and not child.name.startswith("."):
+            roots.append(child)
+            artifact_child = child / "artifacts"
+            if artifact_child.is_dir():
+                roots.append(artifact_child)
+
+    programs_dir = root / "programs"
+    if programs_dir.is_dir():
+        try:
+            program_dirs = list(programs_dir.iterdir())
+        except OSError:
+            program_dirs = []
+        for program_dir in program_dirs:
+            if program_dir.is_dir():
+                roots.append(program_dir)
+                artifact_child = program_dir / "artifacts"
+                if artifact_child.is_dir():
+                    roots.append(artifact_child)
+    return roots
 
 
 def _programs_from_root(root: Path) -> set[str]:

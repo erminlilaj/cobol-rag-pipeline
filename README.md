@@ -75,7 +75,7 @@ Current default LLM:
 
 ```yaml
 llm:
-  model: "granite-code:8b-instruct"
+  model: "granite4.1:8b"
 ```
 
 Future adjustment point: change `llm.model` in config or override it with `COBOL_RAG_LLM_MODEL`.
@@ -96,19 +96,40 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 ```
 
-Install dependencies:
+Install the package and dependencies:
 
 ```bash
-pip install \
-  llama-index \
-  llama-index-vector-stores-chroma \
-  llama-index-llms-ollama \
-  llama-index-embeddings-ollama \
-  chromadb \
-  typer \
-  rich \
-  pydantic-settings \
-  pyyaml
+pip install -e .
+```
+
+## One-Command Development Workflow
+
+For day-to-day local testing, use the development runner:
+
+```bash
+./scripts/dev_rag.sh
+```
+
+By default it:
+
+- runs the fixed-input analysis pipeline in `../legacy-program-analysis`
+- builds combined output for every fixed-input program folder
+- indexes every generated `*_combined.jsonl`
+- uses `COBOL_RAG_COLLECTION=cobol-combined-all`
+- uses `COBOL_RAG_CHROMA_DIR=data/chroma-combined-all`
+- starts the UI at `http://127.0.0.1:8000/`
+
+Focused one-program testing still works:
+
+```bash
+./scripts/dev_rag.sh --program PDCBVC --mode combined --no-server
+```
+
+The lower-level one-program script remains available when you need explicit
+control over a single generated input:
+
+```bash
+./scripts/run_fixed_input_rag.sh --mode combined --program PDCBVC --analysis-repo ../legacy-program-analysis --build-analysis
 ```
 
 Print the active config:
@@ -185,6 +206,23 @@ data/manifests/cobol-dev.json
 4. Write `data/manifests/<collection>.json`.
 
 Future adjustment point: keep `--dry-run` as the default safe preview. Any destructive behavior, such as removing documents no longer present in `data/inbox/`, should get its own dry-run output before writes are allowed.
+
+## Generated Artifacts Policy
+
+Keep source code, configs, docs, tests, small examples, and explicit evaluation
+fixtures in Git. Keep runtime outputs local unless they are intentionally
+promoted as fixtures.
+
+Ignored local outputs include:
+
+- Chroma indexes under `.chroma/` and `data/chroma-*/`
+- sync manifests under `data/manifests/*.json`
+- archived JSONL snapshots under `data/archive/*.jsonl`
+- local final-script bundles and ZIPs
+- editable-install metadata such as `src/*.egg-info/`
+
+The `.gitkeep` files remain tracked so the expected directories exist after a
+fresh clone.
 
 ## Remove Workflow
 
@@ -333,7 +371,7 @@ cobol-rag query "What is in the JSON document?" --top-k 2
 
 The answer is generated from retrieved context only. The CLI always prints a `Sources` table after the answer so you can check which indexed documents supported it.
 
-If retrieval works but `query` fails, check the configured local LLM. The default config pins `context_window: 4096` for `granite-code:8b-instruct`, matching the normal Ollama CLI context size and avoiding oversized API context requests.
+If retrieval works but `query` fails, check the configured local LLM. The default config pins `context_window: 4096` for `granite4.1:8b`, matching the normal Ollama CLI context size and avoiding oversized API context requests.
 
 Current answer shape:
 
@@ -371,7 +409,7 @@ Chat commands:
 
 Chat memory is not indexed evidence. It is only used to understand follow-up wording. Answers still have to come from retrieved Chroma sources, and each answer prints a `Sources` table.
 
-During early development, before installing the package as editable, use:
+If you have not installed the package as editable yet, either run `pip install -e .` or use:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m cobol_rag.cli config

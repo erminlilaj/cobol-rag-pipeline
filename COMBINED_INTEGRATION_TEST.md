@@ -1,5 +1,9 @@
 # COBOL-REKT Combination Test
 
+Historical note: this document records the original manual combined-mode test.
+For current local development, prefer `./scripts/dev_rag.sh` or the workflow in
+`FIXED_INPUT_WORKFLOW.md`.
+
 This branch is for testing the combined PDCBVC evidence without replacing the stable RAG input.
 
 ## What This Contains
@@ -64,7 +68,7 @@ Run Ollama and the UI:
 
 ```bash
 ollama serve
-ollama pull granite-code:8b-instruct
+ollama pull granite4.1:8b
 ollama pull mxbai-embed-large:latest
 python -m uvicorn cobol_rag.api:app --host 127.0.0.1 --port 8000
 ```

@@ -200,8 +200,17 @@ elif [[ -f ".venv/bin/activate" ]]; then
 fi
 
 if [[ "$PULL_MODELS" -eq 1 ]]; then
-  ollama pull granite-code:8b-instruct
+  ollama pull granite4.1:8b
   ollama pull mxbai-embed-large:latest
+fi
+
+COBOL_RAG_BIN="cobol-rag"
+RUN_PYTHON="python"
+if [[ -x ".venv/bin/cobol-rag" ]]; then
+  COBOL_RAG_BIN=".venv/bin/cobol-rag"
+fi
+if [[ -x ".venv/bin/python" ]]; then
+  RUN_PYTHON=".venv/bin/python"
 fi
 
 export COBOL_RAG_FINAL_SCRIPTS_DIR="$FINAL_SCRIPTS"
@@ -219,11 +228,11 @@ echo "Collection: $COBOL_RAG_COLLECTION"
 echo "Chroma dir: $COBOL_RAG_CHROMA_DIR"
 echo
 
-cobol-rag inspect "$TARGET_JSONL" --preview-chars 80
-cobol-rag sync "$TARGET_JSONL" --apply
+"$COBOL_RAG_BIN" inspect "$TARGET_JSONL" --preview-chars 80
+"$COBOL_RAG_BIN" sync "$TARGET_JSONL" --apply
 
 if [[ "$START_SERVER" -eq 1 ]]; then
   echo
   echo "Open: http://127.0.0.1:$PORT/"
-  python -m uvicorn cobol_rag.api:app --host 127.0.0.1 --port "$PORT"
+  "$RUN_PYTHON" -m uvicorn cobol_rag.api:app --host 127.0.0.1 --port "$PORT"
 fi

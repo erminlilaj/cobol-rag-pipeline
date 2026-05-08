@@ -1,5 +1,9 @@
 # COBOL RAG Project Handoff
 
+Historical note: this handoff captures the state of an earlier integration
+session. For current local development, prefer `./scripts/dev_rag.sh` and the
+workflow in `FIXED_INPUT_WORKFLOW.md`.
+
 This file summarizes the current state so a new chat can continue without reading the full previous conversation.
 
 ## Repositories And Branches
@@ -456,7 +460,7 @@ Expected shape in UI:
 {
   "chroma_dir": "data/chroma-fixed-pdcbvc",
   "collection": "cobol-fixed-pdcbvc",
-  "llm": "granite-code:8b-instruct",
+  "llm": "granite4.1:8b",
   "embedding": "mxbai-embed-large:latest"
 }
 ```
@@ -496,4 +500,3 @@ http://127.0.0.1:8000/
 ```
 
 Retest the questions listed above.
-

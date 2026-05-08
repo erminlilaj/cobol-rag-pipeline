@@ -8,3 +8,10 @@ __pycache__/
 .env
 .codex
 eval/out/
+data/chroma-*/
+data/archive/*.jsonl
+data/manifests/*.json
+data/inbox/*.manifest.json
+src/*.egg-info/
+final_scripts/
+final_scripts.zip

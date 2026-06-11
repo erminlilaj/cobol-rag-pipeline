@@ -625,6 +625,51 @@ def _known_variables(root: Path, program: str) -> set[str]:
     }
 
 
+def _call_targets(root: Path, program: str) -> set[str]:
+    return {
+        str(call.get("target", "")).strip().upper()
+        for call in _calls(root, program)
+        if str(call.get("target", "")).strip()
+    }
+
+
+def _copybook_names(root: Path, program: str) -> set[str]:
+    payload = _read_json(root / "architecture.copybooks" / "architecture.copybooks.json")
+    if not isinstance(payload, dict) or payload.get("program") != program:
+        return set()
+    return {
+        str(name).strip().upper()
+        for name in payload.get("content", {}).get("all", [])
+        if str(name).strip()
+    }
+
+
+def _db2_table_names(root: Path, program: str) -> set[str]:
+    names: set[str] = set()
+    for path in (root / "architecture.db2_table").glob("architecture.db2_table.*.json"):
+        payload = _read_json(path)
+        if not isinstance(payload, dict) or payload.get("program") != program:
+            continue
+        content = payload.get("content", {})
+        name = str(content.get("table") or content.get("name") or "").strip().upper()
+        if name:
+            names.add(name)
+    return names
+
+
+def _sql_include_names(root: Path, program: str) -> set[str]:
+    names: set[str] = set()
+    for path in (root / "architecture.sqlinclude").glob("architecture.sqlinclude.*.json"):
+        payload = _read_json(path)
+        if not isinstance(payload, dict) or payload.get("program") != program:
+            continue
+        content = payload.get("content", {})
+        name = str(content.get("include") or content.get("name") or "").strip().upper()
+        if name:
+            names.add(name)
+    return names
+
+
 def _variable_reference_tokens(question: str) -> list[str]:
     ignored = {
         "ABOUT",
@@ -694,6 +739,12 @@ def _answer_variable_reference(root: Path, program: str, question: str) -> str |
     if not known:
         return None
 
+    secondary_entities = (
+        _call_targets(root, program)
+        | _copybook_names(root, program)
+        | _db2_table_names(root, program)
+        | _sql_include_names(root, program)
+    )
     tokens = _variable_reference_tokens(question)
     variables = [_variable_payload(root, program, token) for token in tokens if token in known]
     variables = [variable for variable in variables if variable]
@@ -707,6 +758,7 @@ def _answer_variable_reference(root: Path, program: str, question: str) -> str |
         token
         for token in tokens
         if token not in {program, "PDCBVC", "COBOL", "CBL"} and _looks_like_variable_name(token)
+        and token not in secondary_entities
     ]
     if not unknowns:
         return None
@@ -715,7 +767,7 @@ def _answer_variable_reference(root: Path, program: str, question: str) -> str |
     lines = [f"I do not have indexed dataflow evidence for variable `{unknown}` in `{program}`."]
     if close:
         lines.append(f"Closest indexed variable: `{close}`. Ask about `{close}` if that is what you meant.")
-    lines.append("Check the variable name or regenerate the analysis artifacts if this variable should exist.")
+    lines.append("I will not infer a meaning from the name alone; check the variable name or regenerate the analysis artifacts if this variable should exist.")
     return "\n".join(lines)
 
 

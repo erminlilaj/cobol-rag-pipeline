@@ -14,12 +14,18 @@ class PathConfig:
     inbox_dir: Path = Path("data/inbox")
     archive_dir: Path = Path("data/archive")
     manifest_dir: Path = Path("data/manifests")
+    trace_dir: Path = Path("data/traces")
+    feedback_dir: Path = Path("data/feedback")
+    eval_dir: Path = Path("data/eval")
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "chroma_dir", Path(self.chroma_dir))
         object.__setattr__(self, "inbox_dir", Path(self.inbox_dir))
         object.__setattr__(self, "archive_dir", Path(self.archive_dir))
         object.__setattr__(self, "manifest_dir", Path(self.manifest_dir))
+        object.__setattr__(self, "trace_dir", Path(self.trace_dir))
+        object.__setattr__(self, "feedback_dir", Path(self.feedback_dir))
+        object.__setattr__(self, "eval_dir", Path(self.eval_dir))
 
 
 @dataclass(frozen=True)
@@ -30,6 +36,7 @@ class LlmConfig:
     context_window: int = 4096
     request_timeout: int = 300
     temperature: float = 0.1
+    max_output_tokens: int = 256
 
 
 @dataclass(frozen=True)
@@ -52,17 +59,22 @@ class RetrievalConfig:
     top_k: int = 6
     filters: dict[str, Any] = field(default_factory=dict)
     similarity_cutoff: float | None = None
-    mode: str = "vector"
+    mode: str = "hybrid"  # vector | bm25 | hybrid
     bm25_top_k: int = 12
-    chunk_type_boosts_path: str = "config/chunk_type_boosts.yaml"
 
 
 @dataclass(frozen=True)
 class AnswerConfig:
     require_citations: bool = True
     show_sources: bool = True
-    system_prompt_path: str | None = None
-    llm_polish_final_scripts: bool = False
+    system_prompt_path: str | None = "config/system_prompt.md"
+    max_context_chars: int = 6000
+
+
+@dataclass(frozen=True)
+class ObservabilityConfig:
+    enabled: bool = False
+    include_hit_previews: bool = False
 
 
 @dataclass(frozen=True)
@@ -73,6 +85,7 @@ class AppConfig:
     index: IndexConfig = field(default_factory=IndexConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     answers: AnswerConfig = field(default_factory=AnswerConfig)
+    observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -86,6 +99,7 @@ def load_config(path: Path = Path("config/default.yaml")) -> AppConfig:
         index=IndexConfig(**data.get("index", {})),
         retrieval=RetrievalConfig(**data.get("retrieval", {})),
         answers=AnswerConfig(**data.get("answers", {})),
+        observability=ObservabilityConfig(**data.get("observability", {})),
         raw=data,
     )
 
@@ -104,6 +118,8 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
     result = dict(data)
     _set_nested(result, ("paths", "chroma_dir"), os.getenv("COBOL_RAG_CHROMA_DIR"))
     _set_nested(result, ("paths", "inbox_dir"), os.getenv("COBOL_RAG_INBOX_DIR"))
+    _set_nested(result, ("paths", "trace_dir"), os.getenv("COBOL_RAG_TRACE_DIR"))
+    _set_nested(result, ("paths", "feedback_dir"), os.getenv("COBOL_RAG_FEEDBACK_DIR"))
     _set_nested(result, ("index", "collection"), os.getenv("COBOL_RAG_COLLECTION"))
     _set_nested(result, ("llm", "model"), os.getenv("COBOL_RAG_LLM_MODEL"))
     _set_nested(result, ("llm", "base_url"), os.getenv("COBOL_RAG_LLM_BASE_URL"))
@@ -114,12 +130,6 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         _set_nested(result, ("retrieval", "top_k"), int(top_k))
     if context_window := os.getenv("COBOL_RAG_LLM_CONTEXT_WINDOW"):
         _set_nested(result, ("llm", "context_window"), int(context_window))
-    if polish := os.getenv("COBOL_RAG_LLM_POLISH_FINAL_SCRIPTS"):
-        _set_nested(
-            result,
-            ("answers", "llm_polish_final_scripts"),
-            polish.strip().lower() in {"1", "true", "yes", "on"},
-        )
     return result
 
 

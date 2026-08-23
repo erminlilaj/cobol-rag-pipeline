@@ -14,8 +14,6 @@ from cobol_rag.loaders.base import (
 )
 
 
-MAX_EMBED_TEXT_CHARS = 600
-
 SCALAR_METADATA_TYPES = (str, int, float, bool)
 
 PIPELINE_METADATA_FIELDS = {
@@ -32,47 +30,57 @@ ALLOWED_METADATA_FIELDS = {
     "chunk_id",
     "title",
     "source_file",
-    "evidence_path",
     "source_kind",
+    "source_system",
+    "source_chunk_type",
+    "source_bundle_path",
+    "original_chunk_type",
+    "original_chunk_id",
+    "intent_domain",
+    "coverage_dimension",
+    "evidence_path",
+    "hierarchy_level",
+    "parent_type",
+    "parent_id",
+    "program_parent_id",
+    "domain_parent_id",
+    "entity_parent_id",
+    "entity_type",
+    "entity_key",
+    "variable",
+    "paragraph",
+    "target",
+    "call_type",
+    "copybook",
+    "sql_include",
+    "db2_table",
+    "mapa_record",
+    "truncated_for_embedding",
+    "sha256",
     "json_index",
     "chunk_index",
     "chunk_count",
-    "intent_domain",
-    "hierarchy_level",
-    "parent_id",
-    "parent_type",
     "indexable",
     "schema_version",
     "pipeline_version",
-    "source_system",
-    "source_chunk_type",
-    "original_chunk_type",
-    "coverage_dimension",
-    "entity_type",
-    "entity_key",
-    "target",
-    "call_type",
-    "command",
-    "variable",
-    "paragraph",
-    "copybook",
-    "db2_table",
-    "sql_include",
-    "line",
-    "source_line",
-    "factory_source_id",
-    "factory_content_hash",
-    "source_bundle_path",
-    "original_chunk_id",
-    "sha256",
-    "truncated_for_embedding",
-    "left_source_system",
-    "right_source_system",
+    "index_schema_version",
+    "extractor_version",
+    "source_sha256",
+    "artifact_hash",
+    "access_scope",
+    "security_classification",
 }
 
 
 class RagDocumentsLoader:
-    """Load control_flow RAG factory JSON/JSONL documents."""
+    """Load control_flow RAG factory documents.
+
+    The factory emits records shaped like:
+    {"id", "program", "type", "title", "text", "metadata"}.
+
+    This loader keeps the prebuilt text unchanged and promotes `type` to
+    `chunk_type`, which the retriever uses for filtering and intent reranking.
+    """
 
     name = "rag_documents"
 
@@ -105,31 +113,20 @@ class RagDocumentsLoader:
                 metadata.setdefault("chunk_id", record_id)
                 metadata.setdefault("factory_record_id", record_id)
 
-            parts = self._split_text(text)
-            for part_index, part_text in enumerate(parts):
-                part_metadata = dict(metadata)
-                part_source_id = source_id
-                if len(parts) > 1:
-                    part_source_id = f"{source_id}:part{part_index + 1}"
-                    part_metadata["parent_source_id"] = source_id
-                    part_metadata["chunk_part_index"] = part_index
-                    part_metadata["chunk_part_count"] = len(parts)
-
-                document = make_document(
-                    text=part_text,
+            document = make_document(
+                text=text,
+                source_path=path,
+                source_format=self.name,
+                source_id=source_id,
+                extra_metadata=metadata,
+            )
+            loaded.append(
+                LoadedDocument(
+                    document=document,
+                    loader_name=self.name,
                     source_path=path,
-                    source_format=self.name,
-                    source_id=part_source_id,
-                    extra_metadata=part_metadata,
                 )
-                self._keep_metadata_out_of_embeddings(document)
-                loaded.append(
-                    LoadedDocument(
-                        document=document,
-                        loader_name=self.name,
-                        source_path=path,
-                    )
-                )
+            )
         return loaded
 
     def _read_records(self, path: Path) -> list[dict[str, Any]]:
@@ -194,33 +191,10 @@ class RagDocumentsLoader:
         )
         if doc_type:
             result["chunk_type"] = doc_type
-            result.setdefault("source_chunk_type", doc_type)
-
-        record_id = self._record_id(record)
-        if record_id:
-            result.setdefault("chunk_id", record_id)
 
         title = self._scalar(record.get("title")) or self._scalar(nested.get("title"))
         if title:
             result["title"] = title
-
-        for key in (
-            "source_system",
-            "source_chunk_type",
-            "coverage_dimension",
-            "entity_type",
-            "entity_key",
-            "target",
-            "call_type",
-            "command",
-            "variable",
-            "paragraph",
-            "line",
-            "source_line",
-        ):
-            value = self._scalar(record.get(key))
-            if value:
-                result[key] = value
 
         for key, value in nested.items():
             if key == "source_id":
@@ -236,7 +210,6 @@ class RagDocumentsLoader:
             if key == "type":
                 if self._scalar(value):
                     result.setdefault("chunk_type", value)
-                    result.setdefault("source_chunk_type", value)
                 continue
             if key in ALLOWED_METADATA_FIELDS and isinstance(value, SCALAR_METADATA_TYPES):
                 result[key] = value
@@ -269,44 +242,3 @@ class RagDocumentsLoader:
         if isinstance(value, int | float | bool):
             return str(value)
         return ""
-
-    def _split_text(self, text: str) -> list[str]:
-        """Keep each embedding request comfortably below local Ollama limits."""
-        compact = text.strip()
-        if len(compact) <= MAX_EMBED_TEXT_CHARS:
-            return [compact]
-
-        parts: list[str] = []
-        current: list[str] = []
-        current_length = 0
-        for line in compact.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            extra = len(line) + (1 if current else 0)
-            if current and current_length + extra > MAX_EMBED_TEXT_CHARS:
-                parts.append("\n".join(current))
-                current = []
-                current_length = 0
-
-            while len(line) > MAX_EMBED_TEXT_CHARS:
-                if current:
-                    parts.append("\n".join(current))
-                    current = []
-                    current_length = 0
-                parts.append(line[:MAX_EMBED_TEXT_CHARS])
-                line = line[MAX_EMBED_TEXT_CHARS:].lstrip()
-
-            if line:
-                current.append(line)
-                current_length += len(line) + (1 if current_length else 0)
-
-        if current:
-            parts.append("\n".join(current))
-        return parts or [compact[:MAX_EMBED_TEXT_CHARS]]
-
-    def _keep_metadata_out_of_embeddings(self, document: Any) -> None:
-        keep = {"program", "chunk_type", "title"}
-        document.excluded_embed_metadata_keys = [
-            key for key in document.metadata if key not in keep
-        ]

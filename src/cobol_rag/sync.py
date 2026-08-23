@@ -106,7 +106,11 @@ def apply_sync_plan(config: AppConfig, plan: SyncPlan) -> None:
         if item.action in {"add", "update"}:
             if item.loaded_document is None:
                 continue
-            upsert_document(resources, item.loaded_document.document)
+            upsert_document(
+                resources,
+                item.loaded_document.document,
+                chunk_mode=config.index.chunk_mode,
+            )
         elif item.action == "remove":
             resources.chroma_collection.delete(where={"source_id": item.source_id})
     existing_raw = _read_manifest_raw(plan.manifest_path)

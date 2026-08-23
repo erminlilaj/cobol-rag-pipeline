@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -15,6 +15,12 @@ from cobol_rag.chat import ChatSession
 from cobol_rag.config import load_config
 from cobol_rag.index import collection_count, open_index
 from cobol_rag.loaders import LoaderError, load_path
+from cobol_rag.observability import (
+    list_feedback,
+    list_traces,
+    load_trace,
+    write_feedback,
+)
 from cobol_rag.query import QueryError
 from cobol_rag.remove import apply_remove_plan, build_remove_plan
 from cobol_rag.reset import apply_reset_plan, build_reset_plan
@@ -22,6 +28,17 @@ from cobol_rag.retrieve import retrieve as retrieve_documents
 from cobol_rag.sync import apply_sync_plan, build_sync_plan
 
 app = FastAPI(title="COBOL RAG API")
+
+
+@app.middleware("http")
+async def prevent_stale_ui_assets(request: Request, call_next: Any) -> Any:
+    """Keep the local UI shell and bundles fresh during active development."""
+    response = await call_next(request)
+    if request.url.path in {"/", "/index.html", "/app.js", "/style.css"}:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 # Mount the static files for the UI
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -40,6 +57,7 @@ def get_chat_session() -> ChatSession:
 
 class ChatRequest(BaseModel):
     message: str
+    program: Optional[str] = None
 
 class SyncRequest(BaseModel):
     paths: Optional[List[str]] = None
@@ -50,6 +68,12 @@ class InspectRequest(BaseModel):
 class RetrieveRequest(BaseModel):
     query: str
     top_k: Optional[int] = None
+
+class FeedbackRequest(BaseModel):
+    trace_id: str
+    rating: str
+    labels: List[str] = []
+    note: str = ""
 
 @app.get("/api/health")
 def health() -> Any:
@@ -66,17 +90,37 @@ def health() -> Any:
 def chat(req: ChatRequest) -> Any:
     session = get_chat_session()
     try:
-        answer = session.ask(req.message)
+        answer = session.ask(req.message, target_program=req.program)
         sources = [
             {
                 "source_id": s.metadata.get("source_id", ""),
                 "source_path": s.metadata.get("source_path", ""),
                 "source_format": s.metadata.get("source_format", ""),
+                "source_file": s.metadata.get("source_file", ""),
+                "evidence_path": s.metadata.get("evidence_path", ""),
+                "chunk_type": s.metadata.get("chunk_type", ""),
+                "program": s.metadata.get("program", ""),
+                "variable": s.metadata.get("variable", ""),
+                "paragraph": s.metadata.get("paragraph", ""),
+                "entity_key": s.metadata.get("entity_key", ""),
+                "intent_domain": s.metadata.get("intent_domain", ""),
+                "context_role": s.metadata.get("context_role", ""),
                 "score": float(s.score) if s.score is not None else None,
             }
             for s in answer.sources
         ]
-        return {"answer": answer.answer, "sources": sources}
+        return {
+            "answer": answer.answer,
+            "sources": sources,
+            "route": answer.route,
+            "scope": answer.scope.as_dict(),
+            "session_state": session.state.as_dict(),
+            "trace_id": answer.trace_id,
+            "guard_status": answer.guard_status,
+            "plan": answer.plan.as_dict() if answer.plan else {},
+            "execution_mode": answer.execution_mode,
+            "debug": answer.debug,
+        }
     except QueryError as error:
         raise HTTPException(status_code=400, detail=str(error))
 
@@ -94,6 +138,8 @@ def get_config_endpoint() -> Any:
             "chroma_dir": str(settings.paths.chroma_dir),
             "inbox_dir": str(settings.paths.inbox_dir),
             "manifest_dir": str(settings.paths.manifest_dir),
+            "trace_dir": str(settings.paths.trace_dir),
+            "feedback_dir": str(settings.paths.feedback_dir),
         },
         "llm": {
             "provider": settings.llm.provider,
@@ -112,8 +158,8 @@ def get_config_endpoint() -> Any:
         },
         "answers": {
             "require_citations": settings.answers.require_citations,
-            "llm_polish_final_scripts": settings.answers.llm_polish_final_scripts,
-        }
+        },
+        "observability": {"enabled": settings.observability.enabled},
     }
 
 @app.get("/api/index-info")
@@ -222,6 +268,12 @@ def retrieve_raw(req: RetrieveRequest) -> Any:
             "source_format": str(r.metadata.get("source_format", "")),
             "source_id": str(r.metadata.get("source_id", "")),
             "source_path": str(r.metadata.get("source_path", "")),
+            "source_file": str(r.metadata.get("source_file", "")),
+            "evidence_path": str(r.metadata.get("evidence_path", "")),
+            "chunk_type": str(r.metadata.get("chunk_type", "")),
+            "program": str(r.metadata.get("program", "")),
+            "variable": str(r.metadata.get("variable", "")),
+            "paragraph": str(r.metadata.get("paragraph", "")),
             "preview": r.text[:180] + "..." if len(r.text) > 180 else r.text
         })
         
@@ -230,6 +282,41 @@ def retrieve_raw(req: RetrieveRequest) -> Any:
         "results_count": len(results),
         "items": docs
     }
+
+@app.get("/api/traces")
+def traces(limit: int = 20) -> Any:
+    settings = load_config(CONFIG_PATH)
+    return {"items": list_traces(settings, limit=limit)}
+
+@app.get("/api/traces/{trace_id}")
+def trace_detail(trace_id: str) -> Any:
+    settings = load_config(CONFIG_PATH)
+    try:
+        trace = load_trace(settings, trace_id)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if trace is None:
+        raise HTTPException(status_code=404, detail="Trace not found")
+    return trace
+
+@app.post("/api/feedback")
+def feedback(req: FeedbackRequest) -> Any:
+    settings = load_config(CONFIG_PATH)
+    try:
+        return write_feedback(
+            settings,
+            trace_id=req.trace_id,
+            rating=req.rating,
+            labels=req.labels,
+            note=req.note,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+@app.get("/api/feedback")
+def feedback_list(limit: int = 50) -> Any:
+    settings = load_config(CONFIG_PATH)
+    return {"items": list_feedback(settings, limit=limit)}
 
 app.mount("/", StaticFiles(directory=str(UI_DIR), html=True), name="ui")
 

@@ -24,7 +24,6 @@ dependencies = [
 
 [project.scripts]
 cobol-rag = "cobol_rag.cli:app"
-cobol-rag-api = "cobol_rag.api:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]

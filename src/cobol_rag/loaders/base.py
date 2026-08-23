@@ -61,7 +61,12 @@ def make_document(
     }
     if extra_metadata:
         metadata.update(_clean_metadata(extra_metadata))
-    return Document(text=text, metadata=metadata, id_=source_id)
+    return Document(
+        text=text,
+        metadata=metadata,
+        id_=source_id,
+        excluded_embed_metadata_keys=list(metadata.keys()),
+    )
 
 
 def _clean_metadata(metadata: dict[str, Any]) -> dict[str, Any]:

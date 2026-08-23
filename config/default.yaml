@@ -3,6 +3,9 @@ paths:
   inbox_dir: "data/inbox"
   archive_dir: "data/archive"
   manifest_dir: "data/manifests"
+  trace_dir: "data/traces"
+  feedback_dir: "data/feedback"
+  eval_dir: "data/eval"
 
 llm:
   provider: "ollama"
@@ -11,6 +14,7 @@ llm:
   context_window: 4096
   request_timeout: 300
   temperature: 0.1
+  max_output_tokens: 256
 
 embedding:
   provider: "ollama"
@@ -21,19 +25,24 @@ index:
   collection: "cobol-dev"
   chunk_mode: "pre_chunked"
   batch_size: 64
+  include_non_indexable: false
 
 retrieval:
   top_k: 6
   filters: {}
   similarity_cutoff: null
-  mode: "hybrid" # vector | bm25 | hybrid
+  mode: "hybrid"  # vector | bm25 | hybrid
   bm25_top_k: 12
-  chunk_type_boosts_path: "config/chunk_type_boosts.yaml"
 
 answers:
   require_citations: true
   show_sources: true
-  llm_polish_final_scripts: false
+  system_prompt_path: "config/system_prompt.md"
+  max_context_chars: 6000
+
+observability:
+  enabled: true
+  include_hit_previews: false
 
 loaders:
   generic_json:

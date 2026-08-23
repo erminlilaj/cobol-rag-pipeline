@@ -28,6 +28,7 @@ from cobol_rag.final_scripts_answers import (
 from cobol_rag.index import build_llm, open_index
 from cobol_rag.observability import write_answer_trace
 from cobol_rag.query_plan import (
+    _CAPABILITY_ENTITY_TYPES,
     _CAPABILITY_TASKS,
     _capability_route,
     ALLOWED_PLAN_DOMAINS,
@@ -837,6 +838,65 @@ def _execute_evidence_subtasks(
     )
 
 
+_ENTITY_CONTRACT_PREFIX = "missing_requested_entity:"
+
+# A claim may be re-routed at most this many times. Each retry costs a retrieval,
+# so the bound keeps a badly routed claim from walking the whole capability list.
+_MAX_CAPABILITY_RETRIES = 2
+
+
+def _entity_contract_failed(result: EvidenceSubtaskResult) -> bool:
+    """True when a claim named an entity that its own answer never mentioned."""
+    if result.passed:
+        return False
+    return any(reason.startswith(_ENTITY_CONTRACT_PREFIX) for reason in result.reasons)
+
+
+def _capability_indexes_entities(capability: str, entity_types: frozenset[str]) -> bool:
+    supported = _CAPABILITY_ENTITY_TYPES.get(capability)
+    return bool(supported) and bool(entity_types & set(supported))
+
+
+def _rerouted_subtask(
+    *,
+    question: str,
+    config: AppConfig,
+    plan: QueryPlan,
+    subtask: EvidenceSubtask,
+    tried: frozenset[str],
+) -> EvidenceSubtask | None:
+    """Re-route a claim to the best untried capability that indexes its entity.
+
+    Only capabilities that actually catalogue this kind of entity are considered,
+    so the retry is chosen by what the evidence layer can hold rather than by
+    anything read off the wording of the question.
+    """
+    entity_types = frozenset(entity.entity_type for entity in plan.entities)
+    if not entity_types:
+        return None
+    candidates = {
+        capability
+        for capability in eligible_capabilities(entity_types=entity_types)
+        if capability not in tried and _capability_indexes_entities(capability, entity_types)
+    }
+    if not candidates:
+        return None
+    try:
+        matches = router_for(config).rank(question, allowed=candidates)
+    except Exception:
+        return None
+    if not matches:
+        return None
+    capability = matches[0].capability
+    return replace(
+        subtask,
+        capability=capability,
+        tasks=_CAPABILITY_TASKS.get(capability, ()),
+        source_domains=(),
+        relations=(),
+    )
+
+
 def _execute_evidence_subtask(
     *,
     question: str,
@@ -848,6 +908,66 @@ def _execute_evidence_subtask(
     chunk_types: list[str] | None,
     conversation_history: str | None,
     get_llm: Any,
+) -> EvidenceSubtaskResult:
+    """Run a claim, re-routing it when its evidence turns out to be off-entity.
+
+    A capability that returns program-wide records for an entity-scoped claim has
+    answered a different question. Rather than render that, the claim is retried
+    against the next capability able to hold evidence about the entity, and the
+    attempts from every route are kept so a rejected answer stays inspectable.
+    """
+    attempts: list[dict[str, Any]] = []
+    tried: set[str] = set()
+    active = subtask
+    result: EvidenceSubtaskResult | None = None
+
+    for remaining in range(_MAX_CAPABILITY_RETRIES, -1, -1):
+        tried.add(active.capability)
+        result = _attempt_evidence_subtask(
+            question=question,
+            config=config,
+            parent_plan=parent_plan,
+            parent_scope=parent_scope,
+            subtask=active,
+            top_k=top_k,
+            chunk_types=chunk_types,
+            conversation_history=conversation_history,
+            get_llm=get_llm,
+            # While another route is still available, an off-entity artifact ends
+            # the attempt early. The final attempt runs the full fallback chain so
+            # exhausting the routes costs no more than not re-routing at all.
+            reroute_available=remaining > 0,
+        )
+        attempts.extend(result.attempts)
+        if not _entity_contract_failed(result):
+            break
+        rerouted = _rerouted_subtask(
+            question=question,
+            config=config,
+            plan=result.plan,
+            subtask=active,
+            tried=frozenset(tried),
+        )
+        if rerouted is None:
+            break
+        active = rerouted
+
+    assert result is not None
+    return replace(result, attempts=tuple(attempts))
+
+
+def _attempt_evidence_subtask(
+    *,
+    question: str,
+    config: AppConfig,
+    parent_plan: QueryPlan,
+    parent_scope: QueryScope,
+    subtask: EvidenceSubtask,
+    top_k: int | None,
+    chunk_types: list[str] | None,
+    conversation_history: str | None,
+    get_llm: Any,
+    reroute_available: bool = False,
 ) -> EvidenceSubtaskResult:
     subplan = plan_for_subtask(parent_plan, subtask)
     subscope = _scope_for_subtask(parent_scope, subplan)
@@ -874,6 +994,21 @@ def _execute_evidence_subtask(
                     attempts=tuple(attempts),
                 )
             last_reasons = contract.reasons
+            # This capability's own artifact is about something else. Retrieval
+            # and generation would read the same off-entity evidence, so hand
+            # back to the caller to re-route instead of paying for a model call
+            # over material already shown not to concern the entity.
+            if reroute_available and any(
+                reason.startswith(_ENTITY_CONTRACT_PREFIX) for reason in contract.reasons
+            ):
+                return EvidenceSubtaskResult(
+                    subtask=subtask,
+                    plan=subplan,
+                    passed=False,
+                    sources=tuple(candidate_sources),
+                    attempts=tuple(attempts),
+                    reasons=contract.reasons,
+                )
 
     subtask_question = (
         f"{question}\n\nEvidence subtask {subtask.claim_id}: {subtask.description}. "

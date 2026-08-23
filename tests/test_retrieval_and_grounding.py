@@ -18,6 +18,10 @@ from cobol_rag.query import (
     _build_prompt,
     _build_constrained_routing_prompt,
     _build_routing_prompt,
+    _attempt_evidence_subtask,
+    _entity_contract_failed,
+    _rerouted_subtask,
+    EvidenceSubtaskResult,
     _decision_respects_candidates,
     _routing_candidates,
     _chunk_types_for_plan,
@@ -37,6 +41,8 @@ from cobol_rag.query import (
     QueryRoutingDecision,
 )
 from cobol_rag.query_plan import (
+    _CAPABILITY_ENTITY_TYPES,
+    _CAPABILITY_TASKS,
     EvidenceSubtask,
     QueryPlan,
     build_query_plan,
@@ -1304,6 +1310,254 @@ class PromptGroundingTest(unittest.TestCase):
         ]
         answer = _ensure_citations("Grounded answer.", sources)
         self.assertIn("[Source 1] business_rule/business_rule.BR-028.json", answer)
+
+
+class EntityScopedEvidenceContractTest(unittest.TestCase):
+    """Evidence offered as being about an identifier must mention that identifier."""
+
+    @staticmethod
+    def _plan(value: str, *, intent: str, tasks: tuple[str, ...]) -> QueryPlan:
+        entity = EntityReference(
+            "PDCBVC", "variable", value, f"PDCBVC|VARIABLE|{value}",
+        )
+        return QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent=intent,
+            domain="control_flow", tasks=tasks, entities=(entity,),
+        )
+
+    def test_off_entity_rule_dump_is_rejected_under_any_intent(self) -> None:
+        # A claim scoped to NPAGT that comes back with the whole business-rule
+        # catalogue has answered a different question, and the intent it was
+        # routed under must not excuse it.
+        plan = self._plan("NPAGT", intent="business_rules", tasks=("business_rules",))
+        answer = (
+            "PDCBVC business rules (32 matching unique direct-evidence rule(s)):\n"
+            "- BR-001\n  Condition: NOT (TWCOB-FASE = '1' OR TWCOB-FASE = '2')\n"
+            "  Action: JUMP -> ABEND00\n  Source location: PDCBVC.CBL line 227\n"
+            "- BR-010\n  Condition: EIBAID = DFHENTER\n"
+            "  Action: JUMP -> BROWSE-FASE2-ENTER\n  Source location: PDCBVC.CBL line 299\n"
+        )
+
+        contract = validate_plan_answer(plan, answer)
+
+        self.assertFalse(contract.passed)
+        self.assertIn("missing_requested_entity:NPAGT", contract.reasons)
+
+    def test_on_entity_answer_passes_under_the_same_intent(self) -> None:
+        plan = self._plan("TWCOB-FASE", intent="business_rules", tasks=("business_rules",))
+        answer = (
+            "PDCBVC business rules (1 matching unique direct-evidence rule(s)):\n"
+            "- BR-001\n  Condition: NOT (TWCOB-FASE = '1' OR TWCOB-FASE = '2')\n"
+            "  Action: JUMP -> ABEND00\n  Source location: PDCBVC.CBL line 227\n"
+        )
+
+        self.assertTrue(validate_plan_answer(plan, answer).passed)
+
+    def test_group_item_is_satisfied_by_a_qualified_child(self) -> None:
+        # PD1VOCI is a group; evidence that names only its children is still
+        # evidence about it, so the contract must not reject the record.
+        plan = self._plan("PD1VOCI", intent="variable_dataflow", tasks=("variable_reads",))
+        answer = (
+            "PD1VOCI direct COBOL access evidence:\nTested/read at:\n"
+            "- MUOVI-DATI-10, line 676: `IF PD1VOCI-IND GREATER PD1VOCI-TABVOX-NUMERO THEN`\n"
+        )
+
+        self.assertTrue(validate_plan_answer(plan, answer).passed)
+
+    def test_specific_field_is_not_satisfied_by_the_group_alone(self) -> None:
+        plan = self._plan(
+            "PD1VOCI-TABVOX-NUMERO", intent="variable_dataflow", tasks=("variable_reads",),
+        )
+        answer = "PD1VOCI is passed as the COMMAREA on the LINK at line 486.\nRead sites: none recorded."
+
+        contract = validate_plan_answer(plan, answer)
+
+        self.assertFalse(contract.passed)
+        self.assertIn("missing_requested_entity:PD1VOCI-TABVOX-NUMERO", contract.reasons)
+
+    def test_reporting_absence_of_evidence_for_the_entity_passes(self) -> None:
+        # Abstaining is a legitimate answer as long as it is about the entity
+        # that was asked for, so it must not be rejected as off-entity.
+        plan = self._plan("WCTPAG", intent="external_programs", tasks=("external_calls",))
+        answer = "No outgoing call evidence matched WCTPAG in PDCBVC."
+
+        self.assertTrue(validate_plan_answer(plan, answer).passed)
+
+    def test_program_wide_claims_are_untouched_by_the_entity_contract(self) -> None:
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent="program_summary",
+            domain="program_structure", tasks=("program_summary",),
+        )
+        answer = "PDCBVC technical overview: 392 lines of code, 72 statements."
+
+        contract = validate_plan_answer(plan, answer)
+
+        self.assertTrue(contract.passed)
+        self.assertFalse(
+            [reason for reason in contract.reasons if reason.startswith("missing_requested_entity")]
+        )
+
+
+class OffEntityClaimReroutingTest(unittest.TestCase):
+    """A claim whose evidence is off-entity is retried against another capability."""
+
+    @staticmethod
+    def _plan(entity_type: str = "variable") -> QueryPlan:
+        entity = EntityReference(
+            "PDCBVC", entity_type, "NPAGT", "PDCBVC|VARIABLE|NPAGT",
+        )
+        return QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent="business_rules",
+            domain="control_flow", tasks=("business_rules",), entities=(entity,),
+        )
+
+    @staticmethod
+    def _subtask(capability: str) -> EvidenceSubtask:
+        return EvidenceSubtask(
+            claim_id="claim_1",
+            description=f"Verify {capability} evidence for NPAGT",
+            capability=capability,
+            tasks=("business_rules",),
+            entity_values=("NPAGT",),
+            source_domains=("business_rule",),
+            relations=("before",),
+        )
+
+    def test_reroute_only_considers_capabilities_that_index_the_entity_type(self) -> None:
+        captured: dict[str, object] = {}
+
+        def rank(question: str, *, allowed=None):
+            captured["allowed"] = set(allowed)
+            return (CapabilityMatch("variable_access", 0.81, 0.09),)
+
+        with patch("cobol_rag.query.router_for", return_value=Mock(rank=rank)):
+            rerouted = _rerouted_subtask(
+                question="Which paragraphs modify NPAGT?",
+                config=Mock(),
+                plan=self._plan(),
+                subtask=self._subtask("condition_outcome"),
+                tried=frozenset({"condition_outcome"}),
+            )
+
+        self.assertIsNotNone(rerouted)
+        self.assertEqual(rerouted.capability, "variable_access")
+        self.assertEqual(rerouted.tasks, _CAPABILITY_TASKS["variable_access"])
+        # The claim keeps the identifier the user typed, and drops the source
+        # domains and relations that belonged to the capability that failed.
+        self.assertEqual(rerouted.entity_values, ("NPAGT",))
+        self.assertEqual(rerouted.source_domains, ())
+        self.assertEqual(rerouted.relations, ())
+        # Already-tried and entity-incompatible capabilities are never offered.
+        self.assertNotIn("condition_outcome", captured["allowed"])
+        self.assertNotIn("program_summary", captured["allowed"])
+        self.assertNotIn("cics_evidence", captured["allowed"])
+
+    def test_claims_without_entities_are_not_rerouted(self) -> None:
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent="program_summary",
+            domain="program_structure", tasks=("program_summary",),
+        )
+
+        self.assertIsNone(_rerouted_subtask(
+            question="What is PDCBVC?",
+            config=Mock(),
+            plan=plan,
+            subtask=self._subtask("program_summary"),
+            tried=frozenset({"program_summary"}),
+        ))
+
+    def test_reroute_stops_when_every_capability_has_been_tried(self) -> None:
+        exhausted = frozenset(_CAPABILITY_ENTITY_TYPES)
+
+        self.assertIsNone(_rerouted_subtask(
+            question="Which paragraphs modify NPAGT?",
+            config=Mock(),
+            plan=self._plan(),
+            subtask=self._subtask("condition_outcome"),
+            tried=exhausted,
+        ))
+
+    def test_off_entity_artifact_ends_the_attempt_before_any_model_call(self) -> None:
+        # Re-routing must stay cheap: once the artifact is shown to be about
+        # something else, retrieval and generation would read the same records,
+        # so neither may run while another route is still available.
+        get_llm = Mock()
+        with (
+            patch("cobol_rag.query._direct_handler_supports", return_value=True),
+            patch(
+                "cobol_rag.query.answer_from_final_scripts",
+                return_value="PDCBVC business rules (32 matching rule(s)):\n- BR-001 TWCOB-FASE\n",
+            ),
+            patch("cobol_rag.query._final_script_sources", return_value=[]),
+            patch("cobol_rag.query._retrieve_for_plan") as retrieve_for_plan,
+        ):
+            result = _attempt_evidence_subtask(
+                question="Which paragraphs modify NPAGT?",
+                config=Mock(),
+                parent_plan=self._plan(),
+                parent_scope=QueryScope(intent="business_rules"),
+                subtask=self._subtask("condition_outcome"),
+                top_k=None,
+                chunk_types=None,
+                conversation_history=None,
+                get_llm=get_llm,
+                reroute_available=True,
+            )
+
+        self.assertFalse(result.passed)
+        self.assertIn("missing_requested_entity:NPAGT", result.reasons)
+        retrieve_for_plan.assert_not_called()
+        get_llm.assert_not_called()
+
+    def test_final_attempt_still_runs_the_full_fallback_chain(self) -> None:
+        # With no route left, behaviour matches not re-routing at all, so the
+        # bound on re-routing never costs an answer that the chain would find.
+        with (
+            patch("cobol_rag.query._direct_handler_supports", return_value=True),
+            patch(
+                "cobol_rag.query.answer_from_final_scripts",
+                return_value="PDCBVC business rules (32 matching rule(s)):\n- BR-001 TWCOB-FASE\n",
+            ),
+            patch("cobol_rag.query._final_script_sources", return_value=[]),
+            patch("cobol_rag.query._retrieve_for_plan") as retrieve_for_plan,
+        ):
+            retrieve_for_plan.return_value = Mock(
+                results=[], guard=Mock(status="insufficient", reasons=("no_evidence",)),
+            )
+            _attempt_evidence_subtask(
+                question="Which paragraphs modify NPAGT?",
+                config=Mock(),
+                parent_plan=self._plan(),
+                parent_scope=QueryScope(intent="business_rules"),
+                subtask=self._subtask("condition_outcome"),
+                top_k=None,
+                chunk_types=None,
+                conversation_history=None,
+                get_llm=Mock(),
+                reroute_available=False,
+            )
+
+        retrieve_for_plan.assert_called_once()
+
+    def test_only_an_off_entity_failure_triggers_a_reroute(self) -> None:
+        plan = self._plan()
+        subtask = self._subtask("condition_outcome")
+
+        off_entity = EvidenceSubtaskResult(
+            subtask=subtask, plan=plan, passed=False,
+            reasons=("missing_requested_entity:NPAGT",),
+        )
+        other_failure = EvidenceSubtaskResult(
+            subtask=subtask, plan=plan, passed=False,
+            reasons=("no_sufficient_subtask_evidence",),
+        )
+        success = EvidenceSubtaskResult(
+            subtask=subtask, plan=plan, passed=True, answer="grounded",
+        )
+
+        self.assertTrue(_entity_contract_failed(off_entity))
+        self.assertFalse(_entity_contract_failed(other_failure))
+        self.assertFalse(_entity_contract_failed(success))
 
 
 if __name__ == "__main__":

@@ -329,6 +329,10 @@ _CAPABILITY_TASKS = {
     "screen_lineage": ("screen_lineage",),
 }
 
+# Entity types that are exact identifiers copied from the user's question, and so
+# must survive into any answer claiming to be about them.
+NAMED_IDENTIFIER_ENTITY_TYPES = frozenset({"call", "variable", "unknown_identifier"})
+
 _CAPABILITY_ENTITY_TYPES = {
     "paragraph_evidence": {"paragraph"},
     "variable_access": {"variable", "unknown_identifier"},
@@ -1060,10 +1064,16 @@ def validate_plan_answer(plan: QueryPlan, answer: str) -> PlanContractValidation
                 reasons.append("outside_requested_division")
                 break
 
-    if plan.intent in {"external_programs", "variable_dataflow"}:
-        for entity in plan.entities:
-            if entity.entity_type in {"call", "variable", "unknown_identifier"} and entity.value.lower() not in lowered:
-                reasons.append(f"missing_requested_entity:{entity.value}")
+    # Evidence offered as being about a named identifier must mention that
+    # identifier. This holds for every capability, not just the two that read
+    # entities most often: a claim scoped to one entity that comes back with
+    # program-wide records is not evidence about that entity, whatever intent
+    # the planner chose. Matching is a substring test on purpose, so a group
+    # item is satisfied by any of its qualified children while a question about
+    # a specific field is not satisfied by the group alone.
+    for entity in plan.entities:
+        if entity.entity_type in NAMED_IDENTIFIER_ENTITY_TYPES and entity.value.lower() not in lowered:
+            reasons.append(f"missing_requested_entity:{entity.value}")
 
     # Program-level capabilities describe a whole program rather than a location in
     # it, so requiring a source line from them rejects a correct answer for a field

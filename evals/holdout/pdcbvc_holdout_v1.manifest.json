@@ -1,0 +1,8 @@
+{
+  "suite_id": "pdcbvc-v1",
+  "suite_file": "pdcbvc_holdout_v1.jsonl",
+  "sha256": "913dd06351838216824220608d193236ebd051ce46ae63a730bbf1f4a9d5d680",
+  "cases": 5,
+  "sealed_at": "2026-08-21",
+  "policy": "Created after implementation freeze. Do not edit this suite or tune the implementation against its results; create a new development regression and a later holdout version."
+}

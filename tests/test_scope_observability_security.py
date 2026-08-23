@@ -422,6 +422,45 @@ class EvidenceSecurityTest(unittest.TestCase):
             result.reasons,
         )
 
+    def test_absence_is_refused_however_it_is_phrased(self) -> None:
+        # The first guard enumerated verb-and-quantifier pairs, so "has no
+        # variables" was refused while "calls nothing" was accepted and cited.
+        # Absence is one concept; every phrasing of it must be refused.
+        source = RetrievalResult(
+            0.9,
+            "PDCBVC calls PD1VOCI, PD1FS00, PXRSEMAF, PD0UTI01 and PDPRED. variables",
+            {"source_id": "calls"},
+        )
+        for claim in (
+            "- PDCBVC calls nothing [Source 1]",
+            "- PDCBVC has no variables [Source 1]",
+            "- PDCBVC never calls any external program [Source 1]",
+            "- There are no copybooks in PDCBVC [Source 1]",
+            "- PDCBVC does not call any program [Source 1]",
+            "- PDCBVC contains zero business rules [Source 1]",
+            "- The program is without external calls [Source 1]",
+        ):
+            result = _validate_generated_claims(claim, [source])
+            self.assertFalse(result.passed, f"accepted an absence claim: {claim}")
+            self.assertTrue(
+                any("unverifiable_absence_claim" in reason for reason in result.reasons),
+                f"{claim} -> {result.reasons}",
+            )
+
+    def test_quoted_cobol_conditions_are_not_mistaken_for_absence_claims(self) -> None:
+        # COBOL conditions carry their own NOT. Showing one is evidence, not an
+        # assertion that something is missing.
+        source = RetrievalResult(
+            0.9,
+            "READ-TAB-SEMAF line 762: IF PXCSEMAF-OUTCOME NOT = SPACE",
+            {"source_id": "variable-outcome"},
+        )
+        result = _validate_generated_claims(
+            "- READ-TAB-SEMAF line 762: `IF PXCSEMAF-OUTCOME NOT = SPACE` [Source 1]",
+            [source],
+        )
+        self.assertTrue(result.passed, result.reasons)
+
     def test_generated_count_claim_is_rejected_when_the_model_invents_the_total(self) -> None:
         # Observed production failure: "PDCBVC has 8 variables" validated as passed
         # while the catalogue holds 170. A count cannot be established from a chunk.

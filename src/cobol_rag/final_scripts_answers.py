@@ -99,6 +99,13 @@ def answer_from_final_scripts(
     if intent in {"datasets", "datasets_tables"} or (use_text_fallback and _asks_about_datasets(q)):
         return _answer_datasets(root, program)
 
+    # The manifest records capabilities the analysis produced no evidence for.
+    # Saying so is a real answer; letting the question fall through to retrieval
+    # returns whatever is merely nearby and reads as if it were the answer.
+    absent = _absent_capability_answer(root, program, intent)
+    if absent:
+        return absent
+
     if intent == "ui_navigation" or (use_text_fallback and _asks_about_ui_navigation(q)):
         answer = _answer_ui_navigation(root, program)
         if answer:
@@ -465,6 +472,72 @@ def _answer_artifact_inventory(root: Path, program: str) -> str | None:
         lines.extend(f"- `{name}/` — {count} JSON file(s)" for name, count in detail_groups)
     lines.append("This is the evidence inventory exposed to the assistant for the selected program.")
     return "\n".join(lines)
+
+
+# Intents whose whole answer comes from one capability, so an absent capability
+# means the question has a definite negative answer rather than a missing one.
+_INTENT_SOLE_CAPABILITY = {
+    "ui_navigation": "screen_lineage",
+    "variable_inventory": "variable_inventory",
+    "cics_operations": "cics_evidence",
+    "copybooks": "copybook_evidence",
+    "dead_code": "quality_evidence",
+}
+
+
+def _absent_capability_answer(root: Path, program: str, intent: str | None) -> str | None:
+    capability = _INTENT_SOLE_CAPABILITY.get(str(intent or ""))
+    if not capability:
+        return None
+    manifest = capability_manifest(program)
+    if not manifest:
+        return None
+    entry = manifest.get("capabilities", {}).get(capability)
+    if not isinstance(entry, dict) or entry.get("available", True):
+        return None
+    reason = str(entry.get("reason") or "").strip()
+    return (
+        f"{program} has no {capability.replace('_', ' ')} evidence in the analyzed artifacts"
+        + (f": {reason}." if reason else ".")
+        + f" Source: `{entry.get('artifact', 'program.capability_manifest.json')}`."
+    )
+
+
+def capability_manifest(program: str | None) -> dict[str, Any] | None:
+    """Read the generated index of what evidence a program actually has.
+
+    The analysis stage records which capabilities were produced, how many items
+    each holds, and why one is missing. Reading it turns "does this program have
+    JCL" into a lookup instead of something inferred from an empty retrieval,
+    and keeps the answer honest when a program genuinely has no such evidence.
+    """
+    if not program:
+        return None
+    root = find_final_scripts_root()
+    if root is None:
+        return None
+    program_root = find_program_artifact_root(root, program)
+    if program_root is None:
+        return None
+    payload = _read_json(_artifact_path(program_root, "program.capability_manifest.json"))
+    if not isinstance(payload, dict) or payload.get("program") != program:
+        return None
+    content = payload.get("content")
+    return content if isinstance(content, dict) else None
+
+
+def unavailable_capabilities(program: str | None) -> frozenset[str]:
+    """Capabilities the analysis proved this program has no evidence for."""
+    manifest = capability_manifest(program)
+    if not manifest:
+        return frozenset()
+    capabilities = manifest.get("capabilities", {})
+    if not isinstance(capabilities, dict):
+        return frozenset()
+    return frozenset(
+        name for name, entry in capabilities.items()
+        if isinstance(entry, dict) and not entry.get("available", True)
+    )
 
 
 def _program_character(root: Path, program: str) -> str:

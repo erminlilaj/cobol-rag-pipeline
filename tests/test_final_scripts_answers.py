@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from cobol_rag.final_scripts_answers import (
     answer_from_final_scripts,
+    unavailable_capabilities,
     program_from_question,
 )
 from cobol_rag.config import AppConfig
@@ -751,6 +752,55 @@ class FinalScriptsAnswersTest(unittest.TestCase):
         self.assertIn("technical overview", answer)
         self.assertIn("does not by itself prove a business-domain purpose", answer)
         self.assertNotIn("direct COBOL access evidence", answer)
+
+    def _write_manifest(self, capabilities: dict) -> None:
+        self._write_json(
+            "program.capability_manifest.json",
+            {
+                "type": "program.capability_manifest",
+                "program": "PDCBVC",
+                "content": {"capabilities": capabilities, "program_facts": {}},
+            },
+        )
+
+    def test_absent_capability_is_answered_instead_of_falling_through(self) -> None:
+        # A capability the analysis produced no evidence for has a definite
+        # negative answer. Letting it fall through to retrieval returns whatever
+        # happens to be nearby, which reads as though it were the answer.
+        self._write_manifest({
+            "screen_lineage": {
+                "artifact": "screen_field_lineage.json", "count": 0,
+                "available": False, "reason": "no screen field lineage was derived",
+            },
+        })
+        answer = answer_from_final_scripts(
+            "How does a value reach the screen?", intent="ui_navigation",
+        )
+        assert answer is not None
+        self.assertIn("no screen lineage evidence", answer)
+        self.assertIn("no screen field lineage was derived", answer)
+
+    def test_available_capability_is_not_short_circuited(self) -> None:
+        self._write_manifest({
+            "copybook_evidence": {
+                "artifact": "architecture.copybooks.json", "count": 12, "available": True,
+            },
+        })
+        answer = answer_from_final_scripts(
+            "Which copybooks does PDCBVC use?", intent="copybooks",
+        )
+        assert answer is not None
+        self.assertIn("DFHAID", answer)
+        self.assertNotIn("no copybook evidence", answer)
+
+    def test_unavailable_capabilities_are_reported_for_ranking(self) -> None:
+        self._write_manifest({
+            "jcl_evidence": {"artifact": "jcl.file_io.json", "count": 0, "available": False},
+            "call_evidence": {"artifact": "architecture.call_parameters.json", "count": 5, "available": True},
+        })
+        missing = unavailable_capabilities("PDCBVC")
+        self.assertIn("jcl_evidence", missing)
+        self.assertNotIn("call_evidence", missing)
 
     def test_unmatched_named_entity_does_not_return_the_whole_call_inventory(self) -> None:
         # Observed production failure: asking where WXYZ-NOTREAL is used returned

@@ -6,7 +6,7 @@ import chromadb
 from chromadb.api import ClientAPI
 from chromadb.api.models.Collection import Collection
 from llama_index.core import Settings, VectorStoreIndex
-from llama_index.core.schema import Document
+from llama_index.core.schema import Document, TextNode
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.chroma import ChromaVectorStore
@@ -29,20 +29,46 @@ class IndexResources:
     index: VectorStoreIndex
 
 
-def configure_llamaindex(config: AppConfig) -> LlamaIndexRuntime:
-    """Configure LlamaIndex global settings from the project config."""
+def build_llm(
+    config: AppConfig,
+    *,
+    json_mode: bool = False,
+    max_output_tokens: int | None = None,
+    temperature: float | None = None,
+) -> Ollama:
+    """Create the configured Ollama LLM without opening the vector store."""
     if config.llm.provider != "ollama":
         raise ValueError(f"Unsupported LLM provider: {config.llm.provider}")
-    if config.embedding.provider != "ollama":
-        raise ValueError(f"Unsupported embedding provider: {config.embedding.provider}")
-
-    llm = Ollama(
+    return Ollama(
         model=config.llm.model,
         base_url=config.llm.base_url,
         context_window=config.llm.context_window,
         request_timeout=config.llm.request_timeout,
-        temperature=config.llm.temperature,
+        temperature=config.llm.temperature if temperature is None else temperature,
+        json_mode=json_mode,
+        additional_kwargs={
+            "num_predict": max_output_tokens or config.llm.max_output_tokens
+        },
     )
+
+
+def build_embedder(config: AppConfig) -> OllamaEmbedding:
+    """Create the configured embedding model without opening the vector store."""
+    if config.embedding.provider != "ollama":
+        raise ValueError(f"Unsupported embedding provider: {config.embedding.provider}")
+    return OllamaEmbedding(
+        model_name=config.embedding.model,
+        base_url=config.embedding.base_url,
+        embed_batch_size=config.index.batch_size,
+    )
+
+
+def configure_llamaindex(config: AppConfig) -> LlamaIndexRuntime:
+    """Configure LlamaIndex global settings from the project config."""
+    if config.embedding.provider != "ollama":
+        raise ValueError(f"Unsupported embedding provider: {config.embedding.provider}")
+
+    llm = build_llm(config)
     embed_model = OllamaEmbedding(
         model_name=config.embedding.model,
         base_url=config.embedding.base_url,
@@ -87,8 +113,22 @@ def delete_source(resources: IndexResources, source_id: str) -> None:
     resources.chroma_collection.delete(where={"source_id": source_id})
 
 
-def upsert_document(resources: IndexResources, document: Document) -> None:
+def upsert_document(
+    resources: IndexResources,
+    document: Document,
+    chunk_mode: str = "pre_chunked",
+) -> None:
     """Refresh one normalized document in the vector index."""
     source_id = str(document.metadata["source_id"])
     delete_source(resources, source_id)
+    if chunk_mode == "pre_chunked":
+        node = TextNode(
+            id_=document.id_,
+            text=document.text,
+            metadata=dict(document.metadata),
+            excluded_embed_metadata_keys=list(document.excluded_embed_metadata_keys),
+            excluded_llm_metadata_keys=list(document.excluded_llm_metadata_keys),
+        )
+        resources.index.insert_nodes([node])
+        return
     resources.index.insert(document)

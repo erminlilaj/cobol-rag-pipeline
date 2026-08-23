@@ -134,10 +134,51 @@ cobol-rag inspect data/inbox/example.txt
 
 The current loaders are intentionally general:
 
+- `rag_documents` handles the `rag_documents.jsonl` and `rag_documents.json` files produced by the `control_flow` RAG document factory. It keeps the factory text unchanged, uses the factory record `id` as the stable chunk id, and maps factory `type` into `chunk_type` for retrieval filters and intent reranking.
 - `generic_json` handles JSON objects or lists. It extracts text from configured fields such as `text`, `content`, `summary`, or `description`; if none are present, it stores the stable JSON representation as text.
 - `plain_text` handles UTF-8 text-like files such as `.txt`, `.md`, `.cbl`, `.cpy`, `.cob`, and `.jcl`.
 
-Format-specific loaders, including `cobol-rekt` chunks or friend-specific output formats, should be added later as small adapters after we have real examples.
+Format-specific loaders should stay as small adapters around one source contract, so the rest of the sync/retrieval pipeline stays stable.
+
+## Control Flow Factory Output
+
+The preferred input from `control_flow` is the final RAG index folder created by `scripts/pipeline/run_rag_factory.py`, especially:
+
+```text
+rag_index/rag_documents.jsonl
+rag_index/rag_manifest.json
+rag_index/program_index.json
+```
+
+For Ollama `mxbai-embed-large`, keep factory chunks compact. A safe tested setting from `control_flow` is:
+
+```bash
+python scripts/pipeline/build_rag_index.py \
+  --out-root /path/to/program_artifacts \
+  --out-dir /path/to/rag_index_embed_safe \
+  --max-text-chars 1200 \
+  --overlap-chars 150
+```
+
+Inspect the JSONL before indexing:
+
+```bash
+cobol-rag inspect /path/to/rag_index/rag_documents.jsonl
+cobol-rag inspect /path/to/rag_index
+```
+
+Sync it directly without copying into `data/inbox`. Passing the `rag_index` folder automatically selects `rag_documents.jsonl` when present:
+
+```bash
+cobol-rag sync /path/to/rag_index --dry-run
+cobol-rag sync /path/to/rag_index --apply
+```
+
+The loader preserves factory metadata such as `program`, `source_file`, `source_kind`, `chunk_index`, and `chunk_count`. It also exposes the factory document type as `chunk_type`, so commands like this can target a specific evidence family:
+
+```bash
+cobol-rag retrieve "which copybooks are shared?" --chunk-type global.copybook_usage
+```
 
 Plan an inbox sync without writing to Chroma:
 
@@ -247,62 +288,6 @@ Expected result:
 
 Use reset when changing embedding models, clearing experiments, or rebuilding a collection from scratch.
 
-## Final Scripts Enrichment Workflow
-
-The detailed `final_scripts/` bundle is the evidence source for questions that
-need deterministic analysis instead of a generic LLM guess. Some useful
-question classes are not always present as first-class artifacts in the bundle,
-so the pipeline can derive normalized review artifacts from the existing JSON
-files.
-
-Preview the derived artifacts:
-
-```bash
-cobol-rag enrich-final-scripts --root /path/to/final_scripts --program PDCBVC --dry-run
-```
-
-Write them back into the bundle:
-
-```bash
-cobol-rag enrich-final-scripts --root /path/to/final_scripts --program PDCBVC --apply
-```
-
-If the bundle is outside the repository, set the environment variable once:
-
-```bash
-export COBOL_RAG_FINAL_SCRIPTS_DIR="/path/to/final_scripts"
-cobol-rag enrich-final-scripts --program PDCBVC --dry-run
-```
-
-On Windows PowerShell:
-
-```powershell
-$env:COBOL_RAG_FINAL_SCRIPTS_DIR="C:\path\to\final_scripts"
-cobol-rag enrich-final-scripts --program PDCBVC --dry-run
-```
-
-Current derived artifact types:
-
-- `quality.dead_code`: separates commented-out code from CFG reachability.
-- `architecture.unused_copybooks`: compares COPY members with available
-  variable/call evidence and reports proof level, so the assistant does not
-  overclaim unused copybooks.
-- `jcl.file_io`: maps JCL jobs, steps, DD reads, writes, and SYSOUT evidence to
-  matching batch programs when the JCL artifacts contain that linkage.
-- `screen_field_lineage`: groups BMS/map variables by screen field family and
-  cites read, write, control-flow, literal/attribute, and connected-variable
-  evidence.
-
-These artifacts are also built in memory by direct-answer code when possible,
-so the UI can answer common review questions even before `--apply` is run.
-Writing them is still useful because it makes the evidence explicit and easier
-to inspect, sync, and evaluate.
-
-Direct structured answers include an `Evidence:` section or inline citations
-such as `dataflow.variable/dataflow.variable.SCELTAI.json | line 317`, so a
-good answer is traceable back to the generated artifact and COBOL/JCL line
-where that line number is available.
-
 ## Retrieval Debug Workflow
 
 Retrieval debug checks what evidence the vector database returns before any LLM answer is generated.
@@ -346,7 +331,82 @@ Sources:
 - source_path
 ```
 
-Trust rule: an answer without sources is not useful for this project. If retrieval returns weak or wrong sources, debug with `cobol-rag retrieve ...` before trusting `cobol-rag query ...`.
+Trust rule: a factual COBOL answer without sources is not useful for this project. Conversational and clarification replies intentionally have no sources. If retrieval returns weak or wrong sources, debug with `cobol-rag retrieve ...` before trusting `cobol-rag query ...`.
+
+## Semantic Query Routing
+
+Query handling uses a hybrid deterministic + LLM + semantic routing plan. The complete implementation and operating guide is in [docs/research-rag-implementation.md](docs/research-rag-implementation.md).
+
+1. Resolve the program and all exact COBOL entities from the question. An explicitly named program wins; otherwise the current technical session or a uniquely owned entity may select it. A multi-program corpus without a unique target produces a clarification instead of defaulting to PDCBVC. Structured session state is inherited only for an explicit follow-up.
+2. Compile authoritative scope and literal constraints: exact entities, operations/exclusions, division/section filters, requested fields, and condition terms.
+3. Ask the configured LLM to produce the hierarchical semantic plan: route, category, domain, intent, tasks, relations, response language, and source families. Preserve explicit constraints during fusion and retry contradictory/invalid plans with a compact LLM prompt.
+4. Decompose compound requests into independently verifiable semantic claims. Each claim receives one evidence capability, an exact entity subset, relations, required fields, and allowed source families. Literal assignments, call context, variable lineage, control flow, quality evidence, and other capabilities cannot silently borrow incompatible evidence.
+5. Execute every claim independently. Use capability-gated structured executors first, including exact artifacts, paragraph references/body, CFG paths, call before/after context, DB2/JCL separation, copybook usage examples, quality categories, and pagination. Otherwise translate only that claim into program/entity/task metadata filters, run hybrid retrieval, and expand bounded parent/entity/domain context.
+6. Validate each claim separately. Retry only unresolved claims through retrieval, grounded generation, and citation repair; successful claims are never regenerated. Compose verified claims and explicitly report any still-unresolved required claim. `all`, `every`, and `every single` set `result_scope=all`, so collection answers must return the source count completely rather than silently applying a top-N cap.
+
+Exact multiple identifiers are preserved as a set. Direct artifact roots and returned sources are checked against the selected program so same-named artifacts from different programs cannot be mixed. A new explicit intent clears incompatible entity memory. Technical continuations such as `there is more`, `continue`, and `show the rest` retain the prior program and intent. Ambiguous identifier prefixes request the exact COBOL name instead of silently selecting a candidate. Qualifiers such as source line, division, section, `only`, exhaustive scope, excluded evidence types, condition values, and CICS operation types are plan fields rather than special-case answer strings.
+
+The semantic router classifies meaning using the current message and recent technical questions. Technical intents include artifact inventory, variable inventory, variable dataflow, copybooks, business rules, external programs, control flow, CICS operations, static values, dead code, DB2/SQL, datasets, UI navigation, source metrics, program summary, and general COBOL analysis.
+
+A semantic capability router sits underneath the LLM planner as its deterministic floor. Every evidence capability carries a natural-language description of what it answers in `src/cobol_rag/capability_router.py`; a question is embedded with the same model that indexes the corpus and ranked against those descriptions. When the planner returns an unusable plan, or returns `technical` with no intent and no task, the top-ranked capability supplies the missing one instead of the system degrading into generic retrieval with no handler. A match is used only when it clears both a similarity and a margin threshold, so a question that belongs to no capability stays unrouted rather than being forced into the nearest one. Deterministic entity scope still gates which capabilities are eligible: entity-scoped capabilities are dropped when no identifier was resolved, and a named variable removes the whole-program catalogue from the ranking so exact evidence always wins. Adding a capability means adding a description, never a question pattern; ranking accuracy is measurable independently of the planner.
+
+Entity-scoped and program-wide questions use different evidence. `variable_dataflow` answers about one named variable from `dataflow.variable.<NAME>.json`; `variable_inventory` answers about a program's variables in general from the generated `dataflow.used_variables.json` catalogue. The router chooses between them by meaning rather than by wording, so listing, counting, sampling, and "which ones control flow" all reach the catalogue, while a named identifier still routes to its exact per-variable evidence. The catalogue is a direct-artifact capability, so these answers need no LLM generation.
+
+The conversational route answers without retrieval or citation validation. A message whose deterministic scope resolved an analyzed program from the question itself, or any exact COBOL identifier, can therefore never be answered conversationally; such a turn is forced back to the technical path so the reply stays evidence-grounded. A program selected in the UI does not trigger this, so greetings remain conversational. Two further contracts close the same hole from the output side: a conversational reply that names an analyzed program or any COBOL identifier is treated as a technical answer that skipped validation, and an explicit continuation of a technical thread (`there is more`, `show the rest`) can never be answered conversationally. Naming the domain itself (COBOL, CICS, DB2) stays allowed, so capability descriptions still work.
+
+A name the corpus does not contain is answered with an abstention rather than with whichever program happened to be selected. An identifier-shaped token that matches no analyzed program and no catalogued entity resolves to an explicit unresolved reference, so asking about an unanalyzed program, or comparing an analyzed program against one that was never indexed, says so instead of returning the selected program's evidence under the wrong name. This matters more as the corpus grows: most programs a user names will not be indexed yet.
+
+Output-field contracts are checked against what the selected capability can render. Program-level capabilities such as the summary, metrics, artifact inventory, and variable catalogue describe a whole program rather than a location inside it, so they are never required to quote a source line; asking how big a program is "in terms of lines of code" is a size question and no longer sets the source-line requirement that once rejected a correct answer.
+
+Generated claims may narrate verified evidence but may not introduce facts of their own. Counts and absence are properties of a complete artifact, while retrieval returns parts of one, so a generated sentence asserting `N somethings` or `has no X` is rejected regardless of how well its words match a chunk. Word-overlap support cannot distinguish a true statement from a false one built out of true words, which is how a prompt-injection message once produced a validated "has no variables" answer. Deterministic handlers read whole artifacts and render these totals themselves, and they do not pass through claim validation, so the honest count still reaches the user.
+
+- `technical`: dispatch to the canonical evidence handler, then fall back to hybrid retrieval and grounded generation only when necessary.
+- `conversational`: generate a short natural reply without vector retrieval or returned sources.
+- `unclear`: request clarification and explain the COBOL-analysis scope without running retrieval.
+
+The API returns `route`, `scope`, `plan`, `session_state`, `guard_status`, `trace_id`, `execution_mode`, `answer`, and `sources`. The UI labels direct-artifact, retrieved-renderer, grounded-LLM, repaired, clarification, and conversational answers. Only technical turns update structured program/entity/intent memory.
+
+`POST /api/chat` also accepts an optional `program` field. This is the program selected by a future multi-program UI and is used when the question does not explicitly name another analyzed program:
+
+```json
+{"message": "List every forced value.", "program": "PDCBVC"}
+```
+
+## Traces, Feedback, And Gold Evaluation
+
+Every answer in the configured API runtime writes a JSON trace containing the resolved scope, metadata filter, vector and lexical candidates, final context roles, corrective-retrieval decision, guard result, answer sources, and latency.
+
+```text
+GET  /api/traces
+GET  /api/traces/{trace_id}
+POST /api/feedback
+GET  /api/feedback
+```
+
+Run the PDCBVC regression suite with:
+
+```bash
+python -m cobol_rag.evaluation \
+  --config /workspace/.runs/PDCBVC/rag/config/runtime.yaml \
+  --gold evals/pdcbvc_gold.jsonl \
+  --final-scripts-dir /workspace/.runs/PDCBVC/analysis/output/combined/final_scripts/PDCBVC
+```
+
+Evaluation reports are written to the configured `paths.eval_dir`. The current 47-case suite measures route, intent, program, entities, comparison and exhaustive-result plans, source recall, execution mode, answer content, follow-up behavior, and abstention.
+
+The development gold suite must not read files under `evals/holdout`. Holdout suites are versioned and checksum-sealed; run them only after implementation is frozen:
+
+```bash
+python -m cobol_rag.holdout \
+  --config /workspace/.runs/PDCBVC/rag/config/runtime.yaml \
+  --suite evals/holdout/pdcbvc_holdout_v1.jsonl \
+  --manifest evals/holdout/pdcbvc_holdout_v1.manifest.json \
+  --output-dir /workspace/.runs/PDCBVC/rag/evals/holdout \
+  --final-scripts-dir /workspace/.runs/PDCBVC/analysis/output/combined/final_scripts/PDCBVC \
+  --acknowledge-sealed-suite
+```
+
+The checksum is verified before execution. Do not edit or tune against a failed sealed case. Move any discovered weakness into a new development regression case, implement the general fix, and measure generalization later with a new holdout version.
 
 ## Chat Workflow
 

@@ -4,100 +4,117 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from cobol_rag.final_scripts_artifacts import (
-    load_or_build_jcl_file_io,
-    load_or_build_quality_dead_code,
-    load_or_build_screen_field_lineage,
-    load_or_build_unused_copybooks,
-    program_has_jcl_evidence,
-)
+if TYPE_CHECKING:
+    from cobol_rag.query_plan import QueryPlan
 
 
-def answer_from_final_scripts(question: str) -> str | None:
+def answer_from_final_scripts(
+    question: str,
+    intent: str | None = None,
+    plan: QueryPlan | None = None,
+) -> str | None:
     root = find_final_scripts_root()
     if root is None:
         return None
-
-    unknown_program_answer = _answer_unknown_program_if_explicit(root, question)
-    if unknown_program_answer:
-        return unknown_program_answer
-
-    program = _program_for_question(root, question)
+    program = plan.program if plan and plan.program else program_from_question(question, root)
     if program is None:
         return None
+    program_root = find_program_artifact_root(root, program)
+    if program_root is None:
+        return None
+    root = program_root
 
     q = question.lower()
+    intent = plan.intent if plan else intent
+    use_text_fallback = plan is None
 
-    if _asks_about_copybooks(q) and "unused" in q:
-        answer = _answer_copybooks(root, program, q)
+    if intent == "artifact_inventory" or (use_text_fallback and _asks_about_artifact_inventory(q)):
+        answer = _answer_artifact_inventory(root, program)
         if answer:
             return answer
 
-    if _asks_about_lines_or_counts(q):
-        answer = _answer_counts(root, program, q)
+    if intent == "program_summary" or (use_text_fallback and _asks_about_program_summary(q)):
+        answer = _answer_program_summary(root, program, plan)
         if answer:
             return answer
 
-    if _asks_about_dead_or_commented_code(q):
+    # A whole-program variable question has no exact entity to look up. The
+    # generated catalogue is the authoritative source for it, so the semantic
+    # router can route here instead of forcing an entity-scoped capability.
+    if intent == "variable_inventory":
+        answer = _answer_variable_inventory(root, program, plan)
+        if answer:
+            return answer
+
+    # Exact variable scope is authoritative. Execute it before program-wide
+    # control-flow or literal handlers so a semantic classification cannot replace
+    # the named entity with an unrelated artifact family.
+    if intent == "variable_dataflow" and plan and plan.entity_values_for("variable"):
+        variable_answer = _answer_variable_access(root, program, question, plan)
+        if variable_answer:
+            return variable_answer
+
+    if intent == "business_rules" or (use_text_fallback and _asks_about_business_rules(q)):
+        answer = _answer_business_rules(root, program, plan)
+        if answer:
+            return answer
+
+    if intent == "control_flow" or (use_text_fallback and _asks_about_control_flow(q)):
+        answer = _answer_control_flow(root, program, question)
+        if answer:
+            return answer
+
+    if intent == "cics_operations" or (use_text_fallback and _asks_about_cics_operations(q)):
+        answer = _answer_cics_operations(root, program, plan)
+        if answer:
+            return answer
+
+    if intent == "dead_code" or (use_text_fallback and _asks_about_dead_or_commented_code(q)):
         answer = _answer_commented_code(root, program, q)
         if answer:
             return answer
 
-    if _asks_about_screen_field_lineage(q):
-        answer = _answer_screen_field_lineage(root, program, question)
+    if intent == "external_programs" or (use_text_fallback and _asks_about_calls(q)):
+        answer = _answer_calls(root, program, plan)
         if answer:
             return answer
 
-    answer = _answer_structured_behavior(root, program, question)
-    if answer:
-        return answer
-
-    variable_answer = _answer_variable_reference(root, program, question)
-    if variable_answer:
-        return variable_answer
-
-    if _asks_about_calls(q):
-        answer = _answer_calls(root, program)
+    if intent == "static_values" or (use_text_fallback and _asks_about_forced_values(q)):
+        answer = _answer_literal_assignments(root, program, q, plan)
         if answer:
             return answer
 
-    if _asks_about_forced_values(q):
-        answer = _answer_literal_assignments(root, program, q)
+    if intent == "copybooks" or (use_text_fallback and _asks_about_copybooks(q)):
+        answer = _answer_copybooks(root, program, q, plan)
         if answer:
             return answer
 
-    if _asks_about_copybooks(q):
-        answer = _answer_copybooks(root, program, q)
+    if intent == "db2_sql" or (use_text_fallback and _asks_about_db2_or_sql(q)):
+        answer = _answer_db2_sql(root, program, q, plan)
         if answer:
             return answer
 
-    if _asks_about_db2_or_sql(q):
-        answer = _answer_db2_sql(root, program)
-        if answer:
-            return answer
-
-    if _asks_about_datasets(q):
+    if intent in {"datasets", "datasets_tables"} or (use_text_fallback and _asks_about_datasets(q)):
         return _answer_datasets(root, program)
 
-    if _asks_about_ui_navigation(q):
+    if intent == "ui_navigation" or (use_text_fallback and _asks_about_ui_navigation(q)):
         answer = _answer_ui_navigation(root, program)
         if answer:
             return answer
 
-    if _asks_about_business_rules(q):
-        answer = _answer_business_rules(root, program)
+    if intent in {None, "source_metrics"} and _asks_about_lines_or_counts(q):
+        answer = _answer_counts(root, program, q)
         if answer:
             return answer
 
-    if _asks_about_program_overview(q, question, program):
-        answer = _answer_program_overview(root, program)
-        if answer:
-            return answer
+    if intent == "variable_dataflow" or (use_text_fallback and _asks_about_variable_access(q)):
+        variable_answer = _answer_variable_access(root, program, question, plan)
+        if variable_answer:
+            return variable_answer
 
     return None
-
 
 def find_final_scripts_root() -> Path | None:
     configured = os.environ.get("COBOL_RAG_FINAL_SCRIPTS_DIR")
@@ -121,7 +138,56 @@ def find_final_scripts_root() -> Path | None:
     return None
 
 
-def program_from_question(question: str) -> str | None:
+def find_program_artifact_root(root: Path, program: str) -> Path | None:
+    """Resolve one program's aggregate artifacts inside a single- or multi-program corpus."""
+    program = program.upper()
+    candidates = (
+        root / program,
+        root / "programs" / program / "artifacts",
+        root / "programs" / program,
+        root,
+    )
+    for candidate in candidates:
+        if _directory_contains_program(candidate, program):
+            return candidate
+
+    marker_names = (
+        "program.summary.json",
+        "architecture.copybooks.json",
+        "dataflow.literal_assignments.json",
+        "controlflow.cfg.json",
+    )
+    for marker_name in marker_names:
+        for marker in sorted(root.rglob(marker_name)):
+            payload = _read_json(marker)
+            if isinstance(payload, dict) and str(payload.get("program", "")).upper() == program:
+                return marker.parent
+    return None
+
+
+def _directory_contains_program(directory: Path, program: str) -> bool:
+    if not directory.is_dir():
+        return False
+    for path in directory.glob("*.json"):
+        payload = _read_json(path)
+        if isinstance(payload, dict) and str(payload.get("program", "")).upper() == program:
+            return True
+    return False
+
+
+def program_from_question(question: str, root: Path | None = None) -> str | None:
+    known_programs = _known_programs(root) if root is not None else set()
+    question_upper = question.upper()
+    mentioned = [
+        program
+        for program in known_programs
+        if re.search(rf"(?<![A-Z0-9-]){re.escape(program)}(?![A-Z0-9-])", question_upper)
+    ]
+    if mentioned:
+        return max(mentioned, key=len)
+    if len(known_programs) == 1:
+        return next(iter(known_programs))
+
     ignored = {
         "ABOUT",
         "ANY",
@@ -177,175 +243,45 @@ def program_from_question(question: str) -> str | None:
     return max(candidates, key=len)
 
 
-def _program_for_question(root: Path, question: str) -> str | None:
-    candidate = program_from_question(question)
-    core_programs = _core_programs_from_root(root)
-    if candidate and candidate in core_programs:
-        return candidate
-    if candidate and program_has_jcl_evidence(root, candidate):
-        return candidate
-    return _primary_program_from_root(root) or candidate
-
-
-def _answer_unknown_program_if_explicit(root: Path, question: str) -> str | None:
-    candidate = program_from_question(question)
-    if not candidate:
-        return None
-    if not _looks_like_explicit_program_reference(question, candidate):
-        return None
-    core_programs = _core_programs_from_root(root)
-    if candidate in core_programs or program_has_jcl_evidence(root, candidate):
-        return None
-    if _token_exists_in_final_scripts(root, candidate):
-        return None
-
-    indexed = sorted(core_programs)
-    close = _closest_program(candidate, indexed)
-    lines = [f"I do not have indexed analysis for `{candidate}`."]
-    if indexed:
-        lines.append(f"Indexed program(s) currently available: {', '.join(indexed)}.")
-    if close:
-        lines.append(f"Closest indexed name: `{close}`. Ask about `{close}` if that is what you meant.")
-    lines.append("Generate and index that program's analysis artifacts first, then ask again.")
-    return "\n".join(lines)
-
-
-def _looks_like_explicit_program_reference(question: str, candidate: str) -> bool:
-    q = question.lower()
-    c = candidate.lower()
-    normalized = re.sub(r"[^a-z0-9]+", " ", q).strip()
-    if normalized == c:
-        return True
-    if f"{c}.cbl" in q:
-        return True
-    if any(marker in q for marker in (f"file {c}", f"program {c}", f"code {c}", f"{c} file", f"{c} program")):
-        return True
-    return c.startswith(("pd", "px", "pr")) and any(
-        term in q
-        for term in (
-            "what does",
-            "explain",
-            "summarize",
-            "which dataset",
-            "which datasets",
-            "what dataset",
-            "what datasets",
-            "produce",
-            "produces",
-            "produced",
-            "file i/o",
-            "file io",
-        )
-    )
-
-
-def _closest_program(candidate: str, programs: list[str]) -> str | None:
-    if not programs:
-        return None
-    distances = sorted((_edit_distance(candidate, program), program) for program in programs)
-    distance, program = distances[0]
-    return program if distance <= 2 else None
-
-
-def _edit_distance(left: str, right: str) -> int:
-    if left == right:
-        return 0
-    previous = list(range(len(right) + 1))
-    for i, left_char in enumerate(left, start=1):
-        current = [i]
-        for j, right_char in enumerate(right, start=1):
-            current.append(
-                min(
-                    previous[j] + 1,
-                    current[j - 1] + 1,
-                    previous[j - 1] + (left_char != right_char),
-                )
-            )
-        previous = current
-    return previous[-1]
-
-
-def _default_program_from_root(root: Path) -> str | None:
-    primary = _primary_program_from_root(root)
-    if primary:
-        return primary
-    programs = _programs_from_root(root)
-    if len(programs) == 1:
-        return next(iter(programs))
-    return None
-
-
-def _primary_program_from_root(root: Path) -> str | None:
-    programs = _core_programs_from_root(root)
-    if not programs:
-        return None
-    return sorted(programs)[0]
-
-
-def _core_programs_from_root(root: Path) -> set[str]:
+def _known_programs(root: Path | None) -> set[str]:
+    if root is None or not root.exists():
+        return set()
     programs: set[str] = set()
-    for relative in (
-        "program_summary/program.summary.json",
-        "program.comments/program.comments.json",
-        "architecture.copybooks/architecture.copybooks.json",
-        "architecture.call_parameters/architecture.call_parameters.json",
-        "dataflow.literal_assignments/dataflow.literal_assignments.json",
-        "dataflow.used_variables/dataflow.used_variables.json",
-    ):
-        payload = _read_json(root / relative)
-        if isinstance(payload, dict):
-            program = str(payload.get("program", "")).strip().upper()
-            if program and program != "__GLOBAL__":
-                programs.add(program)
-    return programs
-
-
-def _programs_from_root(root: Path) -> set[str]:
-    programs: set[str] = set()
-    for relative in (
-        "program_summary/program.summary.json",
-        "program.comments/program.comments.json",
-        "architecture.copybooks/architecture.copybooks.json",
-        "architecture.call_parameters/architecture.call_parameters.json",
-    ):
-        payload = _read_json(root / relative)
-        if isinstance(payload, dict):
-            program = str(payload.get("program", "")).strip().upper()
-            if program and program != "__GLOBAL__":
-                programs.add(program)
-    for path in root.glob("**/*.json"):
+    candidate_files = list(root.rglob("*.json"))
+    for path in candidate_files:
         payload = _read_json(path)
-        if isinstance(payload, dict):
-            program = str(payload.get("program", "")).strip().upper()
-            if program and program != "__GLOBAL__":
-                programs.add(program)
-    return programs
-
-
-def _token_exists_in_final_scripts(root: Path, token: str) -> bool:
-    token = token.upper()
-    if not token:
-        return False
-    pattern = re.compile(rf"\b{re.escape(token)}\b", flags=re.IGNORECASE)
-    for path in root.glob("**/*.json"):
-        try:
-            if pattern.search(path.read_text(encoding="utf-8", errors="ignore")):
-                return True
-        except OSError:
+        if not isinstance(payload, dict):
             continue
-    return False
+        program = payload.get("program")
+        if isinstance(program, str) and program.strip():
+            programs.add(program.strip().upper())
+    return programs
 
 
 def _asks_about_lines_or_counts(q: str) -> bool:
-    return any(term in q for term in ("how many", "number of", "count", "loc", "lines"))
+    return (
+        any(term in q for term in ("how many", "number of", "count"))
+        or re.search(r"\b(?:loc|line|lines)\b", q) is not None
+    )
 
 
 def _asks_about_dead_or_commented_code(q: str) -> bool:
-    return any(term in q for term in ("unused code", "dead code", "unreachable", "commented-out", "commented out", "commented code"))
+    return any(term in q for term in ("unused code", "dead code", "commented-out", "commented out", "commented code"))
 
 
 def _asks_about_calls(q: str) -> bool:
     return any(term in q for term in ("call", "calls", "outside program", "external program", "commarea", "parameter"))
+
+
+def _asks_about_variable_access(q: str) -> bool:
+    return any(
+        term in q
+        for term in (
+            "modify", "modified", "write", "written", "set", "test",
+            "tested", "check", "checked", "read", "dataflow", "data flow",
+            "return value", "value returned",
+        )
+    )
 
 
 def _asks_about_forced_values(q: str) -> bool:
@@ -353,7 +289,13 @@ def _asks_about_forced_values(q: str) -> bool:
 
 
 def _asks_about_copybooks(q: str) -> bool:
-    return any(term in q for term in ("copybook", "copy book", "copy member", "copy members", "unused copy"))
+    return any(
+        term in q
+        for term in (
+            "copybook", "copy book", "copy member", "copy members", "copy statement",
+            "copy statements", "unused copy",
+        )
+    )
 
 
 def _asks_about_db2_or_sql(q: str) -> bool:
@@ -368,488 +310,505 @@ def _asks_about_ui_navigation(q: str) -> bool:
     return any(term in q for term in ("pf key", "pfkey", "screen", "map", "navigation", "cics key", "eibaid"))
 
 
-def _asks_about_screen_field_lineage(q: str) -> bool:
-    has_screen_term = any(term in q for term in ("screen", "map", "field"))
-    has_lineage_term = any(
-        term in q
-        for term in (
-            "connected",
-            "connection",
-            "variable",
-            "variables",
-            "origin",
-            "data origin",
-            "computation",
-            "computed",
-            "calculated",
-            "modified",
-            "defined",
-            "feeds",
-        )
-    )
-    return has_screen_term and has_lineage_term
-
-
 def _asks_about_business_rules(q: str) -> bool:
     return any(term in q for term in ("business rule", "business rules", "rules", "condition", "conditions"))
 
 
-def _read_json(path: Path) -> Any | None:
-    candidates = [path]
-    if len(path.parents) >= 2:
-        # Support both historical final_scripts layout:
-        #   root/program_summary/program.summary.json
-        # and generated pipeline layout:
-        #   root/program.summary.json
-        flat_candidate = path.parent.parent / path.name
-        if flat_candidate not in candidates:
-            candidates.append(flat_candidate)
-    for candidate in candidates:
-        if not candidate.exists():
-            continue
-        try:
-            return json.loads(candidate.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-    return None
-
-
-def _asks_about_program_overview(q: str, question: str, program: str) -> bool:
-    normalized = re.sub(r"[^a-z0-9]+", " ", q).strip()
-    if normalized == program.lower():
-        return True
-    if program.lower() not in q:
+def _asks_about_artifact_inventory(q: str) -> bool:
+    if _asks_about_datasets(q) or _asks_about_copybooks(q):
         return False
-    return any(
+    asks_for_files = "file" in q and any(
+        term in q for term in ("name", "names", "have", "available", "indexed", "analyzed", "analysed", "list")
+    )
+    return asks_for_files or any(
+        term in q for term in ("artifact inventory", "available artifacts", "indexed artifacts", "analyzed artifacts")
+    )
+
+
+def _asks_about_control_flow(q: str) -> bool:
+    if any(
         term in q
-        for term in (
-            "explain the code",
-            "explain code",
-            "explain the program",
-            "describe the program",
-            "summarize",
-            "summary",
-            "overview",
-            "purpose",
-            f"what is {program.lower()}",
-            f"what does {program.lower()} do",
-            f"what does the file {program.lower()} do",
-            f"what does the program {program.lower()} do",
-        )
-    )
-
-
-def _answer_program_overview(root: Path, program: str) -> str | None:
-    summary = _summary_payload(root, program)
-    if not summary:
-        return None
-
-    meta = summary.get("meta", {}) if isinstance(summary.get("meta"), dict) else {}
-    loc = meta.get("loc") or _extract_approx_loc(summary)
-    paragraphs = meta.get("paragraphs") or _extract_paragraph_count(summary)
-    statements = meta.get("statements")
-
-    lines = [f"{program} overview from the indexed analysis:"]
-    if summary.get("content"):
-        lines.append(f"- {summary.get('content')}")
-    metric_parts = []
-    if loc is not None:
-        metric_parts.append(f"{loc} LOC")
-    if statements is not None:
-        metric_parts.append(f"{statements} statements")
-    if paragraphs is not None:
-        metric_parts.append(f"{paragraphs} paragraphs")
-    if metric_parts:
-        lines.append(f"- Size: {', '.join(str(part) for part in metric_parts)}.")
-
-    calls = _calls(root, program)
-    if calls:
-        call_bits = []
-        for call in calls[:8]:
-            target = call.get("target", "?")
-            call_type = call.get("call_type", "?")
-            paragraph = call.get("paragraph", "?")
-            call_bits.append(f"{target} ({call_type} in {paragraph})")
-        lines.append(f"- External interactions: {len(calls)} outgoing call(s): {', '.join(call_bits)}.")
-
-    copybooks = _read_json(root / "architecture.copybooks" / "architecture.copybooks.json")
-    if isinstance(copybooks, dict) and copybooks.get("program") == program:
-        all_copybooks = copybooks.get("content", {}).get("all", [])
-        if all_copybooks:
-            lines.append(f"- COPY usage: {len(all_copybooks)} COPY member(s): {', '.join(all_copybooks)}.")
-
-    comments = _comments_payload(root, program)
-    if comments:
-        comment_count = comments.get("count")
-        commented_out = comments.get("classification_counts", {}).get("commented_out_code")
-        comment_bits = []
-        if comment_count is not None:
-            comment_bits.append(f"{comment_count} comment lines")
-        if commented_out is not None:
-            comment_bits.append(f"{commented_out} commented-out code/data item(s)")
-        if comment_bits:
-            lines.append(f"- Comment evidence: {', '.join(comment_bits)}.")
-
-    _append_evidence(
-        lines,
-        [
-            _cite("program_summary/program.summary.json", detail="program overview"),
-            _cite("architecture.call_parameters/architecture.call_parameters.json", detail="outgoing calls"),
-            _cite("architecture.copybooks/architecture.copybooks.json", detail="COPY usage"),
-            _cite("program.comments/program.comments.json", detail="comment metrics"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _cfg_edges(root: Path, program: str) -> list[dict[str, Any]]:
-    payload = _read_json(root / "controlflow.cfg" / "controlflow.cfg.json")
-    if not isinstance(payload, dict) or payload.get("program") != program:
-        return []
-    return [edge for edge in payload.get("edges", []) if isinstance(edge, dict)]
-
-
-def _literal_items(root: Path, program: str, paragraph: str | None = None) -> list[dict[str, Any]]:
-    payload = _read_json(root / "dataflow.literal_assignments" / "dataflow.literal_assignments.json")
-    if not isinstance(payload, dict) or payload.get("program") != program:
-        return []
-    items = [item for item in payload.get("assignments", []) if isinstance(item, dict)]
-    if paragraph:
-        items = [item for item in items if item.get("paragraph") == paragraph]
-    return items
-
-
-def _call_by_target(root: Path, program: str, target: str) -> dict[str, Any] | None:
-    for call in _calls(root, program):
-        if str(call.get("target", "")).upper() == target.upper():
-            return call
-    return None
-
-
-def _calls(root: Path, program: str) -> list[dict[str, Any]]:
-    payload = _read_json(root / "architecture.call_parameters" / "architecture.call_parameters.json")
-    if not isinstance(payload, dict) or payload.get("program") != program:
-        return []
-    return [call for call in payload.get("calls", []) if isinstance(call, dict)]
-
-
-def _variable_payload(root: Path, program: str, variable: str) -> dict[str, Any] | None:
-    path = root / "dataflow.variable" / f"dataflow.variable.{variable.upper()}.json"
-    payload = _read_json(path)
-    if isinstance(payload, dict) and payload.get("program") == program:
-        return payload
-    return None
-
-
-def _site_lines(
-    payload: dict[str, Any],
-    site_key: str,
-    *,
-    limit: int = 6,
-    indent: str = "",
-) -> list[str]:
-    sites = payload.get("content", {}).get("evidence", {}).get(site_key, [])
-    lines: list[str] = []
-    for site in sites[:limit]:
-        line = site.get("line_start", "?")
-        paragraph = site.get("paragraph", "?")
-        statement = str(site.get("statement", "")).strip()
-        citation = _site_citation(payload, line)
-        suffix = f" [{citation}]" if citation else ""
-        lines.append(f"{indent}- line {line} `{paragraph}`: {statement}{suffix}")
-    if not lines:
-        lines.append(f"{indent}- none")
-    return lines
-
-
-def _site_citation(payload: dict[str, Any], line: Any) -> str:
-    variable = str(payload.get("content", {}).get("variable", "")).upper()
-    if variable:
-        return _cite(f"dataflow.variable/dataflow.variable.{variable}.json", line=line)
-    return ""
-
-
-def _cite(path: str, *, line: Any | None = None, detail: str | None = None) -> str:
-    parts = [path]
-    if line not in (None, "", -1, "?"):
-        parts.append(f"line {line}")
-    if detail:
-        parts.append(detail)
-    return " | ".join(parts)
-
-
-def _append_evidence(lines: list[str], evidence: list[str], *, limit: int = 8) -> None:
-    unique = []
-    seen = set()
-    for item in evidence:
-        if not item or item in seen:
-            continue
-        seen.add(item)
-        unique.append(item)
-    if not unique:
-        return
-    lines.append("")
-    lines.append("Evidence:")
-    for item in unique[:limit]:
-        lines.append(f"- {item}")
-
-
-def _line_from_site_list(payload: dict[str, Any], key: str) -> Any | None:
-    for site in payload.get("content", {}).get("evidence", {}).get(key, []):
-        line = site.get("line_start")
-        if isinstance(line, int) and line > 0:
-            return line
-    return None
-
-
-def _variables_in_question(question: str) -> list[str]:
-    ignored = {
-        "PDCBVC", "COBOL", "CBL", "BROWSE-FASE1", "BROWSE-FASE2", "ENTER",
-        "PF1", "PF2", "PF3", "PF4", "PF7", "PF8", "PF9", "CONTROL-FLOW", "WHEN", "WHETHER", "WHICH",
-        "WHERE", "WHAT", "WITH", "WRITTEN", "PRESSES", "PRESSED", "PRESSING",
-        "USER", "INTERACTIONS", "MAINTAINED", "CALCULATED",
-    }
-    names: list[str] = []
-    for token in re.findall(r"\b[A-Z][A-Z0-9-]{2,}\b", question.upper()):
-        if token not in ignored and ("-" in token or token.startswith(("W", "PD", "TWCOB", "PX", "SQL"))):
-            names.append(token)
-    return list(dict.fromkeys(names))
-
-
-def _known_variables(root: Path, program: str) -> set[str]:
-    dataflow_dir = root / "dataflow.variable"
-    return {
-        path.name.removeprefix("dataflow.variable.").removesuffix(".json").upper()
-        for path in dataflow_dir.glob("dataflow.variable.*.json")
-        if path.is_file()
-    }
-
-
-def _call_targets(root: Path, program: str) -> set[str]:
-    return {
-        str(call.get("target", "")).strip().upper()
-        for call in _calls(root, program)
-        if str(call.get("target", "")).strip()
-    }
-
-
-def _copybook_names(root: Path, program: str) -> set[str]:
-    payload = _read_json(root / "architecture.copybooks" / "architecture.copybooks.json")
-    if not isinstance(payload, dict) or payload.get("program") != program:
-        return set()
-    return {
-        str(name).strip().upper()
-        for name in payload.get("content", {}).get("all", [])
-        if str(name).strip()
-    }
-
-
-def _db2_table_names(root: Path, program: str) -> set[str]:
-    names: set[str] = set()
-    for path in (root / "architecture.db2_table").glob("architecture.db2_table.*.json"):
-        payload = _read_json(path)
-        if not isinstance(payload, dict) or payload.get("program") != program:
-            continue
-        content = payload.get("content", {})
-        name = str(content.get("table") or content.get("name") or "").strip().upper()
-        if name:
-            names.add(name)
-    return names
-
-
-def _sql_include_names(root: Path, program: str) -> set[str]:
-    names: set[str] = set()
-    for path in (root / "architecture.sqlinclude").glob("architecture.sqlinclude.*.json"):
-        payload = _read_json(path)
-        if not isinstance(payload, dict) or payload.get("program") != program:
-            continue
-        content = payload.get("content", {})
-        name = str(content.get("include") or content.get("name") or "").strip().upper()
-        if name:
-            names.add(name)
-    return names
-
-
-def _variable_reference_tokens(question: str) -> list[str]:
-    ignored = {
-        "ABOUT",
-        "COBOL",
-        "CODE",
-        "DOES",
-        "FILE",
-        "FUNCTION",
-        "INTERACTIONS",
-        "MAINTAINED",
-        "METHOD",
-        "PRESSED",
-        "PRESSES",
-        "PRESSING",
-        "PROGRAM",
-        "REPOSITORY",
-        "STORES",
-        "STORE",
-        "USER",
-        "WHAT",
-        "WHEN",
-        "WHETHER",
-        "WHERE",
-        "WHICH",
-        "WRITTEN",
-    }
-    tokens = [
-        token
-        for token in re.findall(r"\b[A-Z][A-Z0-9-]{2,}\b", question.upper())
-        if token not in ignored
-    ]
-    return list(dict.fromkeys(tokens))
-
-
-def _looks_like_variable_reference_question(q: str) -> bool:
-    return any(
-        term in q
-        for term in (
-            "what does",
-            "what is",
-            "what stores",
-            "stores",
-            "store",
-            "variable",
-            "field",
-            "calculated",
-            "computed",
-            "feed",
-            "feeds",
-            "set",
-            "used",
-            "modified",
-            "read",
-            "written",
-            "origin",
-            "value",
-        )
-    )
-
-
-def _answer_variable_reference(root: Path, program: str, question: str) -> str | None:
-    q = question.lower()
-    if not _looks_like_variable_reference_question(q):
-        return None
-
-    known = _known_variables(root, program)
-    if not known:
-        return None
-
-    secondary_entities = (
-        _call_targets(root, program)
-        | _copybook_names(root, program)
-        | _db2_table_names(root, program)
-        | _sql_include_names(root, program)
-    )
-    tokens = _variable_reference_tokens(question)
-    variables = [_variable_payload(root, program, token) for token in tokens if token in known]
-    variables = [variable for variable in variables if variable]
-    if variables:
-        lines = [f"{program} variable evidence:"]
-        for variable in variables[:4]:
-            lines.append(_format_variable_lineage(program, variable))
-        return "\n\n".join(lines)
-
-    unknowns = [
-        token
-        for token in tokens
-        if token not in {program, "PDCBVC", "COBOL", "CBL"} and _looks_like_variable_name(token)
-        and token not in secondary_entities
-    ]
-    if not unknowns:
-        return None
-    unknown = unknowns[0]
-    close = _closest_program(unknown, sorted(known))
-    lines = [f"I do not have indexed dataflow evidence for variable `{unknown}` in `{program}`."]
-    if close:
-        lines.append(f"Closest indexed variable: `{close}`. Ask about `{close}` if that is what you meant.")
-    lines.append("I will not infer a meaning from the name alone; check the variable name or regenerate the analysis artifacts if this variable should exist.")
-    return "\n".join(lines)
-
-
-def _looks_like_variable_name(token: str) -> bool:
-    if "-" in token:
+        for term in ("control flow", "execution flow", "entry point", "flow from", "path to termination")
+    ):
         return True
-    return token.startswith(("W", "PD", "TWCOB", "PX", "SQL", "FUNZ", "M1", "SCELTA"))
+    return (
+        any(term in q for term in ("decide whether", "choose between", "start from", "branch to", "path between"))
+        and any(term in q for term in ("paragraph", "fase", "phase", "branch", "path", "start"))
+    )
 
 
-def _paragraph_names(root: Path, program: str) -> set[str]:
-    names: set[str] = set()
-    for edge in _cfg_edges(root, program):
-        for key in ("from", "to"):
-            value = str(edge.get(key, "")).strip().upper()
-            if value and value != program:
-                names.add(value)
-    for item in _literal_items(root, program):
-        paragraph = str(item.get("paragraph", "")).strip().upper()
-        if paragraph:
-            names.add(paragraph)
-    for call in _calls(root, program):
-        paragraph = str(call.get("paragraph", "")).strip().upper()
-        if paragraph:
-            names.add(paragraph)
-    return names
+def _asks_about_program_summary(q: str) -> bool:
+    return any(
+        term in q
+        for term in ("program about", "what is the program", "what does the program", "program purpose", "purpose of program", "program overview", "program summary")
+    )
 
 
-def _paragraphs_in_question(root: Path, program: str, question: str) -> list[str]:
-    known = _paragraph_names(root, program)
-    found = [
-        token
-        for token in re.findall(r"\b[A-Z][A-Z0-9-]{2,}\b", question.upper())
-        if token in known
-    ]
-    return list(dict.fromkeys(found))
+def _asks_about_cics_operations(q: str) -> bool:
+    return "cics" in q and any(term in q for term in ("command", "commands", "operation", "operations", "execute", "executes", "used"))
 
 
-def _call_target_in_question(root: Path, program: str, question: str) -> str | None:
-    targets = {str(call.get("target", "")).upper() for call in _calls(root, program)}
-    tokens = set(re.findall(r"\b[A-Z][A-Z0-9]{3,}\b", question.upper()))
-    matches = sorted(targets & tokens, key=len, reverse=True)
-    return matches[0] if matches else None
+def _read_json(path: Path) -> Any | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _artifact_path(root: Path, flat_name: str, nested_name: str | None = None) -> Path:
+    """Resolve both the current flat aggregate layout and the legacy nested layout."""
+    flat = root / flat_name
+    if flat.exists():
+        return flat
+    nested = nested_name or flat_name
+    return root / flat_name.removesuffix(".json") / nested
 
 
 def _comments_payload(root: Path, program: str) -> dict[str, Any] | None:
-    payload = _read_json(root / "program.comments" / "program.comments.json")
+    payload = _read_json(_artifact_path(root, "program.comments.json"))
     if isinstance(payload, dict) and payload.get("program") == program:
         return payload
     return None
 
 
 def _summary_payload(root: Path, program: str) -> dict[str, Any] | None:
-    payload = _read_json(root / "program_summary" / "program.summary.json")
+    payload = _read_json(_artifact_path(root, "program.summary.json"))
     if isinstance(payload, dict) and payload.get("program") == program:
         return payload
     return None
 
 
+def _answer_variable_inventory(
+    root: Path,
+    program: str,
+    plan: QueryPlan | None = None,
+) -> str | None:
+    """Answer whole-program variable questions from the generated variable catalogue."""
+    payload = _read_json(_artifact_path(root, "dataflow.used_variables.json"))
+    if not isinstance(payload, dict) or payload.get("program") != program:
+        return None
+    entries = [item for item in payload.get("variables", []) if isinstance(item, dict)]
+    if not entries:
+        return None
+
+    requested_fields = set(plan.output_fields) if plan else set()
+    exhaustive = bool(plan and plan.result_scope == "all")
+    origin_filter = {
+        section.replace(" SECTION", "").strip().upper()
+        for section in (plan.sections if plan else ())
+    }
+    if origin_filter:
+        entries = [
+            item for item in entries
+            if str(item.get("origin", "")).strip().upper() in origin_filter
+        ]
+        if not entries:
+            return None
+    if plan and "control_usage" in requested_fields:
+        entries = [item for item in entries if item.get("controls_flow")]
+        if not entries:
+            return None
+
+    total = len(entries)
+    limit = total if exhaustive else min(total, 25)
+    lines = [f"{program} declares {total} analyzed variable(s)."]
+    for item in entries[:limit]:
+        name = str(item.get("variable", "")).strip()
+        if not name:
+            continue
+        details: list[str] = []
+        origin = str(item.get("origin", "")).strip()
+        if origin and origin.upper() != "UNKNOWN":
+            details.append(origin)
+        if item.get("controls_flow"):
+            details.append("controls flow")
+        defined_in = [str(value) for value in item.get("defined_in", []) if value]
+        if defined_in and "paragraph" in requested_fields:
+            details.append(f"defined in {', '.join(defined_in)}")
+        lines.append(f"- {name}" + (f" ({'; '.join(details)})" if details else ""))
+    if limit < total:
+        lines.append(
+            f"Showing the first {limit} of {total} analyzed variables. "
+            "Ask for all of them to receive the complete list."
+        )
+    lines.append("Source: `dataflow.used_variables.json`.")
+    return "\n".join(lines)
+
+
+def _answer_artifact_inventory(root: Path, program: str) -> str | None:
+    top_level: list[str] = []
+    for path in sorted(root.glob("*.json")):
+        payload = _read_json(path)
+        if isinstance(payload, dict) and str(payload.get("program", "")).upper() == program:
+            top_level.append(path.name)
+
+    detail_groups: list[tuple[str, int]] = []
+    for directory in sorted(path for path in root.iterdir() if path.is_dir()):
+        count = 0
+        for path in directory.glob("*.json"):
+            payload = _read_json(path)
+            if isinstance(payload, dict) and str(payload.get("program", "")).upper() == program:
+                count += 1
+        if count:
+            detail_groups.append((directory.name, count))
+
+    if not top_level and not detail_groups:
+        return None
+    lines = [f"Analyzed evidence available for {program}:"]
+    if top_level:
+        lines.append("Aggregate files:")
+        lines.extend(f"- `{name}`" for name in top_level)
+    if detail_groups:
+        lines.append("Detailed artifact groups:")
+        lines.extend(f"- `{name}/` — {count} JSON file(s)" for name, count in detail_groups)
+    lines.append("This is the evidence inventory exposed to the assistant for the selected program.")
+    return "\n".join(lines)
+
+
+def _program_character(root: Path, program: str) -> str:
+    """Describe what kind of program this is from the evidence that exists for it."""
+    traits: list[str] = []
+    cics = _read_json(_artifact_path(root, "architecture.cics_operations.json"))
+    if isinstance(cics, dict) and cics.get("program") == program:
+        traits.append("CICS online program")
+    else:
+        traits.append("COBOL program")
+    db2_root = root / "architecture.db2_table"
+    if db2_root.is_dir() and any(db2_root.glob("*.json")):
+        traits.append("with DB2 access")
+    return " ".join(traits)
+
+
+def _program_size_summary(root: Path, program: str, meta: dict[str, Any]) -> str:
+    """Report recorded size, naming disagreeing analyzers instead of picking one.
+
+    The MAPA record and the control-flow graph do not agree on paragraph counts.
+    Presenting one number as fact states something the evidence does not support.
+    """
+    parts: list[str] = []
+    loc = meta.get("loc")
+    statements = meta.get("statements")
+    if isinstance(loc, int):
+        parts.append(f"{loc} lines of code")
+    if isinstance(statements, int):
+        parts.append(f"{statements} statements")
+    size = f"Recorded size: {', '.join(parts)}." if parts else ""
+
+    mapa_paragraphs = meta.get("paragraphs")
+    graph_nodes: int | None = None
+    quality = _read_json(_artifact_path(root, "quality.dead_code.json"))
+    if isinstance(quality, dict) and quality.get("program") == program:
+        reachability = quality.get("content", {}).get("cfg_reachability", {})
+        if isinstance(reachability, dict) and isinstance(reachability.get("nodes_count"), int):
+            graph_nodes = reachability["nodes_count"]
+    if isinstance(mapa_paragraphs, int) and graph_nodes and graph_nodes != mapa_paragraphs:
+        size += (
+            f" Paragraph counts differ between analyzers: the MAPA record lists "
+            f"{mapa_paragraphs}, while the control-flow graph contains {graph_nodes} nodes."
+        )
+    elif isinstance(mapa_paragraphs, int):
+        size += f" {mapa_paragraphs} paragraphs."
+    return size.strip()
+
+
+def _program_composition_facts(root: Path, program: str) -> tuple[list[str], list[str]]:
+    """Summarize a program from the artifacts already computed for it."""
+    facts: list[str] = []
+    sources: list[str] = []
+
+    variables = _read_json(_artifact_path(root, "dataflow.used_variables.json"))
+    if isinstance(variables, dict) and variables.get("program") == program:
+        entries = [item for item in variables.get("variables", []) if isinstance(item, dict)]
+        if entries:
+            controlling = sum(1 for item in entries if item.get("controls_flow"))
+            facts.append(
+                f"{len(entries)} analyzed variables"
+                + (f", {controlling} of which control execution" if controlling else "")
+            )
+            sources.append("dataflow.used_variables.json")
+
+    calls_payload = _read_json(_artifact_path(root, "architecture.call_parameters.json"))
+    if isinstance(calls_payload, dict) and calls_payload.get("program") == program:
+        targets = list(dict.fromkeys(
+            str(call.get("target"))
+            for call in calls_payload.get("calls", [])
+            if isinstance(call, dict) and call.get("target")
+        ))
+        if targets:
+            facts.append(f"{len(targets)} outgoing calls: {', '.join(targets)}")
+            sources.append("architecture.call_parameters.json")
+
+    copybooks = _read_json(_artifact_path(root, "architecture.copybooks.json"))
+    if isinstance(copybooks, dict) and copybooks.get("program") == program:
+        members = [str(value) for value in copybooks.get("content", {}).get("all", []) if value]
+        if members:
+            facts.append(f"{len(members)} copybooks included")
+            sources.append("architecture.copybooks.json")
+
+    cics = _read_json(_artifact_path(root, "architecture.cics_operations.json"))
+    if isinstance(cics, dict) and cics.get("program") == program:
+        content = cics.get("content", {})
+        operations = [item for item in content.get("operations", []) if isinstance(item, dict)]
+        commands = [str(value) for value in content.get("commands", []) if value]
+        if operations:
+            facts.append(
+                f"{len(operations)} CICS operations"
+                + (f" covering {', '.join(commands)}" if commands else "")
+            )
+            sources.append("architecture.cics_operations.json")
+
+    literals = _read_json(_artifact_path(root, "dataflow.literal_assignments.json"))
+    if isinstance(literals, dict) and literals.get("program") == program:
+        assignments = [item for item in literals.get("assignments", []) if isinstance(item, dict)]
+        if assignments:
+            facts.append(f"{len(assignments)} forced literal values")
+            sources.append("dataflow.literal_assignments.json")
+
+    rule_root = root / "business_rule"
+    if rule_root.is_dir():
+        rules = [
+            path for path in rule_root.glob("*.json")
+            if isinstance(_read_json(path), dict)
+            and _read_json(path).get("program") == program
+        ]
+        if rules:
+            facts.append(f"{len(rules)} recorded business rules")
+            sources.append("business_rule/")
+
+    return facts, sources
+
+
+def _answer_program_summary(
+    root: Path,
+    program: str,
+    plan: QueryPlan | None = None,
+) -> str | None:
+    payload_path = _artifact_path(root, "program.summary.json")
+    payload = _read_json(payload_path)
+    if not isinstance(payload, dict) or payload.get("program") != program:
+        return None
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    composition, sources = _program_composition_facts(root, program)
+    character = _program_character(root, program)
+    if not composition and not meta:
+        return None
+
+    lines = [f"{program} technical overview{f' ({character})' if character else ''}:"]
+    size = _program_size_summary(root, program, meta)
+    if size:
+        lines.append(size)
+    if composition:
+        lines.append("Analyzed content:")
+        lines.extend(f"- {item}" for item in composition)
+    lines.append(
+        "This is a structural overview from the analyzed evidence; it does not by "
+        "itself prove a business-domain purpose."
+    )
+    cited = ", ".join(f"`{name}`" for name in dict.fromkeys([payload_path.name, *sources]))
+    lines.append(f"Sources: {cited}.")
+    variable_entities = plan.entity_values_for("variable") if plan else ()
+    if variable_entities:
+        focused = _answer_variable_access(root, program, " ".join(variable_entities), plan)
+        if focused:
+            lines.extend(("", "Requested variable focus:", focused))
+    return "\n".join(lines)
+
+
+def _answer_control_flow(root: Path, program: str, question: str = "") -> str | None:
+    cfg_path = _artifact_path(root, "controlflow.cfg.json")
+    cfg = _read_json(cfg_path)
+    if not isinstance(cfg, dict) or cfg.get("program") != program:
+        return None
+    edges = [edge for edge in cfg.get("edges", []) if isinstance(edge, dict)]
+    selection = _answer_control_flow_selection(cfg_path, cfg, program, question, edges)
+    if selection:
+        return selection
+    entry_edges = _unique_flow_edges(edge for edge in edges if edge.get("from") == program)
+    phase_names = [
+        str(edge.get("to"))
+        for edge in entry_edges
+        if str(edge.get("to", "")).startswith("BROWSE-FASE")
+    ]
+
+    lines = [f"{program} control flow from entry to exit:", "Entry transitions:"]
+    lines.extend(_format_flow_edge(edge) for edge in entry_edges)
+    for phase in phase_names:
+        phase_edges = _unique_flow_edges(edge for edge in edges if edge.get("from") == phase)
+        lines.append(f"{phase} transitions:")
+        lines.extend(_format_flow_edge(edge) for edge in phase_edges)
+
+    cics_path = _artifact_path(root, "architecture.cics_operations.json")
+    cics = _read_json(cics_path)
+    terminal_by_paragraph: dict[str, list[str]] = {}
+    if isinstance(cics, dict) and cics.get("program") == program:
+        for operation in cics.get("content", {}).get("operations", []):
+            command = str(operation.get("command", ""))
+            if command not in {"RETURN", "XCTL", "ABEND"}:
+                continue
+            paragraph = str(operation.get("paragraph") or "unknown")
+            location = _cics_location(operation)
+            terminal_by_paragraph.setdefault(paragraph, []).append(f"{command} at {location}")
+    if terminal_by_paragraph or "FINE-ELABORAZIONE" in cfg.get("nodes", []):
+        lines.append("Exit/termination points:")
+        for paragraph, operations in sorted(terminal_by_paragraph.items()):
+            lines.append(f"- {paragraph}: {', '.join(operations)}")
+        if "FINE-ELABORAZIONE" in cfg.get("nodes", []):
+            lines.append("- FINE-ELABORAZIONE: STOP RUN terminal node in the control-flow graph")
+    lines.append(f"Source artifacts: `{cfg_path.name}` and `{cics_path.name}`.")
+    return "\n".join(lines)
+
+
+def _answer_control_flow_selection(
+    cfg_path: Path,
+    cfg: dict[str, Any],
+    program: str,
+    question: str,
+    edges: list[dict[str, Any]],
+) -> str | None:
+    q = question.lower()
+    if not any(term in q for term in ("decide", "choose", "whether", "start from", "branch", "between")):
+        return None
+    upper = question.upper()
+    node_names = [
+        str(node.get("id") if isinstance(node, dict) else node).upper()
+        for node in cfg.get("nodes", [])
+    ]
+    mentioned = [
+        node
+        for node in node_names
+        if node != program
+        and re.search(rf"(?<![A-Z0-9-]){re.escape(node)}(?![A-Z0-9-])", upper)
+    ]
+    mentioned = list(dict.fromkeys(mentioned))
+    mentioned.sort(key=upper.find)
+    if len(mentioned) < 2:
+        return None
+
+    predecessor_sets = [
+        {str(edge.get("from")) for edge in edges if str(edge.get("to")) == target}
+        for target in mentioned
+    ]
+    common = set.intersection(*predecessor_sets) if predecessor_sets else set()
+    if not common:
+        return None
+    predecessor = program if program in common else sorted(common)[0]
+    selected_edges = _unique_flow_edges(
+        edge
+        for edge in edges
+        if str(edge.get("from")) == predecessor and str(edge.get("to")) in mentioned
+    )
+    if len({str(edge.get("to")) for edge in selected_edges}) < len(mentioned):
+        return None
+
+    lines = [f"{program} selects between {', '.join(mentioned)} from {predecessor}:"]
+    lines.extend(_format_flow_edge(edge) for edge in selected_edges)
+    fallback_edges = _unique_flow_edges(
+        edge
+        for edge in edges
+        if str(edge.get("from")) == predecessor
+        and str(edge.get("to")) not in mentioned
+        and edge.get("condition")
+    )
+    if fallback_edges:
+        lines.append("Other explicitly conditioned outcome(s) from the same decision point:")
+        lines.extend(_format_flow_edge(edge) for edge in fallback_edges)
+    lines.append(f"Source artifact: `{cfg_path.name}`.")
+    return "\n".join(lines)
+
+
+def _unique_flow_edges(raw_edges: Any) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for edge in raw_edges:
+        key = (
+            str(edge.get("to", "")),
+            str(edge.get("type", "")),
+            str(edge.get("condition", "")),
+            str(edge.get("evidence", "")),
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(edge)
+    return unique
+
+
+def _format_flow_edge(edge: dict[str, Any]) -> str:
+    condition = str(edge.get("condition") or "")
+    prefix = f"when {condition}, " if condition else ""
+    evidence = str(edge.get("evidence") or "no statement captured")
+    return f"- {prefix}{edge.get('type', '?')} to {edge.get('to', '?')} — {evidence}"
+
+
+def _answer_cics_operations(
+    root: Path,
+    program: str,
+    plan: QueryPlan | None = None,
+) -> str | None:
+    payload_path = _artifact_path(root, "architecture.cics_operations.json")
+    payload = _read_json(payload_path)
+    if not isinstance(payload, dict) or payload.get("program") != program:
+        return None
+    operations = [
+        item for item in payload.get("content", {}).get("operations", [])
+        if isinstance(item, dict)
+    ]
+    if plan and plan.operations:
+        allowed = {value for value in plan.operations if value.upper() == value}
+        if allowed:
+            operations = [item for item in operations if str(item.get("command", "")).upper() in allowed]
+    if plan and plan.excluded_operations:
+        excluded = set(plan.excluded_operations)
+        operations = [item for item in operations if str(item.get("command", "")).upper() not in excluded]
+    if not operations:
+        requested = ", ".join(plan.operations) if plan and plan.operations else "CICS operations"
+        return f"No source-backed {requested} operation matched in {program}. Source: `{payload_path.name}`."
+    commands = list(dict.fromkeys(str(item.get("command", "")) for item in operations))
+    lines = [
+        f"{program} executes {len(commands)} requested CICS command type(s) across {len(operations)} source-backed operations:"
+    ]
+    for operation in operations:
+        command = operation.get("command")
+        paragraph = operation.get("paragraph")
+        statement = operation.get("statement")
+        lines.append(
+            f"- {command} in {paragraph}: "
+            f"{_cics_location(operation)} — `{statement}`"
+        )
+    lines.append(f"Source artifact: `{payload_path.name}`.")
+    return "\n".join(lines)
+
+
+def _cics_location(operation: dict[str, Any]) -> str:
+    source_file = str(operation.get("source_file") or "unknown source")
+    line_start = operation.get("line_start", "?")
+    line_end = operation.get("line_end", line_start)
+    line_label = f"line {line_start}" if line_start == line_end else f"lines {line_start}-{line_end}"
+    included_at = operation.get("included_at_line")
+    if included_at is not None:
+        return f"{source_file} {line_label}, included by the main source at line {included_at}"
+    return f"{source_file} {line_label}"
+
+
 def _answer_counts(root: Path, program: str, q: str) -> str | None:
     comments = _comments_payload(root, program)
     summary = _summary_payload(root, program)
-    copybooks = _read_json(root / "architecture.copybooks" / "architecture.copybooks.json")
-    calls = _read_json(root / "architecture.call_parameters" / "architecture.call_parameters.json")
-    literals = _read_json(root / "dataflow.literal_assignments" / "dataflow.literal_assignments.json")
+    copybooks = _read_json(_artifact_path(root, "architecture.copybooks.json"))
+    calls = _read_json(_artifact_path(root, "architecture.call_parameters.json"))
+    literals = _read_json(_artifact_path(root, "dataflow.literal_assignments.json"))
 
     if "copy" in q and isinstance(copybooks, dict):
         all_copybooks = copybooks.get("content", {}).get("all", [])
-        lines = [f"{program} has {len(all_copybooks)} COPY members listed: {', '.join(all_copybooks)}."]
-        _append_evidence(lines, [_cite("architecture.copybooks/architecture.copybooks.json", detail="content.all")])
-        return "\n".join(lines)
+        return f"{program} has {len(all_copybooks)} COPY members listed: {', '.join(all_copybooks)}."
 
     if ("call" in q or "external" in q or "outside" in q) and isinstance(calls, dict):
         call_items = calls.get("calls", [])
-        lines = [f"{program} has {len(call_items)} outgoing calls in `architecture.call_parameters.json`."]
-        _append_evidence(lines, [_cite("architecture.call_parameters/architecture.call_parameters.json", detail="calls")])
-        return "\n".join(lines)
+        return f"{program} has {len(call_items)} outgoing calls in `architecture.call_parameters.json`."
 
     if ("literal" in q or "forced" in q or "hardcoded" in q) and isinstance(literals, dict):
         items = literals.get("assignments", [])
-        lines = [f"{program} has {len(items)} literal assignments in `dataflow.literal_assignments.json`."]
-        _append_evidence(lines, [_cite("dataflow.literal_assignments/dataflow.literal_assignments.json", detail="assignments")])
-        return "\n".join(lines)
+        return f"{program} has {len(items)} literal assignments in `dataflow.literal_assignments.json`."
 
     if comments and any(term in q for term in ("line", "lines", "loc", "code")):
         total_lines = comments.get("metrics", {}).get("total_lines")
@@ -869,15 +828,7 @@ def _answer_counts(root: Path, program: str, q: str) -> str | None:
         if commented_out is not None:
             parts.append(f"{commented_out} comments are classified as commented-out code.")
         if parts:
-            lines = [" ".join(parts)]
-            _append_evidence(
-                lines,
-                [
-                    _cite("program.comments/program.comments.json", detail="metrics.total_lines/count/classification_counts"),
-                    _cite("program_summary/program.summary.json", detail="content"),
-                ],
-            )
-            return "\n".join(lines)
+            return " ".join(parts)
 
     return None
 
@@ -886,7 +837,11 @@ def _extract_approx_loc(summary: dict[str, Any] | None) -> int | None:
     if not summary:
         return None
     text = str(summary.get("content", ""))
-    match = re.search(r"approximately\s+(\d+)\s+LOC", text, flags=re.IGNORECASE)
+    match = re.search(
+        r"(?:approximately\s+|about\s+|with\s+)?(\d+)\s+LOC",
+        text,
+        flags=re.IGNORECASE,
+    )
     return int(match.group(1)) if match else None
 
 
@@ -899,50 +854,77 @@ def _extract_paragraph_count(summary: dict[str, Any] | None) -> int | None:
 
 
 def _answer_commented_code(root: Path, program: str, q: str) -> str | None:
-    artifact = load_or_build_quality_dead_code(root, program)
-    content = artifact.get("content", {})
-    commented = content.get("commented_out_code", [])
-    if not isinstance(commented, list):
-        commented = []
-    reachability = content.get("cfg_reachability", {})
-    if "dead code" in q or "unreachable" in q:
-        lines = [
-            f"{program} dead-code evidence from `quality.dead_code`:",
-            f"- commented-out code/data: {len(commented)} item(s).",
-            (
-                f"- CFG reachability: {reachability.get('unreachable_nodes_count', 0)} unreachable "
-                f"paragraph/node(s) among {reachability.get('nodes_count', 0)} CFG nodes."
-            ),
-            "- Limitation: static CFG reachability is not a runtime execution proof.",
-        ]
-    else:
-        lines = [f"Commented-out code/data found in {program}: {len(commented)} item(s)."]
+    comments = _comments_payload(root, program)
+    if not comments:
+        return None
+    commented = [
+        comment for comment in comments.get("comments", [])
+        if comment.get("classification") == "commented_out_code"
+    ]
+    lines = [f"Commented-out code/data found in {program}: {len(commented)} item(s)."]
     for comment in commented[:20]:
-        citation = comment.get("citation") or _cite("program.comments/program.comments.json", line=comment.get("line"))
-        lines.append(f"- line {comment.get('line')}: {str(comment.get('text', '')).strip()} [{citation}]")
+        lines.append(f"- line {comment.get('line')}: {str(comment.get('text_raw') or comment.get('text', '')).strip()}")
+    if len(commented) > 20:
+        lines.append(f"Showing the first 20 of {len(commented)} items.")
+    lines.append("Source: `program.comments.json`.")
     if "copy" in q:
         copy_answer = _answer_copybooks(root, program, q)
         if copy_answer:
             lines.append("")
             lines.append(copy_answer)
-    _append_evidence(
-        lines,
-        [
-            _cite("quality.dead_code/quality.dead_code.json", detail="derived artifact"),
-            _cite("program.comments/program.comments.json", detail="commented_out_code"),
-            _cite("controlflow.cfg/controlflow.cfg.json", detail="CFG reachability"),
-        ],
-    )
     return "\n".join(lines)
 
 
-def _answer_calls(root: Path, program: str) -> str | None:
-    payload = _read_json(root / "architecture.call_parameters" / "architecture.call_parameters.json")
+def _answer_calls(
+    root: Path,
+    program: str,
+    plan: QueryPlan | None = None,
+) -> str | None:
+    payload_path = _artifact_path(root, "architecture.call_parameters.json")
+    payload = _read_json(payload_path)
     if not isinstance(payload, dict) or payload.get("program") != program:
         return None
-    calls = payload.get("calls", [])
-    lines = [f"{program} outgoing calls with parameters:"]
-    evidence: list[str] = []
+    calls = [item for item in payload.get("calls", []) if isinstance(item, dict)]
+
+    requested_targets: set[str] = set()
+    named_entities: tuple[str, ...] = ()
+    if plan:
+        named_entities = plan.entity_values_for("call", "unknown_identifier")
+        requested_targets = {
+            value.upper()
+            for value in named_entities
+            if any(str(call.get("target", "")).upper() == value.upper() for call in calls)
+        }
+    if requested_targets:
+        calls = [call for call in calls if str(call.get("target", "")).upper() in requested_targets]
+    elif named_entities:
+        # The user named something specific and none of it is a call in this
+        # program. Returning the unfiltered list would answer a question that was
+        # never asked, using the whole inventory as if it were the match.
+        requested = ", ".join(sorted(named_entities))
+        return (
+            f"No outgoing call evidence matched {requested} in {program}. "
+            f"Source: `{payload_path.name}`."
+        )
+
+    if plan and plan.operations:
+        allowed = {value for value in plan.operations if value.upper() == value}
+        if allowed:
+            calls = [call for call in calls if _canonical_call_operation(call.get("call_type")) in allowed]
+    if plan and plan.excluded_operations:
+        excluded = set(plan.excluded_operations)
+        calls = [call for call in calls if _canonical_call_operation(call.get("call_type")) not in excluded]
+
+    if not calls:
+        requested = ", ".join(sorted(requested_targets)) or (
+            ", ".join(plan.operations) if plan and plan.operations else "the requested call"
+        )
+        return f"No outgoing call evidence matched {requested} in {program}. Source: `{payload_path.name}`."
+
+    if plan and "call_context" in plan.tasks:
+        return _answer_call_context(program, calls, payload_path.name, plan)
+
+    lines = [f"{program} outgoing calls with parameters ({len(calls)} matching call(s)):"]
     for call in calls:
         target = call.get("target", "?")
         call_type = call.get("call_type", "?")
@@ -950,27 +932,85 @@ def _answer_calls(root: Path, program: str) -> str | None:
         line = call.get("line_start", "?")
         params = ", ".join(call.get("parameters", [])) or "no explicit parameter"
         details = [f"- {target}: {call_type} in {paragraph} line {line}; parameters: {params}"]
-        if call.get("commarea"):
-            details.append(f"COMMAREA={call.get('commarea')}")
-        if call.get("length"):
-            details.append(f"LENGTH={call.get('length')}")
+        commarea = call.get("commarea")
+        length = call.get("length")
+        if commarea:
+            details.append(f"COMMAREA={commarea}")
+        if length:
+            details.append(f"LENGTH={length}")
         lines.append("; ".join(details) + ".")
-        evidence.append(
-            _cite(
-                "architecture.call_parameters/architecture.call_parameters.json",
-                line=call.get("line_start"),
-                detail=str(target),
-            )
-        )
-    _append_evidence(lines, evidence)
+    lines.append(f"Source: `{payload_path.name}`.")
     return "\n".join(lines)
 
 
-def _answer_literal_assignments(root: Path, program: str, q: str) -> str | None:
-    payload = _read_json(root / "dataflow.literal_assignments" / "dataflow.literal_assignments.json")
+def _answer_call_context(
+    program: str, calls: list[dict[str, Any]], source_name: str, plan: QueryPlan,
+) -> str:
+    show_before = not plan.relations or "before" in plan.relations
+    show_after = not plan.relations or "after" in plan.relations
+    lines = [f"{program} call context from analyzed parameter evidence:"]
+    for call in calls:
+        target = str(call.get("target") or "?")
+        paragraph = str(call.get("paragraph") or "?")
+        line = call.get("line_start", "?")
+        statement = str(call.get("statement") or "statement unavailable")
+        lines.extend([f"Call to {target}:", f"- {paragraph} line {line}: `{statement}`"])
+        before: list[tuple[str, Any, str, str]] = []
+        after: list[tuple[str, Any, str, str]] = []
+        for detail in call.get("parameter_details", []):
+            for variable in detail.get("variables", []):
+                name = str(variable.get("variable") or "?")
+                for site in variable.get("writes_before_call", []):
+                    before.append((str(site.get("paragraph") or "?"), site.get("line_start", "?"), str(site.get("statement") or ""), name))
+                for site in variable.get("reads_after_call", []):
+                    after.append((str(site.get("paragraph") or "?"), site.get("line_start", "?"), str(site.get("statement") or ""), name))
+        if show_before:
+            lines.append("Before the call — recorded parameter writes:")
+            if before:
+                for site_paragraph, site_line, site_statement, variable in list(dict.fromkeys(before))[:16]:
+                    lines.append(f"- {site_paragraph} line {site_line}, {variable}: `{site_statement}`")
+            else:
+                lines.append("- No parameter write is recorded before this call in the artifact.")
+        if show_after:
+            lines.append("At or after the call — recorded parameter reads/tests:")
+            if after:
+                for site_paragraph, site_line, site_statement, variable in list(dict.fromkeys(after))[:16]:
+                    lines.append(f"- {site_paragraph} line {site_line}, {variable}: `{site_statement}`")
+            else:
+                lines.append("- No parameter read or test is recorded after this call in the artifact.")
+    lines.append(f"Source: `{source_name}`.")
+    return "\n".join(lines)
+
+
+def _canonical_call_operation(value: Any) -> str:
+    upper = str(value or "").upper()
+    if "XCTL" in upper:
+        return "XCTL"
+    if "LINK" in upper:
+        return "LINK"
+    return "CALL"
+
+
+def _answer_literal_assignments(
+    root: Path,
+    program: str,
+    q: str,
+    plan: QueryPlan | None = None,
+) -> str | None:
+    payload_path = _artifact_path(root, "dataflow.literal_assignments.json")
+    payload = _read_json(payload_path)
     if not isinstance(payload, dict) or payload.get("program") != program:
         return None
     items = payload.get("assignments", [])
+    if plan:
+        requested_variables = {
+            value.upper() for value in plan.entity_values_for("variable")
+        }
+        if requested_variables:
+            items = [
+                item for item in items
+                if str(item.get("target_variable", "")).upper() in requested_variables
+            ]
     if "commarea" in q or "parameter" in q:
         items = [item for item in items if item.get("call_commarea_field")]
     elif "screen" in q or "map" in q:
@@ -978,8 +1018,9 @@ def _answer_literal_assignments(root: Path, program: str, q: str) -> str | None:
     elif "control" in q or "flow" in q:
         items = [item for item in items if item.get("controls_flow")]
     lines = [f"{program} literal assignments: {len(items)} matching item(s)."]
-    evidence: list[str] = []
-    for item in items[:25]:
+    exhaustive = bool(plan and plan.result_scope == "all")
+    selected_items = items if exhaustive else items[:25]
+    for item in selected_items:
         tags = []
         if item.get("call_commarea_field"):
             tags.append("COMMAREA")
@@ -990,1432 +1031,104 @@ def _answer_literal_assignments(root: Path, program: str, q: str) -> str | None:
         suffix = f" [{', '.join(tags)}]" if tags else ""
         lines.append(
             f"- line {item.get('line')} {item.get('paragraph')}: "
-            f"{item.get('target_variable')} = {item.get('literal')}{suffix}"
+            f"{item.get('target_variable')} = "
+            f"{item.get('literal_raw', item.get('literal'))}{suffix}"
         )
-        evidence.append(
-            _cite(
-                "dataflow.literal_assignments/dataflow.literal_assignments.json",
-                line=item.get("line"),
-                detail=str(item.get("target_variable", "")),
-            )
-        )
-    _append_evidence(lines, evidence)
+    if len(items) > len(selected_items):
+        lines.append(f"Showing the first 25 of {len(items)} matching assignments.")
+    lines.append(f"Source: `{payload_path.name}`.")
     return "\n".join(lines)
 
 
-def _answer_structured_behavior(root: Path, program: str, question: str) -> str | None:
-    q = question.lower()
-    if _asks_about_phase_decision(q):
-        return _answer_phase_decision(root, program)
-    if _asks_about_ip_function_condition(q):
-        return _answer_ip_function_condition(root, program)
-    if _asks_about_error_paths(q):
-        return _answer_error_paths(root, program)
-    if _asks_about_semaphore(q):
-        return _answer_semaphore_flow(root, program)
-    if _asks_about_session_status(q):
-        return _answer_session_status(root, program)
-    if _asks_about_page_total_calculation(q):
-        return _answer_page_total_calculation(root, program)
-    if _asks_about_browse_fase1_sequence(q):
-        return _answer_paragraph_sequence(root, program, "BROWSE-FASE1", stop_at="SEND-PDCBVC1")
-    if _asks_about_pdrtwa2_to_pd1voci(q):
-        return _answer_pdrtwa2_to_pd1voci(root, program)
-    if _asks_about_numfunz_pd1voci_mapping(q):
-        return _answer_pd1voci_numfunz_mapping(root, program)
-    if _asks_about_pd1fs00_session(q):
-        return _answer_pd1fs00_session(root, program)
-    call_target = _call_target_in_question(root, program, question)
-    if call_target and _asks_about_call_details(q):
-        return _answer_call_preparation(root, program, call_target)
-    if _asks_about_variable_behavior(q) and _asks_for_specific_variable_trace(q):
-        return _answer_variables_from_question(root, program, question)
-    if _asks_about_pagination(q):
-        return _answer_pagination(root, program)
-    if _asks_about_pf_key_comparison(q):
-        return _answer_pf_key_comparison(root, program)
-    paragraphs = _paragraphs_in_question(root, program, question)
-    if paragraphs and _asks_about_paragraph_behavior(q):
-        if paragraphs[0] == "PREP-RIGA" and _asks_about_display_row_build(q):
-            answer = _answer_prep_riga_row_build(root, program)
-            if answer:
-                return answer
-        return _answer_paragraph_behavior(root, program, paragraphs[0])
-    if _asks_about_row_selection(q):
-        return _answer_row_selection(root, program)
-    key_answer = _answer_key_flow(root, program, question)
-    if key_answer:
-        return key_answer
-    if _asks_about_variable_behavior(q):
-        return _answer_variables_from_question(root, program, question)
-    return None
-
-
-def _asks_about_phase_decision(q: str) -> bool:
-    return (
-        ("twcob-fase" in q or ("browse-fase1" in q and "browse-fase2" in q))
-        and any(term in q for term in ("browse-fase1", "browse-fase2", "unexpected", "decide", "whether", "start"))
-    )
-
-
-def _asks_about_ip_function_condition(q: str) -> bool:
-    return (
-        "twcob-funzione" in q
-        and "twcob-id-sistema" in q
-        and "'ip'" in q
-    )
-
-
-def _asks_about_semaphore(q: str) -> bool:
-    return "semaphore" in q or "pdaggvip" in q or "pxcsemaf" in q
-
-
-def _asks_about_browse_fase1_sequence(q: str) -> bool:
-    return "browse-fase1" in q and any(term in q for term in ("sequence", "before", "map", "sent", "send"))
-
-
-def _asks_about_call_preparation(q: str, target: str) -> bool:
-    return target.lower() in q and any(term in q for term in ("prepare", "prepared", "parameter", "influence", "commarea"))
-
-
-def _asks_about_call_details(q: str) -> bool:
-    return any(
-        term in q
-        for term in (
-            "call",
-            "calls",
-            "called",
-            "parameter",
-            "parameters",
-            "passed",
-            "prepare",
-            "prepared",
-            "commarea",
-            "length",
-            "link",
-            "xctl",
-        )
-    )
-
-
-def _asks_about_pdrtwa2_to_pd1voci(q: str) -> bool:
-    return "pdrtwa2" in q and "pd1voci" in q
-
-
-def _asks_about_numfunz_pd1voci_mapping(q: str) -> bool:
-    if "prepare" in q or "prepared" in q or "parameter" in q:
-        return False
-    return "twcob-varcont-numfunz" in q and "pd1voci" in q and any(
-        term in q for term in ("change", "sets", "value", "funzione", "tipo-voce", "mapping")
-    )
-
-
-def _asks_about_pd1fs00_session(q: str) -> bool:
-    return "pd1fs00" in q and any(term in q for term in ("obtain", "obtains", "session", "sess", "information"))
-
-
-def _asks_about_session_status(q: str) -> bool:
-    return "pd1fs00-sess-flag" in q or all(term in q for term in ("aperta", "chiusa", "liquidata"))
-
-
-def _asks_about_page_total_calculation(q: str) -> bool:
-    return any(term in q for term in ("total number of pages", "number of pages", "calculate", "calculated")) and any(
-        term in q for term in ("browse result", "npagt", "resto", "page", "pages")
-    )
-
-
-def _asks_about_pagination(q: str) -> bool:
-    return any(term in q for term in ("pagination", "page", "wctpag", "npagt", "npagina")) and any(
-        term in q for term in ("enter", "pf7", "pf8", "wctpag", "npagt", "npagina")
-    )
-
-
-def _asks_about_row_selection(q: str) -> bool:
-    return any(term in q for term in ("selects a row", "selected progressivo", "selected accounting voice"))
-
-
-def _asks_about_display_row_build(q: str) -> bool:
-    return any(term in q for term in ("displayed row", "build each", "build", "row", "voice code", "installment amount", "progressivo"))
-
-
-def _asks_about_pf_key_comparison(q: str) -> bool:
-    return any(key in q for key in ("pf1", "pf2", "pf3", "pf4", "pf9")) and any(
-        term in q for term in ("compare", "target", "xctl", "function key", "reset")
-    )
-
-
-def _asks_about_error_paths(q: str) -> bool:
-    return any(
-        term in q
-        for term in (
-            "error message",
-            "abnormal",
-            "abend",
-            "abnormal termination",
-            "failed service",
-            "invalid function",
-            "invalid key",
-            "missing record",
-            "invalid selection",
-            "sql error",
-            "sqlerror",
-            "restriction",
-        )
-    )
-
-
-def _asks_about_variable_behavior(q: str) -> bool:
-    return any(
-        term in q
-        for term in (
-            "how is",
-            "where is",
-            "what feeds",
-            "who feeds",
-            "calculated",
-            "maintained",
-            "set",
-            "used",
-            "read",
-            "written",
-            "modified",
-            "origin",
-            "value of",
-            "feed",
-            "feeds",
-        )
-    ) and bool(_variables_in_question(q))
-
-
-def _asks_for_specific_variable_trace(q: str) -> bool:
-    return any(term in q for term in ("where is", "set and used", "read and written", "written", "modified", "origin"))
-
-
-def _asks_about_paragraph_behavior(q: str) -> bool:
-    return any(
-        term in q
-        for term in (
-            "what happens",
-            "build",
-            "displayed row",
-            "explain",
-            "sequence",
-            "flow",
-            "logic",
-            "do in",
-            "does",
-            "operations",
-            "row",
-            "before",
-            "after",
-        )
-    )
-
-
-def _answer_phase_decision(root: Path, program: str) -> str | None:
-    edges = _cfg_edges(root, program)
-    phase_edges = [
-        edge for edge in edges
-        if edge.get("from") == program and "TWCOB-FASE" in str(edge.get("condition", ""))
-    ]
-    if not phase_edges:
-        return None
-    lines = [f"{program} dispatches the initial browse phase from `TWCOB-FASE` using CFG edges:"]
-    for edge in phase_edges:
-        lines.append(f"- `{edge.get('condition')}` -> `{edge.get('to')}` ({edge.get('evidence', '')})")
-    variable = _variable_payload(root, program, "TWCOB-FASE")
-    if variable:
-        lines.append("")
-        lines.append("Supporting variable evidence:")
-        lines.extend(_site_lines(variable, "control_sites", limit=6))
-    _append_evidence(
-        lines,
-        [
-            _cite("controlflow.cfg/controlflow.cfg.json", detail="TWCOB-FASE dispatch edges"),
-            _cite("dataflow.variable/dataflow.variable.TWCOB-FASE.json", detail="control_sites"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _answer_ip_function_condition(root: Path, program: str) -> str | None:
-    edges = _cfg_edges(root, program)
-    condition_edges = [
-        edge for edge in edges
-        if "TWCOB-FUNZIONE" in str(edge.get("condition", ""))
-        and "TWCOB-ID-SISTEMA" in str(edge.get("condition", ""))
-        and "'IP'" in str(edge.get("condition", ""))
-    ]
-    if not condition_edges:
-        return None
-
-    lines = [
-        f"{program} handles `TWCOB-FUNZIONE` in `I/A/C/D/P` with `TWCOB-ID-SISTEMA = 'IP'` as a semaphore restriction path:"
-    ]
-    for edge in condition_edges:
-        condition = edge.get("condition") or "unconditional"
-        lines.append(f"- `{edge.get('from')}` -> `{edge.get('to')}` when `{condition}` ({edge.get('evidence', '')})")
-    lines.append(
-        "- Meaning: in `BROWSE-FASE1`, these insert/update-style functions trigger `READ-TAB-SEMAF` before continuing."
-    )
-    lines.append(
-        "- If `PXCSEMAF-STATUS = 1`, the program moves the restriction message to `TWCOB-AREA-MSG` and transfers to `XCTL-LIV4`; this is a restriction/early-transfer path, not normal browse continuation."
-    )
-    lines.append(
-        "- If the semaphore service itself returns `PXCSEMAF-OUTCOME NOT = SPACE`, `READ-TAB-SEMAF` performs `ABEND00`."
-    )
-    _append_evidence(
-        lines,
-        [
-            _cite("controlflow.cfg/controlflow.cfg.json", detail="IP function/semaphore edges"),
-            _cite("dataflow.literal_assignments/dataflow.literal_assignments.json", detail="TWCOB-AREA-MSG/PXCSEMAF assignments"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _answer_semaphore_flow(root: Path, program: str) -> str | None:
-    edges = _cfg_edges(root, program)
-    read_edges = [edge for edge in edges if edge.get("to") == "READ-TAB-SEMAF"]
-    closed_edges = [edge for edge in edges if "PXCSEMAF-STATUS" in str(edge.get("condition", ""))]
-    abend_edges = [edge for edge in edges if edge.get("from") == "READ-TAB-SEMAF" and edge.get("to") == "ABEND00"]
-    literals = _literal_items(root, program)
-    semaf_literals = [
-        item for item in literals
-        if str(item.get("target_variable", "")).startswith("PXCSEMAF-")
-        or str(item.get("literal", "")).upper() == "PDAGGVIP"
-    ]
-    call = _call_by_target(root, program, "PXRSEMAF")
-    if not read_edges and not semaf_literals and not call:
-        return None
-
-    lines = [f"{program} semaphore `PDAGGVIP` flow:"]
-    for edge in read_edges:
-        condition = edge.get("condition") or "unconditional"
-        lines.append(f"- `READ-TAB-SEMAF` is reached when `{condition}` ({edge.get('evidence', '')}).")
-    if semaf_literals:
-        lines.append("- `READ-TAB-SEMAF` prepares the semaphore request:")
-        for item in semaf_literals[:8]:
-            lines.append(
-                f"  - line {item.get('line')} {item.get('paragraph')}: "
-                f"{item.get('target_variable')} = {item.get('literal')}"
-            )
-    if call:
-        params = ", ".join(call.get("parameters", [])) or "no explicit parameter"
-        lines.append(
-            f"- The service call is `{call.get('target')}` in `{call.get('paragraph')}` "
-            f"line {call.get('line_start')} with parameter(s): {params}."
-        )
-    for edge in closed_edges:
-        lines.append(
-            f"- When `{edge.get('condition')}`, control goes to `{edge.get('to')}` "
-            f"({edge.get('evidence', '')})."
-        )
-    for edge in abend_edges:
-        lines.append(
-            f"- If `{edge.get('condition')}`, `READ-TAB-SEMAF` performs `{edge.get('to')}` "
-            f"({edge.get('evidence', '')})."
-        )
-    _append_evidence(
-        lines,
-        [
-            _cite("controlflow.cfg/controlflow.cfg.json", detail="READ-TAB-SEMAF edges"),
-            _cite("dataflow.literal_assignments/dataflow.literal_assignments.json", detail="PXCSEMAF assignments"),
-            _cite("architecture.call_parameters/architecture.call_parameters.json", line=(call or {}).get("line_start"), detail="PXRSEMAF"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _answer_pdrtwa2_to_pd1voci(root: Path, program: str) -> str | None:
-    call = _call_by_target(root, program, "PD1VOCI")
-    if not call:
-        return None
-    lines = [
-        f"{program} prepares `PD1VOCI` from TWA/COMMAREA fields before the CICS LINK.",
-        (
-            "`PDRTWA2` is the TWA/context COPY member, but the available dataflow evidence records the concrete "
-            "`TWCOB-*` source fields rather than proving every source field's copybook origin."
-        ),
-        "- evidenced source-to-target moves in `INIZ-PARAM`:",
-        "  - `TWCOB-VARCONT-VOCE-LIV4` -> `PD1VOCI-COD-VOCE`.",
-        "  - `TWCOB-TIPO-DIP` -> `PD1VOCI-CODDIP-TIPO`.",
-        "  - `TWCOB-SP-MATR` -> `PD1VOCI-CODDIP-MATR`.",
-        "  - `TWCOB-SP-PAD` -> `PD1VOCI-CODDIP-PAD`.",
-        "  - `TWCOB-FUNZIONE` -> `PD1VOCI-TIPO-VARIAZ`.",
-        "  - `TWCOB-VARCONT-ANNO` / `MESE` / `TMENS` -> `PD1VOCI-LIQUID1-*` period fields.",
-        "- literal/conditional fields prepared for the call include `PD1VOCI-TIPO-GEST`, `PD1VOCI-FUNZIONE`, `PD1VOCI-TIPO-ESTRA`, and `PD1VOCI-TIPO-VOCE`.",
-    ]
-    for variable in (
-        "PD1VOCI-COD-VOCE",
-        "PD1VOCI-CODDIP-TIPO",
-        "PD1VOCI-CODDIP-MATR",
-        "PD1VOCI-CODDIP-PAD",
-        "PD1VOCI-TIPO-VARIAZ",
-        "PD1VOCI-LIQUID1-ANNO",
-        "PD1VOCI-LIQUID1-MESE",
-        "PD1VOCI-LIQUID1-TIPO",
-    ):
-        lines.extend(_variable_write_site_lines(root, program, variable, min_line=426, max_line=477, limit=2, indent="  "))
-    _append_evidence(
-        lines,
-        [
-            _cite("dataflow.variable/*.json", detail="PD1VOCI write sites"),
-            _cite("architecture.copybooks/architecture.copybooks.json", detail="PDRTWA2 listed as state_context"),
-            _cite("architecture.call_parameters/architecture.call_parameters.json", line=call.get("line_start"), detail="PD1VOCI"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _answer_pd1voci_numfunz_mapping(root: Path, program: str) -> str | None:
-    funzione = _variable_payload(root, program, "PD1VOCI-FUNZIONE")
-    tipo_voce = _variable_payload(root, program, "PD1VOCI-TIPO-VOCE")
-    if not funzione and not tipo_voce:
-        return None
-    lines = [
-        f"{program} uses `TWCOB-VARCONT-NUMFUNZ` in `INIZ-PARAM` / `INIZ-PARAM-010` to influence `PD1VOCI`:",
-        "- `PD1VOCI-FUNZIONE`:",
-        "  - NUMFUNZ `1` -> `PD1VOCI-FUNZIONE = '11'`.",
-        "  - NUMFUNZ `6` -> `PD1VOCI-FUNZIONE = '12'`.",
-        "  - `TWCOB-FUNZIONE = 'I'` -> `PD1VOCI-FUNZIONE = '02'` and `PD1VOCI-TIPO-ESTRA = 'A'`.",
-        "  - otherwise -> `PD1VOCI-FUNZIONE = '11'`.",
-        "- `PD1VOCI-TIPO-VOCE`:",
-        "  - NUMFUNZ `2` -> `PD1VOCI-TIPO-VOCE = '1'`.",
-        "  - NUMFUNZ `3` -> `PD1VOCI-TIPO-VOCE = '3'`.",
-        "  - NUMFUNZ `4` -> `PD1VOCI-TIPO-VOCE = '2'`.",
-        "  - NUMFUNZ `5` -> `PD1VOCI-TIPO-VOCE = '4'`.",
-        "  - otherwise -> `PD1VOCI-TIPO-VOCE = '0'`.",
-        "- So NUMFUNZ does not map `1 -> TIPO-VOCE '1'` or `6 -> TIPO-VOCE '3'`; those were hallucinated mappings.",
-    ]
-    if funzione:
-        lines.append("- `PD1VOCI-FUNZIONE` write evidence:")
-        lines.extend(_site_lines(funzione, "write_sites", limit=6, indent="  "))
-    if tipo_voce:
-        lines.append("- `PD1VOCI-TIPO-VOCE` write evidence:")
-        lines.extend(_site_lines(tipo_voce, "write_sites", limit=6, indent="  "))
-    _append_evidence(
-        lines,
-        [
-            _cite("dataflow.variable/dataflow.variable.PD1VOCI-FUNZIONE.json", detail="write sites"),
-            _cite("dataflow.variable/dataflow.variable.PD1VOCI-TIPO-VOCE.json", detail="write sites"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _answer_pd1fs00_session(root: Path, program: str) -> str | None:
-    call = _call_by_target(root, program, "PD1FS00")
-    if not call:
-        return None
-    lines = [
-        f"{program} calls `PD1FS00` through `PREP-LINK-PD1FS00` / `LINK-PD1FS00`:",
-        "- `PREP-LINK-PD1FS00` prepares the request and is performed from browse flow before display/data preparation.",
-    ]
-    for variable in ("PD1FS00-FUNZIONE", "PD1FS00-SESS-SISTEMA"):
-        lines.extend(_variable_write_site_lines(root, program, variable, min_line=400, max_line=420, limit=3, indent="  "))
-    lines.append(
-        f"- CICS LINK line {call.get('line_start')}: COMMAREA={call.get('commarea')} LENGTH={call.get('length')}."
-    )
-    lines.append("- session information read after the service call:")
-    for variable in (
-        "PD1FS00-SESS-ANNO",
-        "PD1FS00-SESS-MESE",
-        "PD1FS00-SESS-TMENS",
-        "PD1FS00-SESS-FLAG",
-        "PD1FS00-RETURN",
-    ):
-        payload = _variable_payload(root, program, variable)
-        if payload:
-            lines.append(f"  - `{variable}`:")
-            lines.extend(_site_lines(payload, "read_sites", limit=4, indent="    "))
-    _append_evidence(
-        lines,
-        [
-            _cite("architecture.call_parameters/architecture.call_parameters.json", line=call.get("line_start"), detail="PD1FS00"),
-            _cite("dataflow.variable/*.json", detail="PD1FS00 session field sites"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _answer_session_status(root: Path, program: str) -> str | None:
-    flag = _variable_payload(root, program, "PD1FS00-SESS-FLAG")
-    if not flag:
-        return None
-    lines = [
-        f"{program} displays session status in `MUOVI-TESTATA-00` using `PD1FS00-SESS-FLAG`:",
-        "- `PD1FS00-SESS-FLAG = '1'` -> moves `Aperta` to `MDSESSO`.",
-        "- `PD1FS00-SESS-FLAG = '2'` -> moves `Chiusa` to `MDSESSO`.",
-        "- `PD1FS00-SESS-FLAG = '3'` -> moves `Liquidata` to `MDSESSO`.",
-        "- The formatted session fields are also moved into map output fields such as `MSESSIO` and `MDSESSO`.",
-        "- flag control evidence:",
-    ]
-    lines.extend(_site_lines(flag, "control_sites", limit=6, indent="  "))
-    for variable in ("MSESSIO", "MDSESSO"):
-        payload = _variable_payload(root, program, variable)
-        if payload:
-            lines.append(f"- `{variable}` writes:")
-            lines.extend(_site_lines(payload, "write_sites", limit=6, indent="  "))
-    _append_evidence(
-        lines,
-        [
-            _cite("dataflow.variable/dataflow.variable.PD1FS00-SESS-FLAG.json", detail="flag controls"),
-            _cite("dataflow.variable/dataflow.variable.MDSESSO.json", detail="displayed status writes"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _answer_page_total_calculation(root: Path, program: str) -> str | None:
-    sites = _paragraph_variable_sites(root, program, "CALCOLA-NPAG")
-    if not sites:
-        return None
-    lines = [
-        f"{program} calculates total browse pages in `CALCOLA-NPAG`:",
-        "- It divides `PD1VOCI-TABVOX-NUMERO` by `MAX-RIGHE`, giving `NPAGT` and remainder `RESTO`.",
-        "- If `NPAGT < 1`, it adds 1 to `NPAGT` and exits, so an empty/small result still has one page.",
-        "- If `RESTO > 0`, it adds 1 to `NPAGT`, which is the usual ceiling division behavior.",
-        "- It does not use `TWCOB-VARCONT-NUMFUNZ` for the page total.",
-        "- evidence in `CALCOLA-NPAG`:",
-    ]
-    seen: set[tuple[str, str]] = set()
-    for site in sites:
-        key = (str(site.get("line")), str(site.get("statement")))
-        if key in seen:
-            continue
-        seen.add(key)
-        lines.append(f"  - line {site.get('line')}: {site.get('statement')}")
-        if len(seen) >= 12:
-            break
-    _append_evidence(
-        lines,
-        [
-            _cite("controlflow.cfg/controlflow.cfg.json", detail="CALCOLA-NPAG edges"),
-            _cite("dataflow.variable/*.json", detail="CALCOLA-NPAG variable sites"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _answer_paragraph_sequence(root: Path, program: str, paragraph: str, stop_at: str | None = None) -> str | None:
-    edges = [edge for edge in _cfg_edges(root, program) if edge.get("from") == paragraph]
-    if not edges:
-        return None
-    lines = [f"{program} `{paragraph}` sequence from `controlflow.cfg.json`:"]
-    for edge in edges:
-        condition = edge.get("condition")
-        prefix = "conditional" if condition else "step"
-        detail = f"{prefix}: `{edge.get('to')}` via {edge.get('type', '?')}"
-        if condition:
-            detail += f" when `{condition}`"
-        evidence = edge.get("evidence")
-        if evidence:
-            detail += f" ({evidence})"
-        lines.append(f"- {detail}.")
-        if stop_at and edge.get("to") == stop_at:
-            break
-    _append_evidence(lines, [_cite("controlflow.cfg/controlflow.cfg.json", detail=f"{paragraph} outgoing edges")])
-    return "\n".join(lines)
-
-
-def _answer_call_preparation(root: Path, program: str, target: str) -> str | None:
-    call = _call_by_target(root, program, target)
-    if not call:
-        return None
-    if target.upper() == "PD1VOCI":
-        return _answer_pd1voci_preparation(root, program, call)
-
-    lines = [
-        f"{program} prepares `{target}` in `{call.get('paragraph')}` before the call:",
-        (
-            f"- call statement line {call.get('line_start')}: {call.get('call_type')} "
-            f"COMMAREA={call.get('commarea', 'n/a')} LENGTH={call.get('length', 'n/a')}"
-        ),
-    ]
-
-    key_variables = {
-        f"{target}-FUNZIONE",
-        f"{target}-TIPO-ESTRA",
-        f"{target}-TIPO-VOCE",
-        f"{target}-TIPO-GEST",
-        f"{target}-TIPO-VARIAZ",
-    }
-    for detail in call.get("parameter_details", []):
-        variables = detail.get("variables", [])
-        selected = [
-            variable for variable in variables
-            if str(variable.get("variable", "")).upper() in key_variables
-            or str(variable.get("variable", "")).upper().startswith(f"{target}-COD")
-            or str(variable.get("variable", "")).upper().startswith(f"{target}-LIQUID")
-        ]
-        if not selected:
-            selected = [
-                variable for variable in variables
-                if variable.get("writes_before_call") or variable.get("reads_before_call")
-            ][:8]
-        if not selected:
-            field_prefix = detail.get("field_prefix")
-            if field_prefix:
-                lines.append(f"- parameter detail `{field_prefix}` has no per-field write evidence in this artifact.")
-            continue
-        lines.append("- prepared fields:")
-        for variable in selected[:18]:
-            name = variable.get("variable")
-            writes = variable.get("writes_before_call", [])
-            if writes:
-                for site in writes[:5]:
-                    lines.append(f"  - `{name}` line {site.get('line_start')}: {site.get('statement')}")
-            else:
-                lines.append(f"  - `{name}` has no write-before-call evidence in this artifact.")
-
-    for name in ("TWCOB-VARCONT-NUMFUNZ", "TWCOB-FUNZIONE"):
-        variable = _variable_payload(root, program, name)
-        if variable:
-            lines.append(f"- `{name}` control/read evidence:")
-            lines.extend(_site_lines(variable, "control_sites", limit=8, indent="  "))
-    _append_evidence(
-        lines,
-        [
-            _cite("architecture.call_parameters/architecture.call_parameters.json", line=call.get("line_start"), detail=target),
-            _cite("dataflow.variable/*.json", detail="write/read sites for call parameters"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _answer_pd1voci_preparation(root: Path, program: str, call: dict[str, Any]) -> str:
-    lines = [
-        f"{program} prepares `PD1VOCI` parameters in `INIZ-PARAM` before the `LINK-PD1VOCI` call.",
-        (
-            "`LINK-PD1VOCI` only executes the CICS LINK and checks the return code; "
-            "the COMMAREA fields are prepared earlier in `INIZ-PARAM`, `INIZ-PARAM-010`, and `INIZ-PARAM-020`."
-        ),
-        (
-            f"- call statement line {call.get('line_start')}: {call.get('call_type')} "
-            f"COMMAREA={call.get('commarea', 'n/a')} LENGTH={call.get('length', 'n/a')}."
-        ),
-        "- base COMMAREA setup:",
-    ]
-
-    for variable in (
-        "PD1VOCI-DATI",
-        "PD1VOCI-COD-VOCE",
-        "PD1VOCI-CODDIP-TIPO",
-        "PD1VOCI-CODDIP-MATR",
-        "PD1VOCI-CODDIP-PAD",
-        "PD1VOCI-TIPO-VARIAZ",
-        "PD1VOCI-TIPO-GEST",
-    ):
-        lines.extend(_variable_write_site_lines(root, program, variable, min_line=426, max_line=477, limit=3, indent="  "))
-
-    lines.extend(
-        [
-            "- `TWCOB-VARCONT-NUMFUNZ` and `TWCOB-FUNZIONE` drive the PD1VOCI function fields:",
-            "  - `TWCOB-VARCONT-NUMFUNZ = '1'` sets `PD1VOCI-FUNZIONE = '11'`.",
-            "  - `TWCOB-VARCONT-NUMFUNZ = '6'` sets `PD1VOCI-FUNZIONE = '12'`.",
-            "  - `TWCOB-FUNZIONE = 'I'` sets `PD1VOCI-FUNZIONE = '02'` and `PD1VOCI-TIPO-ESTRA = 'A'`.",
-            "  - other handled cases set `PD1VOCI-FUNZIONE = '11'`.",
-        ]
-    )
-    for variable in ("PD1VOCI-FUNZIONE", "PD1VOCI-TIPO-ESTRA"):
-        lines.extend(_variable_write_site_lines(root, program, variable, min_line=426, max_line=477, limit=8, indent="  "))
-
-    lines.extend(
-        [
-            "- `TWCOB-VARCONT-NUMFUNZ` drives `PD1VOCI-TIPO-VOCE`:",
-            "  - NUMFUNZ `2` -> `PD1VOCI-TIPO-VOCE = '1'`.",
-            "  - NUMFUNZ `3` -> `PD1VOCI-TIPO-VOCE = '3'`.",
-            "  - NUMFUNZ `4` -> `PD1VOCI-TIPO-VOCE = '2'`.",
-            "  - NUMFUNZ `5` -> `PD1VOCI-TIPO-VOCE = '4'`.",
-            "  - otherwise -> `PD1VOCI-TIPO-VOCE = '0'`.",
-        ]
-    )
-    lines.extend(_variable_write_site_lines(root, program, "PD1VOCI-TIPO-VOCE", min_line=450, max_line=470, limit=8, indent="  "))
-
-    lines.extend(
-        [
-            "- liquidation period fields come from `TWCOB-VARCONT-*`, not directly from `TWCOB-FUNZIONE`:",
-        ]
-    )
-    for variable in ("PD1VOCI-LIQUID1-ANNO", "PD1VOCI-LIQUID1-MESE", "PD1VOCI-LIQUID1-TIPO"):
-        lines.extend(_variable_write_site_lines(root, program, variable, min_line=470, max_line=477, limit=4, indent="  "))
-
-    return_var = _variable_payload(root, program, "PD1VOCI-RETURN")
-    if return_var:
-        lines.append("- return handling in `LINK-PD1VOCI`:")
-        lines.extend(_site_lines(return_var, "write_sites", limit=1, indent="  "))
-        lines.extend(_site_lines(return_var, "read_sites", limit=2, indent="  "))
-
-    _append_evidence(
-        lines,
-        [
-            _cite("dataflow.variable/*.json", detail="PD1VOCI write sites in INIZ-PARAM"),
-            _cite("architecture.call_parameters/architecture.call_parameters.json", line=call.get("line_start"), detail="PD1VOCI"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _variable_write_site_lines(
+def _answer_copybooks(
     root: Path,
     program: str,
-    variable: str,
-    *,
-    min_line: int | None = None,
-    max_line: int | None = None,
-    limit: int = 6,
-    indent: str = "",
-) -> list[str]:
-    payload = _variable_payload(root, program, variable)
-    if not payload:
-        return []
-    lines: list[str] = []
-    for site in payload.get("content", {}).get("evidence", {}).get("write_sites", []):
-        line = site.get("line_start")
-        if isinstance(line, int):
-            if min_line is not None and line < min_line:
-                continue
-            if max_line is not None and line > max_line:
-                continue
-        paragraph = site.get("paragraph", "?")
-        statement = str(site.get("statement", "")).strip()
-        citation = _site_citation(payload, line)
-        suffix = f" [{citation}]" if citation else ""
-        lines.append(f"{indent}- line {line} `{paragraph}`: {statement}{suffix}")
-        if len(lines) >= limit:
-            break
-    return lines
-
-
-def _answer_pagination(root: Path, program: str) -> str | None:
-    variable = _variable_payload(root, program, "WCTPAG")
-    edges = _cfg_edges(root, program)
-    if not variable:
-        return None
-    lines = [f"{program} pagination is centered on `WCTPAG` and `TWCOB-VARCONT-NPAGINA`:"]
-    lines.append("- writes/updates:")
-    lines.extend(_site_lines(variable, "write_sites", limit=10, indent="  "))
-    lines.append("- page-control reads:")
-    control_sites = _site_lines(variable, "control_sites", limit=12, indent="  ")
-    lines.extend(control_sites)
-    ui_edges = []
-    for edge in edges:
-        condition = str(edge.get("condition", ""))
-        source = edge.get("from")
-        target = edge.get("to")
-        if (
-            source == "BROWSE-FASE2"
-            and edge.get("to") != "BROWSE-FASE2-TASTOER"
-            and any(key in condition for key in ("DFHENTER", "DFHPF7", "DFHPF8"))
-        ):
-            ui_edges.append(edge)
-        elif source in {"BROWSE-FASE2-ENTER", "BROWSE-FASE2-PF7", "BROWSE-FASE2-PF8", "BROWSE-FASE2-VISUAL"} and (
-            "WCTPAG" in condition or target in {"BROWSE-FASE2-VISUAL", "XCTL-LIV4"}
-        ):
-            ui_edges.append(edge)
-    if ui_edges:
-        lines.append("- user-interaction paths:")
-        for edge in ui_edges[:12]:
-            condition = edge.get("condition") or "unconditional"
-            lines.append(f"  - `{edge.get('from')}` -> `{edge.get('to')}` when `{condition}` ({edge.get('evidence', '')})")
-    _append_evidence(
-        lines,
-        [
-            _cite("dataflow.variable/dataflow.variable.WCTPAG.json", detail="write/control sites"),
-            _cite("controlflow.cfg/controlflow.cfg.json", detail="PF7/PF8/ENTER pagination edges"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _answer_row_selection(root: Path, program: str) -> str | None:
-    variables = [
-        _variable_payload(root, program, name)
-        for name in ("SCELTAI", "WPROGR", "WPROGREC", "WCTRIG", "WVOCE", "TWCOB-VARCONT-PROGVOCE")
-    ]
-    variables = [variable for variable in variables if variable]
-    edges = [
-        edge for edge in _cfg_edges(root, program)
-        if edge.get("from") in {"BROWSE-FASE2-ENTER", "BROWSE-FASE2-SEL-10"}
-        or edge.get("to") in {"BROWSE-FASE2-SEL", "BROWSE-FASE2-SEL-20", "BROWSE-FASE2-NOTFND"}
-    ]
-    if not variables and not edges:
-        return None
-    lines = [f"{program} row/progressivo selection flow:"]
-    for edge in edges:
-        condition = edge.get("condition") or "unconditional"
-        lines.append(f"- `{edge.get('from')}` -> `{edge.get('to')}` when `{condition}` ({edge.get('evidence', '')})")
-    for variable in variables:
-        content = variable.get("content", {})
-        lines.append(f"- `{content.get('variable')}` evidence:")
-        lines.extend(_site_lines(variable, "read_sites", limit=4, indent="  "))
-        lines.extend(_site_lines(variable, "write_sites", limit=4, indent="  "))
-    _append_evidence(
-        lines,
-        [
-            _cite("controlflow.cfg/controlflow.cfg.json", detail="row-selection edges"),
-            _cite("dataflow.variable/*.json", detail="SCELTAI/WPROGR/TWA variable sites"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _answer_pf_key_comparison(root: Path, program: str) -> str | None:
-    nav = _read_json(root / "ui.cics.navigation" / "ui.cics.navigation.json")
-    edges = _cfg_edges(root, program)
-    if not isinstance(nav, dict) or nav.get("program") != program:
-        return None
-    wanted = {"DFHPF1", "DFHPF2", "DFHPF3", "DFHPF4", "DFHPF9"}
-    actions = [
-        action for action in nav.get("content", {}).get("actions", [])
-        if action.get("key") in wanted
-    ]
-    lines = [f"{program} PF-key control flow:"]
-    for action in actions:
-        xctl = str(action.get("target", ""))
-        reset = any(edge.get("from") == xctl and edge.get("to") == "RESET-TWA" for edge in edges)
-        main = any(edge.get("from") == xctl and edge.get("to") == "XCTL-MAIN" for edge in edges)
-        assignments = _literal_items(root, program, paragraph=xctl)
-        assigned = ", ".join(
-            f"{item.get('target_variable')}={item.get('literal')}"
-            for item in assignments
-            if str(item.get("target_variable", "")).startswith("TWCOB-")
-        )
-        lines.append(
-            f"- `{action.get('key')}` -> `{xctl}` ({action.get('evidence')}); "
-            f"{'performs RESET-TWA' if reset else 'no RESET-TWA edge found'}, "
-            f"{'then goes to XCTL-MAIN' if main else 'no XCTL-MAIN edge found'}"
-            f"{'; ' + assigned if assigned else ''}."
-        )
-    call = _call_by_target(root, program, "PDPRED")
-    if call:
-        lines.append(
-            f"- `XCTL-MAIN` transfers control with `{call.get('call_type')}` to `{call.get('target')}` "
-            f"at line {call.get('line_start')}."
-        )
-    _append_evidence(
-        lines,
-        [
-            _cite("ui.cics.navigation/ui.cics.navigation.json", detail="PF key actions"),
-            _cite("controlflow.cfg/controlflow.cfg.json", detail="XCTL reset edges"),
-            _cite("architecture.call_parameters/architecture.call_parameters.json", line=(call or {}).get("line_start"), detail="PDPRED"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _answer_key_flow(root: Path, program: str, question: str) -> str | None:
-    keys = _key_tokens_in_question(question)
-    if not keys:
-        return None
-
-    nav = _read_json(root / "ui.cics.navigation" / "ui.cics.navigation.json")
-    actions = []
-    if isinstance(nav, dict) and nav.get("program") == program:
-        actions = [
-            action for action in nav.get("content", {}).get("actions", [])
-            if action.get("key") in keys
-        ]
-
-    edges = [
-        edge for edge in _cfg_edges(root, program)
-        if any(key in str(edge.get("condition", "")) for key in keys)
-    ]
-    if not actions and not edges:
-        return None
-
-    lines = [f"{program} key/navigation flow for {', '.join(keys)}:"]
-    for action in actions:
-        target = str(action.get("target", ""))
-        lines.append(
-            f"- UI action: `{action.get('context')}` key `{action.get('key')}` -> "
-            f"`{target}` ({action.get('edge_type')}; {action.get('evidence')})."
-        )
-        for edge in [
-            edge for edge in _cfg_edges(root, program)
-            if str(edge.get("from", "")).upper() == target.upper()
-        ][:6]:
-            condition = edge.get("condition") or "unconditional"
-            lines.append(
-                f"  - then `{target}` -> `{edge.get('to')}` when "
-                f"`{condition}` ({edge.get('evidence', '')})."
-            )
-    for edge in edges[:12]:
-        condition = edge.get("condition") or "unconditional"
-        lines.append(
-            f"- CFG edge: `{edge.get('from')}` -> `{edge.get('to')}` when "
-            f"`{condition}` ({edge.get('evidence', '')})."
-        )
-    _append_evidence(
-        lines,
-        [
-            _cite("ui.cics.navigation/ui.cics.navigation.json", detail="key actions"),
-            _cite("controlflow.cfg/controlflow.cfg.json", detail="key-conditioned edges"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _key_tokens_in_question(question: str) -> list[str]:
-    q = question.lower()
-    mapping = {
-        "enter": "DFHENTER",
-        "pf1": "DFHPF1",
-        "pf2": "DFHPF2",
-        "pf3": "DFHPF3",
-        "pf4": "DFHPF4",
-        "pf5": "DFHPF5",
-        "pf6": "DFHPF6",
-        "pf7": "DFHPF7",
-        "pf8": "DFHPF8",
-        "pf9": "DFHPF9",
-        "pf10": "DFHPF10",
-        "pf11": "DFHPF11",
-        "pf12": "DFHPF12",
-    }
-    keys = [target for token, target in mapping.items() if re.search(rf"\b{re.escape(token)}\b", q)]
-    keys.extend(re.findall(r"\bDFH(?:ENTER|PF\d+)\b", question.upper()))
-    return list(dict.fromkeys(keys))
-
-
-def _answer_paragraph_behavior(root: Path, program: str, paragraph: str) -> str | None:
-    paragraph = paragraph.upper()
-    edges = _cfg_edges(root, program)
-    outgoing = [edge for edge in edges if str(edge.get("from", "")).upper() == paragraph]
-    incoming = [edge for edge in edges if str(edge.get("to", "")).upper() == paragraph]
-    literals = _literal_items(root, program, paragraph=paragraph)
-    calls = [call for call in _calls(root, program) if str(call.get("paragraph", "")).upper() == paragraph]
-    variable_sites = _paragraph_variable_sites(root, program, paragraph)
-
-    if not outgoing and not incoming and not literals and not calls and not variable_sites:
-        return None
-
-    lines = [f"{program} paragraph `{paragraph}` behavior from `final_scripts`:"]
-    if incoming:
-        lines.append("- incoming control-flow:")
-        for edge in incoming[:8]:
-            condition = edge.get("condition") or "unconditional"
-            lines.append(f"  - `{edge.get('from')}` -> `{paragraph}` when `{condition}` ({edge.get('evidence', '')})")
-    if outgoing:
-        lines.append("- outgoing control-flow:")
-        for edge in outgoing[:12]:
-            condition = edge.get("condition") or "unconditional"
-            lines.append(f"  - `{paragraph}` -> `{edge.get('to')}` when `{condition}` ({edge.get('evidence', '')})")
-    if calls:
-        lines.append("- external/service calls:")
-        for call in calls:
-            params = ", ".join(call.get("parameters", [])) or "no explicit parameter"
-            lines.append(
-                f"  - line {call.get('line_start')}: `{call.get('call_type')}` -> "
-                f"`{call.get('target')}` with {params}"
-            )
-    if literals:
-        lines.append("- literal assignments:")
-        for item in literals[:12]:
-            lines.append(
-                f"  - line {item.get('line')}: `{item.get('target_variable')}` = "
-                f"{item.get('literal')}"
-            )
-    if variable_sites:
-        lines.append("- variable evidence in this paragraph:")
-        for site in variable_sites[:12]:
-            lines.append(
-                f"  - {site['kind']} `{site['variable']}` line {site['line']}: {site['statement']}"
-            )
-    _append_evidence(
-        lines,
-        [
-            _cite("controlflow.cfg/controlflow.cfg.json", detail=f"{paragraph} edges"),
-            _cite("dataflow.literal_assignments/dataflow.literal_assignments.json", detail=f"{paragraph} literals"),
-            _cite("architecture.call_parameters/architecture.call_parameters.json", detail=f"{paragraph} calls"),
-            _cite("dataflow.variable/*.json", detail=f"{paragraph} variable sites"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _answer_prep_riga_row_build(root: Path, program: str) -> str | None:
-    paragraph = "PREP-RIGA"
-    variable_sites = [
-        *_paragraph_variable_sites(root, program, paragraph),
-        *_paragraph_variable_sites(root, program, "PREP-RIGA-010"),
-    ]
-    if not variable_sites:
-        return None
-
-    by_line = {int(site["line"]): site for site in variable_sites if str(site.get("line", "")).isdigit()}
-    interesting_lines = [701, 702, 703, 707, 708, 709, 712, 713, 714, 715, 716, 724, 725, 732, 734, 736, 737, 739]
-    lines = [f"{program} builds each displayed row in `PREP-RIGA` from dataflow and CFG evidence:"]
-
-    descriptions = {
-        701: "clears `RIGA-MAPPA`, the row buffer.",
-        702: "moves `WCTRIG` to `WPROGR`, the displayed row/progressivo marker.",
-        703: "moves `PD1VOCI-TABVOX-CODVOX(PD1VOCI-IND)` to `VOCE`, the accounting voice code source.",
-        707: "sets `FUNZ`: spaces for insert flow, otherwise `PD1VOCI-TABVOX-TIPVAR(PD1VOCI-IND)`.",
-        708: "moves `WVOCE` to `WCODVO`, preparing the displayed voice code field.",
-        709: "moves `PD1VOCI-TABVOX-DESCRIZ(PD1VOCI-IND)` to `WDESCVO`, the displayed description.",
-        712: "moves `PD1VOCI-TABVOX-INIZ(PD1VOCI-IND)` to `WDATE2` for start-date formatting.",
-        713: "moves `WDATE2-AA34` to `WDATA-AA`.",
-        714: "moves `WDATE2-MM` to `WDATA-MM`.",
-        715: "moves `WDATE2-GG` to `WDATA-GG`.",
-        716: "moves formatted `WDATA` to `DATA-IMPIANTO`, the displayed start date.",
-        724: "checks whether `PD1VOCI-TABVOX-FINE(PD1VOCI-IND)` is spaces for the end date.",
-        725: "when the end date is blank, moves the placeholder `'   -    '` to `DATA-CESSAZIONE`.",
-        732: "sets `PDRUTI01-FUNZIONE` to `'05'` before amount formatting.",
-        734: "moves the raw installment value to `PDRUTI01-F05-VALORE`.",
-        736: "moves formatted `PDRUTI01-F05-IMPOX11` to `IMPORTO-RATA`, the displayed installment amount.",
-        737: "moves `PD1VOCI-TABVOX-PROGVOX(PD1VOCI-IND)` to `WPROGREC`, the record progressivo.",
-        739: "moves the built `RIGA-MAPPA` into `MRIGAO(WCTRIG)`.",
-    }
-    for line in interesting_lines:
-        site = by_line.get(line)
-        if not site:
-            continue
-        lines.append(f"- line {line}: {descriptions[line]} `{site['statement']}`")
-
-    outgoing = [edge for edge in _cfg_edges(root, program) if str(edge.get("from", "")).upper() == paragraph]
-    if outgoing:
-        lines.append("- control/service steps:")
-        for edge in outgoing:
-            condition = edge.get("condition") or "unconditional"
-            lines.append(f"  - `{paragraph}` -> `{edge.get('to')}` when `{condition}` ({edge.get('evidence', '')})")
-
-    _append_evidence(
-        lines,
-        [
-            _cite("dataflow.variable/*.json", detail="PREP-RIGA row variable sites"),
-            _cite("controlflow.cfg/controlflow.cfg.json", detail="PREP-RIGA service/control edges"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _paragraph_variable_sites(root: Path, program: str, paragraph: str) -> list[dict[str, str]]:
-    sites: list[dict[str, str]] = []
-    dataflow_dir = root / "dataflow.variable"
-    if not dataflow_dir.exists():
-        return sites
-    for path in sorted(dataflow_dir.glob("dataflow.variable.*.json")):
-        payload = _read_json(path)
-        if not isinstance(payload, dict) or payload.get("program") != program:
-            continue
-        variable = str(payload.get("content", {}).get("variable", "")).upper()
-        evidence = payload.get("content", {}).get("evidence", {})
-        for kind, key in (("write", "write_sites"), ("read", "read_sites"), ("control", "control_sites")):
-            for site in evidence.get(key, []):
-                if str(site.get("paragraph", "")).upper() != paragraph:
-                    continue
-                sites.append(
-                    {
-                        "kind": kind,
-                        "variable": variable,
-                        "line": str(site.get("line_start", "?")),
-                        "statement": str(site.get("statement", "")).strip(),
-                    }
-                )
-    return sorted(
-        sites,
-        key=lambda item: (
-            int(item["line"]) if str(item.get("line", "")).isdigit() else 10**9,
-            item["variable"],
-            item["kind"],
-        ),
-    )
-
-
-def _answer_error_paths(root: Path, program: str) -> str | None:
-    edges = _cfg_edges(root, program)
-    abend_edges = [edge for edge in edges if edge.get("to") == "ABEND00"]
-    message_edges = [
-        edge for edge in edges
-        if edge.get("to") in {"BROWSE-FASE2-TASTOER", "BROWSE-FASE2-NOTFND"}
-    ]
-    restriction_edges = [
-        edge for edge in edges
-        if edge.get("to") == "XCTL-LIV4"
-        and any(term in str(edge.get("condition", "")) for term in ("PXCSEMAF-STATUS", "PD1VOCI-TABVOX-NUMERO"))
-    ]
-    lines = [f"{program} error/message and abnormal paths from structured artifacts:"]
-    if abend_edges:
-        lines.append("- abnormal termination / ABEND00:")
-        for edge in abend_edges[:12]:
-            condition = edge.get("condition") or "unconditional"
-            lines.append(f"  - `{edge.get('from')}` -> `ABEND00` when `{condition}` ({edge.get('evidence', '')})")
-    if message_edges:
-        lines.append("- user-facing error/message paths:")
-        for edge in message_edges[:8]:
-            condition = edge.get("condition") or "unconditional"
-            lines.append(f"  - `{edge.get('from')}` -> `{edge.get('to')}` when `{condition}` ({edge.get('evidence', '')})")
-    if restriction_edges:
-        lines.append("- restriction / early-transfer paths (not ABEND00):")
-        for edge in restriction_edges[:6]:
-            condition = edge.get("condition") or "unconditional"
-            lines.append(f"  - `{edge.get('from')}` -> `{edge.get('to')}` when `{condition}` ({edge.get('evidence', '')})")
-    message_field_lines: list[str] = []
-    for name in ("M1MSGO", "M1MSGL", "SCELTAL"):
-        variable = _variable_payload(root, program, name)
-        if variable:
-            message_field_lines.append(f"  - `{name}` writes:")
-            message_field_lines.extend(_site_lines(variable, "write_sites", limit=5, indent="    "))
-    if message_field_lines:
-        lines.append("- supporting message/cursor field writes (evidence for messages, not separate control paths):")
-        lines.extend(message_field_lines)
-    sqlerror = _variable_payload(root, program, "SQLERROR")
-    if sqlerror:
-        lines.append("- SQL handling evidence:")
-        lines.extend(_site_lines(sqlerror, "read_sites", limit=3, indent="  "))
-    _append_evidence(
-        lines,
-        [
-            _cite("controlflow.cfg/controlflow.cfg.json", detail="ABEND/message/restriction edges"),
-            _cite("dataflow.variable/*.json", detail="message and SQL variable sites"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _answer_variables_from_question(root: Path, program: str, question: str) -> str | None:
-    variables = [_variable_payload(root, program, name) for name in _variables_in_question(question)]
-    variables = [variable for variable in variables if variable]
-    if not variables:
-        return None
-    lines = [f"{program} variable evidence:"]
-    for variable in variables[:4]:
-        lines.append(_format_variable_lineage(program, variable))
-    return "\n\n".join(lines)
-
-
-def _answer_copybooks(root: Path, program: str, q: str) -> str | None:
-    payload = _read_json(root / "architecture.copybooks" / "architecture.copybooks.json")
+    q: str,
+    plan: QueryPlan | None = None,
+) -> str | None:
+    payload_path = _artifact_path(root, "architecture.copybooks.json")
+    payload = _read_json(payload_path)
     if not isinstance(payload, dict) or payload.get("program") != program:
         return None
     content = payload.get("content", {})
     all_copybooks = content.get("all", [])
     classified = content.get("classified", {})
+    location_terms = (
+        "division", "section", "source line", "line number", "copy statement",
+        "copy statements", "where included", "where is each included",
+    )
+    if any(term in q for term in location_terms):
+        inclusions = [item for item in content.get("inclusions", []) if isinstance(item, dict)]
+        if plan and plan.divisions:
+            allowed_divisions = {value.upper() for value in plan.divisions}
+            inclusions = [
+                item for item in inclusions
+                if str(item.get("division", "")).upper() in allowed_divisions
+            ]
+        if plan and plan.sections:
+            allowed_sections = {value.upper() for value in plan.sections}
+            inclusions = [
+                item for item in inclusions
+                if str(item.get("section", "")).upper() in allowed_sections
+            ]
+        if plan:
+            requested_copybooks = {value.upper() for value in plan.entity_values_for("copybook")}
+            if requested_copybooks:
+                inclusions = [
+                    item for item in inclusions
+                    if str(item.get("copybook", "")).upper() in requested_copybooks
+                ]
+        if not inclusions:
+            if content.get("inclusions"):
+                requested_scope = ", ".join((plan.divisions + plan.sections) if plan else ()) or "the requested scope"
+                return f"No COPY statement matched {requested_scope} in {program}. Source: `{payload_path.name}`."
+            return (
+                f"{program} copybook names are indexed, but the artifact does not contain COPY "
+                "line/division evidence. Rebuild the analysis with source-location enrichment. "
+                f"Source: `{payload_path.name}`."
+            )
+        lines = [f"COPY statements in {program}:"]
+        for item in sorted(inclusions, key=lambda value: int(value.get("line", 0))):
+            section = str(item.get("section") or "UNKNOWN")
+            section_text = f", {section}" if section != "UNKNOWN" else ""
+            lines.append(
+                f"- {item.get('copybook')}: {item.get('division', 'UNKNOWN')}{section_text}, "
+                f"{item.get('source_file', program + '.CBL')} line {item.get('line')} — "
+                f"`{item.get('statement', '')}`"
+            )
+        lines.append(f"Source: `{payload_path.name}`.")
+        return "\n".join(lines)
+    if "only" in q and not any(term in q for term in ("role", "purpose", "used", "unused")):
+        return f"{program} COPY members: {', '.join(all_copybooks)}. Source: `{payload_path.name}`."
     if "unused" in q:
-        artifact = load_or_build_unused_copybooks(root, program)
-        artifact_content = artifact.get("content", {})
-        referenced = artifact_content.get("referenced_copybooks", [])
-        needs_review = artifact_content.get("needs_review_copybooks", [])
-        status_items = artifact_content.get("copybook_status", [])
+        used_origins = _copybook_origins_from_dataflow(root, program)
+        heuristic_unused = [name for name in all_copybooks if name not in used_origins]
         lines = [
-            f"{program} COPY usage heuristic from `architecture.unused_copybooks`:",
-            "This is not a full unused-copybook proof; it compares COPY members against available dataflow/call artifacts.",
-            f"- Proof level: {artifact_content.get('proof_level', 'available-artifact review')}.",
-            f"- COPY members listed: {', '.join(artifact_content.get('all_copybooks', all_copybooks))}",
-            f"- COPY members with reference evidence: {', '.join(referenced) or 'none'}",
-            (
-                f"- Need review / possibly unused by this heuristic ({len(needs_review)}): "
-                f"{', '.join(needs_review) or 'none'}"
-            ),
-            "- Proven unused COPY members: none from the available artifacts.",
+            f"{program} COPY usage heuristic:",
+            "This is not a full unused-copybook proof; it compares COPY members against dataflow variable origins.",
+            f"- COPY members listed: {', '.join(all_copybooks)}",
+            f"- COPY members with variables referenced in dataflow: {', '.join(sorted(used_origins)) or 'none'}",
+            f"- Need review / possibly unused by this heuristic: {', '.join(heuristic_unused) or 'none'}",
         ]
-        if status_items:
-            lines.append("- per-copybook status:")
-            for item in status_items:
-                evidence = item.get("evidence", [])
-                citation = ""
-                if evidence:
-                    citation = f" [{evidence[0].get('citation') or evidence[0].get('source')}]"
-                lines.append(f"  - {item.get('copybook')}: {item.get('status')}{citation}")
-        _append_evidence(
-            lines,
-            [
-                _cite("architecture.unused_copybooks/architecture.unused_copybooks.json", detail="derived artifact"),
-                _cite("architecture.copybooks/architecture.copybooks.json", detail="content.all"),
-                _cite("dataflow.used_variables/dataflow.used_variables.json", detail="copybook-origin evidence"),
-                _cite("dataflow.variable/*.json", detail="copybook-origin evidence"),
-                _cite("architecture.call_parameters/architecture.call_parameters.json", detail="parameter evidence"),
-            ],
-        )
         return "\n".join(lines)
-    lines = [f"{program} COPY members ({len(all_copybooks)}): {', '.join(all_copybooks)}."]
-    lines.append("- role/context from available artifacts:")
-    for copybook in all_copybooks:
-        lines.append(f"  - `{copybook}`: {_copybook_role(root, program, str(copybook), classified)}")
-    if classified:
-        lines.append("- classification groups:")
-        for category, names in classified.items():
-            lines.append(f"  - {category}: {', '.join(names)}")
-    _append_evidence(lines, [_cite("architecture.copybooks/architecture.copybooks.json", detail="content.classified")])
-    return "\n".join(lines)
-
-
-def _copybook_role(root: Path, program: str, copybook: str, classified: dict[str, Any]) -> str:
-    name = copybook.upper()
-    categories = [category for category, names in classified.items() if name in {str(item).upper() for item in names}]
-    category_text = f"category `{', '.join(categories)}`" if categories else "listed COPY member"
-    variable_prefixes = {
-        "PD1FS00": "PD1FS00 service/session COMMAREA fields, including return and session status fields.",
-        "PD1VOCI": "PD1VOCI accounting-voice COMMAREA/table fields used before and after the CICS LINK.",
-        "PDCBVCM": "PDCBVC map/BMS screen fields such as selection/message/display fields.",
-        "PDRUTI01": "PD0UTI01 utility COMMAREA fields used for formatting values.",
-        "PXCSEMAF": "PXRSEMAF semaphore request/response area for `PDAGGVIP`.",
-        "PDIABEND": "abnormal-termination/ABEND support area.",
-        "PDRTWA2": "TWA/state context fields used through `TWCOB-*` data.",
-        "PDSAVTW2": "saved TWA/state context support.",
-        "DFHAID": "CICS AID key constants such as ENTER/PF keys.",
-        "DFHBMSCA": "CICS BMS map attribute constants; no direct field reference is proven in the current dataflow artifacts.",
-        "PDRTIP01": "business COPY member listed by architecture; no specific field role is proven in the current dataflow artifacts.",
-        "PDRVC": "business/state COPY member listed by architecture; no specific field role is proven in the current dataflow artifacts.",
+    category_purposes = {
+        "ui_cics": "UI and CICS constants or map definitions",
+        "business": "business data structures and program interfaces",
+        "utilities": "shared utility and service interfaces",
+        "state_context": "transaction state and context structures",
+        "error_handling": "error and abend handling structures",
     }
-    if name in variable_prefixes:
-        return f"{variable_prefixes[name]} ({category_text})"
-
-    matching = []
-    dataflow_dir = root / "dataflow.variable"
-    if dataflow_dir.exists():
-        for path in dataflow_dir.glob(f"dataflow.variable.{name}-*.json"):
-            matching.append(path.stem.replace("dataflow.variable.", ""))
-            if len(matching) >= 4:
-                break
-    if matching:
-        return f"fields referenced in dataflow: {', '.join(matching)}. ({category_text})"
-    return f"{category_text}; no more specific role is proven by the current artifacts."
-
-
-def _answer_screen_field_lineage(root: Path, program: str, question: str) -> str | None:
-    artifact = load_or_build_screen_field_lineage(root, program)
-    content = artifact.get("content", {})
-    fields = content.get("fields", [])
-    if not isinstance(fields, list) or not fields:
-        return _answer_screen_field_lineage_fallback(root, program, question, content)
-
-    by_name = {str(item.get("field", "")).upper(): item for item in fields if isinstance(item, dict)}
-    tokens = [
-        token
-        for token in re.findall(r"\b[A-Z][A-Z0-9-]{2,}\b", question.upper())
-        if token not in {"PDCBVC", "SCREEN", "FIELD", "MAP", "DATA", "ORIGIN", "COMPUTATION", "VARIABLE"}
-    ]
-    exact = next((token for token in tokens if token in by_name), None)
-    if exact:
-        return _format_screen_field_lineage(program, by_name[exact])
-
-    related = []
-    for token in tokens:
-        related.extend(
-            name
-            for name, field in by_name.items()
-            if name.startswith(token)
-            or token.startswith(name)
-            or str(field.get("family", "")).startswith(token)
-            or token.startswith(str(field.get("family", "")))
-        )
-    related = sorted(set(related))
-    if related:
-        lines = [f"I found several {program} screen/map fields matching the reference:"]
-        for name in related[:10]:
-            field = by_name[name]
-            lines.append(
-                f"- {name}: origin {field.get('origin', '?')}; "
-                f"family {field.get('family', '?')}; "
-                f"modified in {_join_or_none(field.get('modified_in', []))}; "
-                f"used in {_join_or_none(field.get('used_in', []))}; "
-                f"controls flow: {'yes' if field.get('controls_flow') else 'no'}"
-            )
-        lines.append("Ask again with one exact field name to get the full origin/computation trace.")
-        _append_evidence(lines, [_cite("screen_field_lineage/screen_field_lineage.json", detail="fields")])
-        return "\n".join(lines)
-
-    candidate_names = sorted(by_name)[:20]
-    lines = [
-        "I need the concrete map field name to trace data origin/computation safely.",
-        (
-            f"For {program}, `screen_field_lineage` can trace {len(by_name)} screen/map variables "
-            f"from copybook origin(s) {', '.join(content.get('copybook_origins', [])) or 'unknown'}."
-        ),
-        f"Examples: {', '.join(candidate_names)}.",
-        "Ask for one field, for example: `What feeds SCELTAI on the screen?`",
-    ]
-    _append_evidence(lines, [_cite("screen_field_lineage/screen_field_lineage.json", detail="fields")])
+    lines = [f"{program} uses {len(all_copybooks)} COBOL COPY members:"]
+    for category, names in classified.items():
+        purpose = category_purposes.get(category, category.replace("_", " "))
+        lines.append(f"- {', '.join(names)} — {purpose}.")
+    lines.append(f"Source: `{payload_path.name}`. The purpose categories are analyzer classifications.")
     return "\n".join(lines)
-
-
-def _answer_screen_field_lineage_fallback(
-    root: Path,
-    program: str,
-    question: str,
-    lineage_content: dict[str, Any],
-) -> str | None:
-    variables = _known_variables(root, program)
-    tokens = [
-        token
-        for token in re.findall(r"\b[A-Z][A-Z0-9-]{2,}\b", question.upper())
-        if token in variables
-    ]
-    if not tokens:
-        return None
-    variable_name = tokens[0]
-    payload = _variable_payload(root, program, variable_name)
-    if not payload:
-        return None
-
-    family = _map_field_family(variable_name)
-    family_members = sorted(name for name in variables if _map_field_family(name) == family)
-    lines = [
-        f"{program} screen/map field `{variable_name}` evidence:",
-        (
-            "`screen_field_lineage` is present but has no field records for this run, "
-            "so this answer falls back to `dataflow.variable` evidence."
-        ),
-        _format_variable_lineage(program, payload),
-    ]
-    map_copybooks = _map_copybook_candidates(root, program)
-    if map_copybooks:
-        lines.append("")
-        lines.append(
-            "Map copybook context: "
-            + ", ".join(f"`COPY:{copybook}`" for copybook in map_copybooks)
-            + " is listed for this program. The dataflow origin for this field is still `UNKNOWN`, "
-            "so treat the copybook link as screen/map context until a compiler-expanded copybook parser confirms it."
-        )
-    related = [name for name in family_members if name != variable_name]
-    if related:
-        lines.append("")
-        lines.append(f"Same BMS-style field family `{family}` from dataflow variables: {', '.join(family_members)}.")
-        lines.append("Related family members can represent input/output/length/attribute variants, but origin is only proven when the dataflow artifact says so.")
-        for name in related[:8]:
-            related_payload = _variable_payload(root, program, name)
-            if not related_payload:
-                continue
-            content = related_payload.get("content", {})
-            lines.append(
-                f"- `{name}`: origin {content.get('origin', '?')}; "
-                f"modified in {_join_or_none(content.get('modified_in', []))}; "
-                f"used in {_join_or_none(content.get('used_in', []))}"
-            )
-    if lineage_content.get("limitations"):
-        lines.append("")
-        lines.append("Lineage limitation: " + str(lineage_content.get("limitations", [""])[0]))
-    _append_evidence(
-        lines,
-        [
-            _cite("screen_field_lineage/screen_field_lineage.json", detail="fields_count=0"),
-            _cite(f"dataflow.variable/dataflow.variable.{variable_name}.json", detail="fallback variable evidence"),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _map_copybook_candidates(root: Path, program: str) -> list[str]:
-    payload = _read_json(root / "architecture.copybooks" / "architecture.copybooks.json")
-    if not isinstance(payload, dict) or payload.get("program") != program:
-        return []
-    copybooks = [str(name).upper() for name in payload.get("content", {}).get("all", [])]
-    candidates = [name for name in copybooks if name == f"{program}M" or name.endswith("MAP") or name.endswith("BMS")]
-    return list(dict.fromkeys(candidates))
-
-
-def _map_field_family(variable: str) -> str:
-    variable = variable.upper()
-    if len(variable) > 1 and variable[-1] in {"I", "O", "L", "A", "F"}:
-        return variable[:-1]
-    return variable
-
-
-def _screen_variables(root: Path, program: str) -> list[dict[str, Any]]:
-    variables: list[dict[str, Any]] = []
-    for path in sorted((root / "dataflow.variable").glob("dataflow.variable.*.json")):
-        payload = _read_json(path)
-        if not isinstance(payload, dict) or payload.get("program") != program:
-            continue
-        content = payload.get("content", {})
-        origin = str(content.get("origin", "")).upper()
-        if origin == "COPY:PDCBVCM":
-            variables.append(payload)
-    return variables
-
-
-def _format_variable_lineage(program: str, payload: dict[str, Any]) -> str:
-    content = payload.get("content", {})
-    variable = content.get("variable", "?")
-    lines = [
-        f"{program} variable `{variable}`:",
-        f"- origin: {content.get('origin', '?')}",
-        f"- defined in: {_join_or_none(content.get('defined_in', []))}",
-        f"- modified in: {_join_or_none(content.get('modified_in', []))}",
-        f"- used in: {_join_or_none(content.get('used_in', []))}",
-        f"- controls flow: {'yes' if content.get('controls_flow') else 'no'}",
-    ]
-    evidence = content.get("evidence", {})
-    for label, key in (("writes", "write_sites"), ("reads", "read_sites"), ("controls", "control_sites")):
-        sites = evidence.get(key, [])
-        if not sites:
-            continue
-        lines.append(f"- {label}:")
-        for site in sites[:6]:
-            line = site.get("line_start", "?")
-            paragraph = site.get("paragraph", "?")
-            statement = str(site.get("statement", "")).strip()
-            lines.append(f"  - line {line} {paragraph}: {statement} [{_site_citation(payload, line)}]")
-    _append_evidence(lines, [_site_citation(payload, _line_from_site_list(payload, "read_sites") or _line_from_site_list(payload, "write_sites"))])
-    return "\n".join(lines)
-
-
-def _format_screen_field_lineage(program: str, field: dict[str, Any]) -> str:
-    name = str(field.get("field", "?"))
-    lines = [
-        f"{program} screen/map field `{name}` lineage from `screen_field_lineage`:",
-        f"- origin: {field.get('origin', '?')}",
-        f"- BMS-style family: {field.get('family', '?')} ({', '.join(field.get('family_members', [])) or name})",
-        f"- defined in: {_join_or_none(field.get('defined_in', []))}",
-        f"- modified in: {_join_or_none(field.get('modified_in', []))}",
-        f"- used in: {_join_or_none(field.get('used_in', []))}",
-        f"- controls flow: {'yes' if field.get('controls_flow') else 'no'}",
-    ]
-    if field.get("read_sites"):
-        lines.append("- read/input/control use:")
-        for site in field.get("read_sites", [])[:8]:
-            lines.append(
-                f"  - line {site.get('line_start')} `{site.get('paragraph')}`: "
-                f"{site.get('statement')} [{site.get('citation')}]"
-            )
-    if field.get("write_sites"):
-        lines.append("- direct writes:")
-        for site in field.get("write_sites", [])[:8]:
-            lines.append(
-                f"  - line {site.get('line_start')} `{site.get('paragraph')}`: "
-                f"{site.get('statement')} [{site.get('citation')}]"
-            )
-    if field.get("control_sites"):
-        lines.append("- control-flow use:")
-        for site in field.get("control_sites", [])[:8]:
-            lines.append(
-                f"  - line {site.get('line_start')} `{site.get('paragraph')}`: "
-                f"{site.get('statement')} [{site.get('citation')}]"
-            )
-    if field.get("literal_assignments"):
-        lines.append("- related screen literal/attribute assignments in the same field family:")
-        for item in field.get("literal_assignments", [])[:8]:
-            lines.append(
-                f"  - line {item.get('line')} `{item.get('paragraph')}`: "
-                f"{item.get('target_variable')} = {item.get('literal')} [{item.get('citation')}]"
-            )
-    if field.get("related_variables"):
-        lines.append("- connected variables seen in the same statements:")
-        for item in field.get("related_variables", [])[:8]:
-            lines.append(
-                f"  - `{item.get('variable')}` at line {item.get('line')} "
-                f"({item.get('relationship')}) [{item.get('citation')}]"
-            )
-    _append_evidence(
-        lines,
-        [
-            _cite("screen_field_lineage/screen_field_lineage.json", detail=name),
-            str(field.get("source_artifact", "")),
-        ],
-    )
-    return "\n".join(lines)
-
-
-def _join_or_none(values: list[Any]) -> str:
-    return ", ".join(str(value) for value in values) if values else "none"
 
 
 def _copybook_origins_from_dataflow(root: Path, program: str) -> set[str]:
     origins: set[str] = set()
-    copybooks_payload = _read_json(root / "architecture.copybooks" / "architecture.copybooks.json")
+    copybooks_payload = _read_json(_artifact_path(root, "architecture.copybooks.json"))
     known_copybooks = set()
     if isinstance(copybooks_payload, dict) and copybooks_payload.get("program") == program:
         known_copybooks = set(copybooks_payload.get("content", {}).get("all", []))
@@ -2425,7 +1138,7 @@ def _copybook_origins_from_dataflow(root: Path, program: str) -> set[str]:
             if value == copybook or value.startswith(f"{copybook}-"):
                 origins.add(copybook)
 
-    used = _read_json(root / "dataflow.used_variables" / "dataflow.used_variables.json")
+    used = _read_json(_artifact_path(root, "dataflow.used_variables.json"))
     if isinstance(used, dict) and used.get("program") == program:
         for variable in used.get("variables", []):
             mark_by_prefix(str(variable.get("variable", "")))
@@ -2441,12 +1154,12 @@ def _copybook_origins_from_dataflow(root: Path, program: str) -> set[str]:
             origins.add(origin.split(":", 1)[1])
         mark_by_prefix(str(payload.get("content", {}).get("variable", "")))
 
-    literals = _read_json(root / "dataflow.literal_assignments" / "dataflow.literal_assignments.json")
+    literals = _read_json(_artifact_path(root, "dataflow.literal_assignments.json"))
     if isinstance(literals, dict) and literals.get("program") == program:
         for item in literals.get("assignments", []):
             mark_by_prefix(str(item.get("target_variable", "")))
 
-    calls = _read_json(root / "architecture.call_parameters" / "architecture.call_parameters.json")
+    calls = _read_json(_artifact_path(root, "architecture.call_parameters.json"))
     if isinstance(calls, dict) and calls.get("program") == program:
         for call in calls.get("calls", []):
             for parameter in call.get("parameters", []):
@@ -2462,7 +1175,7 @@ def _copybook_origins_from_dataflow(root: Path, program: str) -> set[str]:
 
 
 def _uses_cics_aid_constants(root: Path, program: str) -> bool:
-    used = _read_json(root / "dataflow.used_variables" / "dataflow.used_variables.json")
+    used = _read_json(_artifact_path(root, "dataflow.used_variables.json"))
     if not isinstance(used, dict) or used.get("program") != program:
         return False
     for variable in used.get("variables", []):
@@ -2473,93 +1186,117 @@ def _uses_cics_aid_constants(root: Path, program: str) -> bool:
     return False
 
 
-def _answer_db2_sql(root: Path, program: str) -> str | None:
+def _answer_db2_sql(
+    root: Path,
+    program: str,
+    q: str = "",
+    plan: QueryPlan | None = None,
+) -> str | None:
     db2_files = sorted((root / "architecture.db2_table").glob("architecture.db2_table.*.json"))
     sql_files = sorted((root / "architecture.sqlinclude").glob("architecture.sqlinclude.*.json"))
-    db2 = [_read_json(path) for path in db2_files]
-    sql = [_read_json(path) for path in sql_files]
-    db2 = [item for item in db2 if isinstance(item, dict) and item.get("program") == program]
-    sql = [item for item in sql if isinstance(item, dict) and item.get("program") == program]
-    if not db2 and not sql:
+    db2_items = [
+        (path, payload)
+        for path in db2_files
+        if isinstance((payload := _read_json(path)), dict) and payload.get("program") == program
+    ]
+    sql_items = [
+        (path, payload)
+        for path in sql_files
+        if isinstance((payload := _read_json(path)), dict) and payload.get("program") == program
+    ]
+    if not db2_items and not sql_items:
         return None
-    lines = [f"{program} DB2/SQL evidence:"]
-    for item in db2:
-        content = item.get("content", {})
-        table = content.get("table") or item.get("title", "").replace(f"{program} DB2 table ", "")
-        statement_type = content.get("statement_type") or content.get("verb") or "unknown statement"
-        lines.append(f"- DB2 table {table}: {statement_type}")
-    if sql:
-        includes = [str(item.get("content", {}).get("include") or item.get("title", "")) for item in sql]
-        lines.append(f"- SQL includes: {', '.join(includes)}")
-    _append_evidence(
-        lines,
-        [
-            _cite("architecture.db2_table/*.json", detail="DB2 table artifacts"),
-            _cite("architecture.sqlinclude/*.json", detail="SQL include artifacts"),
-        ],
+
+    include_types = set(plan.include_types) if plan else set()
+    exclude_types = set(plan.exclude_types) if plan else set()
+    if include_types:
+        show_includes = bool(sql_items) and "sql_include" in include_types
+        show_tables = bool(db2_items) and "db2_table" in include_types
+    else:
+        asks_includes = "include" in q or "sqlinclude" in q
+        asks_tables = "table" in q or "tables" in q
+        show_includes = bool(sql_items) and (asks_includes or not asks_tables)
+        show_tables = bool(db2_items) and (asks_tables or not asks_includes)
+    show_includes = show_includes and "sql_include" not in exclude_types
+    show_tables = show_tables and "db2_table" not in exclude_types
+
+    if not show_includes and not show_tables:
+        requested = ", ".join(sorted(include_types)) or "the requested DB2/SQL evidence"
+        return f"No {requested} matched after applying the query exclusions for {program}."
+
+    only_names_and_locations = bool(
+        (plan and plan.only_requested_fields)
+        or ("only" in q and any(
+            term in q for term in ("location", "locations", "source", "artifact", "path", "line")
+        ))
     )
+    asks_source_line = bool(
+        (plan and "source_line" in plan.output_fields)
+        or "source line" in q
+        or "line number" in q
+    )
+
+    lines = [f"{program} DB2/SQL evidence:"]
+    if only_names_and_locations:
+        if show_tables:
+            for path, item in db2_items:
+                content = item.get("content", {})
+                table = content.get("table") or item.get("title", "").replace(f"{program} DB2 table ", "")
+                location = f"source line unavailable; artifact `{path.name}`" if asks_source_line else f"artifact `{path.name}`"
+                lines.append(f"- DB2 table {table} — {location}")
+        if show_includes:
+            for path, item in sql_items:
+                include = str(item.get("content", {}).get("include") or item.get("title", ""))
+                location = f"source line unavailable; artifact `{path.name}`" if asks_source_line else f"artifact `{path.name}`"
+                lines.append(f"- SQL include {include} — {location}")
+        return "\n".join(lines)
+
+    if show_tables:
+        for _, item in db2_items:
+            content = item.get("content", {})
+            table = content.get("table") or item.get("title", "").replace(f"{program} DB2 table ", "")
+            statement_type = (
+                content.get("statement_type")
+                or content.get("stmt_type")
+                or content.get("verb")
+                or "statement type unavailable"
+            )
+            lines.append(f"- DB2 table {table}: {statement_type}")
+    if show_includes:
+        includes = [
+            str(item.get("content", {}).get("include") or item.get("title", ""))
+            for _, item in sql_items
+        ]
+        joined_includes = ", ".join(includes)
+        lines.append(f"- SQL includes: {joined_includes}")
+    source_paths = ([path for path, _ in db2_items] if show_tables else []) + (
+        [path for path, _ in sql_items] if show_includes else []
+    )
+    joined_sources = ", ".join(f"`{path.name}`" for path in source_paths)
+    lines.append(f"Source artifacts: {joined_sources}.")
     return "\n".join(lines)
 
 
 def _answer_datasets(root: Path, program: str) -> str:
-    artifact = load_or_build_jcl_file_io(root, program)
-    content = artifact.get("content", {})
-    if content.get("has_jcl_linkage"):
-        lines = [f"{program} JCL file-I/O evidence from `jcl.file_io`:"]
-        evidence: list[str] = [_cite("jcl.file_io/" + f"jcl.file_io.{program.upper()}.json", detail="derived artifact")]
-        jobs = content.get("matching_jobs", [])
-        if jobs:
-            lines.append("- matching job(s): " + ", ".join(str(job.get("job")) for job in jobs))
-        reads = content.get("reads", [])
-        writes = content.get("writes", [])
-        sysout = content.get("sysout", [])
-        if reads:
-            lines.append(f"- reads ({len(reads)}):")
-            for item in reads[:10]:
-                lines.append(
-                    f"  - {item.get('job')}/{item.get('step')} {item.get('ddname')}: "
-                    f"{item.get('dsn')} [{item.get('citation')}]"
-                )
-                evidence.append(str(item.get("citation", "")))
-        if writes:
-            lines.append(f"- writes/produces ({len(writes)}):")
-            for item in writes[:10]:
-                lines.append(
-                    f"  - {item.get('job')}/{item.get('step')} {item.get('ddname')}: "
-                    f"{item.get('dsn')} [{item.get('citation')}]"
-                )
-                evidence.append(str(item.get("citation", "")))
-        if sysout:
-            lines.append(f"- SYSOUT outputs ({len(sysout)}):")
-            for item in sysout[:8]:
-                lines.append(
-                    f"  - {item.get('job')}/{item.get('step')} {item.get('ddname')}: "
-                    f"SYSOUT={item.get('sysout')} OUTPUT={item.get('output')} [{item.get('citation')}]"
-                )
-                evidence.append(str(item.get("citation", "")))
-        _append_evidence(lines, evidence)
-        return "\n".join(lines)
-
-    known_jobs = content.get("known_jobs", [])
-    known_programs = content.get("known_programs_sample", [])
-    lines = [
-        f"`jcl.file_io` found no JCL dataset/file-I/O linkage for {program}. "
-        "Produced datasets are not evidenced for this program in the available final_scripts artifacts. "
-        f"Known JCL job(s) in the artifact set: {', '.join(known_jobs) or 'none'}. "
-        f"Known batch program sample: {', '.join(known_programs[:10]) or 'none'}."
-    ]
-    _append_evidence(
-        lines,
-        [
-            _cite("jcl.file_io/" + f"jcl.file_io.{program.upper()}.json", detail="derived artifact"),
-            _cite("jcl/**/*.json", detail="scanned JCL summaries and steps"),
-        ],
+    matched_jobs: list[str] = []
+    for summary in (root / "jcl").glob("**/jcl.summary.json"):
+        payload = _read_json(summary)
+        if not isinstance(payload, dict):
+            continue
+        programs = {str(item).upper() for item in payload.get("programs", [])}
+        if program.upper() in programs:
+            matched_jobs.append(str(payload.get("job", summary.parent.name)))
+    if matched_jobs:
+        return f"{program} appears in JCL job(s): {', '.join(sorted(set(matched_jobs)))}. Check the job dataset artifacts for inputs/outputs."
+    return (
+        f"I found no JCL dataset/file-I/O artifact connecting {program} to produced datasets in `final_scripts`. "
+        f"The analyzed evidence for {program} does not establish dataset production or a batch dataset-producing role."
     )
-    return "\n".join(lines)
 
 
 def _answer_ui_navigation(root: Path, program: str) -> str | None:
-    payload = _read_json(root / "ui.cics.navigation" / "ui.cics.navigation.json")
+    payload_path = _artifact_path(root, "ui.cics.navigation.json")
+    payload = _read_json(payload_path)
     if not isinstance(payload, dict) or payload.get("program") != program:
         return None
     actions = payload.get("content", {}).get("actions", [])
@@ -2569,24 +1306,1032 @@ def _answer_ui_navigation(root: Path, program: str) -> str | None:
             f"- {action.get('context')}: key {action.get('key')} -> {action.get('target')} "
             f"({action.get('edge_type')})"
         )
-    _append_evidence(lines, [_cite("ui.cics.navigation/ui.cics.navigation.json", detail="content.actions/maps")])
+    lines.append(f"Source: `{payload_path.name}`.")
     return "\n".join(lines)
 
 
-def _answer_business_rules(root: Path, program: str) -> str | None:
-    rules = []
+def _answer_business_rules(
+    root: Path,
+    program: str,
+    plan: QueryPlan | None = None,
+) -> str | None:
+    rules: list[tuple[Path, dict[str, Any]]] = []
     for path in sorted((root / "business_rule").glob("business_rule*.json")):
         payload = _read_json(path)
         if isinstance(payload, dict) and payload.get("program") == program:
-            rules.append(payload)
+            rules.append((path, payload))
     if not rules:
         return None
-    lines = [f"{program} business rules: {len(rules)} rule artifact(s)."]
-    for rule in rules[:20]:
+    unique_rules: list[tuple[Path, dict[str, Any]]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for path, rule in rules:
+        content = rule.get("content", {})
+        key = (
+            str(content.get("scope", "")).strip(),
+            str(content.get("condition", "")).strip(),
+            str(content.get("action", "")).strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_rules.append((path, rule))
+
+    if plan:
+        requested = {
+            value.upper()
+            for value in plan.entity_values_for("variable", "paragraph", "unknown_identifier")
+        }
+        if requested:
+            matched = []
+            for path, rule in unique_rules:
+                content = rule.get("content", {})
+                searchable = " ".join(
+                    str(content.get(key, "")) for key in ("scope", "condition", "action")
+                ).upper()
+                if any(re.search(rf"(?<![A-Z0-9-]){re.escape(value)}(?![A-Z0-9-])", searchable) for value in requested):
+                    matched.append((path, rule))
+            if matched:
+                unique_rules = matched
+
+        if plan.negative_condition:
+            negative_rules = [
+                (path, rule)
+                for path, rule in unique_rules
+                if re.search(r"\b(?:NOT|NEITHER)\b", str(rule.get("content", {}).get("condition", "")).upper())
+            ]
+            if negative_rules:
+                unique_rules = negative_rules
+
+        if plan.condition_terms:
+            scored: list[tuple[int, Path, dict[str, Any]]] = []
+            for path, rule in unique_rules:
+                condition = str(rule.get("content", {}).get("condition", "")).upper()
+                score = sum(1 for term in plan.condition_terms if _condition_has_term(condition, term))
+                scored.append((score, path, rule))
+            best_score = max((item[0] for item in scored), default=0)
+            if best_score:
+                unique_rules = [(path, rule) for score, path, rule in scored if score == best_score]
+
+    if not unique_rules:
+        return None
+    lines = [f"{program} business rules ({len(unique_rules)} matching unique direct-evidence rule(s)):"]
+    for path, rule in unique_rules:
         content = rule.get("content", {})
         rule_id = content.get("id") or rule.get("id") or "rule"
-        condition = content.get("condition") or content.get("if") or rule.get("embedding_text", "")
-        target = content.get("target") or content.get("then") or ""
-        lines.append(f"- {rule_id}: {condition} {target}".strip())
-    _append_evidence(lines, [_cite("business_rule/business_rule*.json", detail="rule artifacts")])
+        condition = _deduplicate_simple_or_terms(
+            str(content.get("condition") or content.get("if") or rule.get("embedding_text", ""))
+        )
+        action = str(content.get("action") or content.get("target") or content.get("then") or "")
+        paragraph = str(content.get("scope") or content.get("evidence", {}).get("from") or "unknown")
+        variables = _cobol_identifiers(condition)
+        evidence = content.get("evidence", {})
+        raw_evidence = str(evidence.get("raw_evidence") or "")
+        lines.append(f"- {rule_id}")
+        lines.append(f"  Condition: {condition}")
+        lines.append(f"  Action: {action}")
+        lines.append(f"  Paragraph: {paragraph}")
+        joined_variables = ", ".join(variables) or "none identified"
+        lines.append(f"  Variables: {joined_variables}")
+        if raw_evidence:
+            lines.append(f"  COBOL evidence: {raw_evidence}")
+        line_start = evidence.get("line_start")
+        line_end = evidence.get("line_end", line_start)
+        source_file = evidence.get("source_file")
+        if line_start is not None:
+            line_label = f"line {line_start}" if line_start == line_end else f"lines {line_start}-{line_end}"
+            source_label = source_file or "COBOL source"
+            lines.append(f"  Source location: {source_label} {line_label}")
+        else:
+            lines.append("  Source location: unavailable in the rule artifact")
+        lines.append(f"  Artifact: `{path.name}`")
     return "\n".join(lines)
+
+
+def _condition_has_term(condition: str, term: str) -> bool:
+    target = str(term).strip().upper()
+    if not target:
+        return False
+    return bool(re.search(rf"(?<![A-Z0-9-]){re.escape(target)}(?![A-Z0-9-])", condition.upper()))
+
+
+def _answer_variable_access(
+    root: Path,
+    program: str,
+    question: str,
+    plan: QueryPlan | None = None,
+) -> str | None:
+    question_upper = question.upper()
+    question_parts = set(re.findall(r"[A-Z0-9]+", question_upper))
+    planned_order = [
+        value.upper() for value in plan.entity_values_for("variable", "unknown_identifier")
+    ] if plan else []
+    planned_values = set(planned_order)
+    candidates: list[tuple[str, Path, dict[str, Any], int]] = []
+    variable_root = root / "dataflow.variable"
+    candidate_paths: list[Path] = []
+    if planned_order:
+        candidate_paths.extend(
+            variable_root / f"dataflow.variable.{value}.json"
+            for value in planned_order
+            if (variable_root / f"dataflow.variable.{value}.json").exists()
+        )
+    if not planned_order or len(candidate_paths) < len(planned_order):
+        known = set(candidate_paths)
+        candidate_paths.extend(
+            path for path in variable_root.glob("dataflow.variable.*.json")
+            if path not in known
+        )
+    for path in candidate_paths:
+        payload = _read_json(path)
+        if not isinstance(payload, dict) or payload.get("program") != program:
+            continue
+        content = payload.get("content", {})
+        variable = str(content.get("variable", "")).upper()
+        match = re.search(rf"(?<![A-Z0-9-]){re.escape(variable)}(?![A-Z0-9-])", question_upper) if variable else None
+        variable_parts = [part for part in variable.split("-") if part]
+        compound_alias_match = len(variable_parts) >= 2 and all(part in question_parts for part in variable_parts)
+        selected = variable in planned_values if planned_values else bool(match or compound_alias_match)
+        if selected:
+            position = (
+                planned_order.index(variable)
+                if variable in planned_order
+                else (match.start() if match else len(question_upper))
+            )
+            candidates.append((variable, path, payload, position))
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[3], -len(item[0])))
+    records: list[dict[str, Any]] = []
+    seen_variables: set[str] = set()
+    for variable, path, payload, _ in candidates:
+        if variable in seen_variables:
+            continue
+        content = payload.get("content", {}) if isinstance(payload.get("content"), dict) else {}
+        evidence = content.get("evidence", {}) if isinstance(content.get("evidence"), dict) else {}
+        write_sites, read_sites, conflicts = _normalized_variable_sites(
+            variable,
+            _unique_sites(evidence.get("write_sites", [])),
+            _unique_sites(evidence.get("read_sites", [])),
+        )
+        control_sites = _unique_sites(evidence.get("control_sites", []))
+        seen_variables.add(variable)
+        records.append({
+            "variable": variable,
+            "path": path,
+            "content": content,
+            "write_sites": write_sites,
+            "read_sites": read_sites,
+            "control_sites": control_sites,
+            "conflicts": conflicts,
+        })
+    if not records:
+        return None
+
+    operations = set(plan.operations) if plan else set()
+    tasks = set(plan.tasks) if plan else set()
+    lineage_requested = "variable_lineage" in tasks or bool(re.search(
+        r"\b(?:lifecycle|life cycle|trace|lineage|data movement|data flow|"
+        r"intermediate|originated|transferred|feeds?|toward|through)\b",
+        question.lower(),
+    ))
+    descriptive = bool(
+        operations & {"describe", "exists", "compare"}
+        or "variable_definition" in tasks
+        or lineage_requested
+    )
+    control_requested = bool(
+        "control_usage" in (set(plan.output_fields) if plan else set())
+        or "control_outcome" in tasks
+        or "compare" in operations
+        or re.search(r"\b(?:control flow|controls? execution|affects? (?:the )?flow|branch)\b", question.lower())
+        or lineage_requested
+    )
+    lines: list[str] = []
+    if "compare" in operations and len(records) > 1:
+        lines.append(f"Comparison of direct variable evidence in {program}:")
+    elif len(records) > 1:
+        lines.append(f"Direct COBOL access evidence for {len(records)} variables:")
+
+    for index, record in enumerate(records):
+        if index and lines:
+            lines.append("")
+        variable = record["variable"]
+        content = record["content"]
+        write_sites = record["write_sites"]
+        read_sites = record["read_sites"]
+        control_sites = record["control_sites"]
+        if "exists" in operations:
+            lines.append(f"{variable} exists in the analyzed {program} variable catalogue.")
+        else:
+            lines.append(f"{variable} direct COBOL access evidence:")
+
+        if descriptive:
+            origin = str(content.get("origin") or "UNKNOWN")
+            defined_in = [str(value) for value in content.get("defined_in", [])]
+            modified_in = [str(value) for value in content.get("modified_in", [])]
+            used_in = [str(value) for value in content.get("used_in", [])]
+            lines.append(f"- Origin: {origin}")
+            lines.append(f"- Defined in: {', '.join(defined_in) if defined_in else 'not recorded'}")
+            lines.append(f"- Modified in: {', '.join(modified_in) if modified_in else 'not recorded'}")
+            lines.append(f"- Used in: {', '.join(used_in) if used_in else 'not recorded'}")
+            lines.append(f"- Controls flow: {'yes' if content.get('controls_flow') else 'no'}")
+            if not defined_in:
+                lines.append("- Declaration details such as level number and PIC are not present in this dataflow artifact.")
+
+        variable_task_filter = tasks & {
+            "variable_definition", "variable_reads", "variable_writes",
+            "variable_comparison", "variable_lineage", "control_outcome",
+            "variable_composition", "call_option_usage", "lineage_terminal",
+        }
+        if operations & {"describe", "exists", "compare"}:
+            show_writes = True
+            show_reads = True
+        elif variable_task_filter:
+            show_writes = bool(variable_task_filter & {
+                "variable_writes", "variable_comparison", "variable_lineage",
+            })
+            show_reads = bool(variable_task_filter & {
+                "variable_reads", "variable_comparison", "variable_lineage",
+            })
+        else:
+            show_writes = not operations or "find_reads" not in operations or bool(
+                operations & {"find_writes", "describe", "exists", "compare"}
+            )
+            show_reads = not operations or "find_writes" not in operations or bool(
+                operations & {"find_reads", "describe", "exists", "compare"}
+            )
+        if show_writes:
+            lines.append("Modified at:")
+            if write_sites:
+                lines.extend(_format_evidence_site(site) for site in write_sites)
+            else:
+                lines.append("- No explicit write site is present in the variable artifact.")
+            lines.append(f"Write coverage: {len(write_sites)}/{len(write_sites)} direct site(s) returned.")
+        if show_reads:
+            lines.append("Tested/read at:")
+            if read_sites:
+                lines.extend(_format_evidence_site(site) for site in read_sites)
+            else:
+                lines.append("- No explicit read or test site is present in the variable artifact.")
+            lines.append(f"Read coverage: {len(read_sites)}/{len(read_sites)} direct site(s) returned.")
+        if control_requested:
+            lines.append("Control-flow use:")
+            if control_sites:
+                lines.extend(_format_evidence_site(site) for site in control_sites)
+            else:
+                lines.append("- No direct control-flow site is present in the variable artifact.")
+            lines.append(f"Control coverage: {len(control_sites)}/{len(control_sites)} recorded site(s) returned.")
+            assigned_literals = _assigned_literal_values(variable, write_sites)
+            if assigned_literals:
+                lines.append("Assigned-value control evidence:")
+                for literal in assigned_literals:
+                    matching_sites = [
+                        site for site in control_sites
+                        if literal.upper() in str(site.get("statement", "")).upper()
+                    ]
+                    if matching_sites:
+                        locations = ", ".join(
+                            f"{site.get('paragraph') or 'unknown paragraph'} line {site.get('line_start')}"
+                            for site in matching_sites
+                            if isinstance(site.get("line_start"), int) and site.get("line_start") >= 0
+                        )
+                        lines.append(
+                            f"- {literal} is directly tested by a recorded control condition"
+                            + (f" at {locations}." if locations else ".")
+                        )
+                    else:
+                        lines.append(
+                            f"- {literal} is assigned, but no direct control condition for that value is recorded."
+                        )
+        joined_paths: list[Path] = []
+        if lineage_requested:
+            lineage_lines, lineage_paths = _variable_lineage(root, variable)
+            lines.append("Lineage:")
+            lines.extend(lineage_lines or ["- No direct MOVE lineage is present in the analyzed variable artifacts."])
+            joined_paths.extend(lineage_paths)
+        if "control_outcome" in tasks:
+            outcome_lines, outcome_paths = _variable_control_outcomes(
+                root, program, variable, control_sites,
+            )
+            lines.append("Resulting control-flow actions:")
+            lines.extend(outcome_lines or [
+                "- No direct business-rule or error-path outcome is recorded for this variable."
+            ])
+            joined_paths.extend(outcome_paths)
+        if "variable_composition" in tasks:
+            composition_lines, composition_paths = _variable_composition_context(
+                root, variable, write_sites, read_sites,
+            )
+            lines.append("Construction/context evidence:")
+            lines.extend(composition_lines or [
+                "- No surrounding source-backed construction sequence is present in the variable artifacts."
+            ])
+            joined_paths.extend(composition_paths)
+        if "call_option_usage" in tasks:
+            call_lines, call_paths = _variable_call_option_usage(root, variable)
+            lines.append("CICS/call option usage:")
+            lines.extend(call_lines or [
+                "- No call option or parameter in `architecture.call_parameters.json` uses this variable."
+            ])
+            joined_paths.extend(call_paths)
+        if "lineage_terminal" in tasks:
+            terminal_lines, terminal_paths = _variable_lineage_completion(
+                root, variable, question,
+            )
+            lines.append("Lineage completion:")
+            lines.extend(terminal_lines or [
+                "- No terminal destination could be proven from direct MOVE evidence."
+            ])
+            joined_paths.extend(terminal_paths)
+        if record["conflicts"]:
+            lines.append(
+                f"Evidence consistency: {record['conflicts']} site(s) recorded as reads contain direct assignments; rendered as writes."
+            )
+        lines.append(f"Source artifact: `{record['path'].name}`.")
+        extra_paths = list(dict.fromkeys(
+            path for path in joined_paths if path != record["path"]
+        ))
+        if extra_paths:
+            names = ", ".join(f"`{path.name}`" for path in extra_paths)
+            lines.append(f"Joined evidence artifacts: {names}.")
+    return "\n".join(lines)
+
+
+def _variable_lineage(root: Path, variable: str, max_depth: int = 4) -> tuple[list[str], list[Path]]:
+    """Follow direct MOVE edges through variable artifacts without inferring semantics."""
+    variable = variable.upper()
+    lines: list[str] = []
+    used_paths: list[Path] = []
+    seen_edges: set[tuple[str, str, str, str]] = set()
+    expanded: set[str] = set()
+    catalog: dict[str, tuple[Path, dict[str, Any]]] = {}
+    for path in (root / "dataflow.variable").glob("dataflow.variable.*.json"):
+        payload = _read_json(path)
+        content = payload.get("content", {}) if isinstance(payload, dict) else {}
+        name = str(content.get("variable", "")).upper()
+        if name:
+            catalog[name] = (path, content)
+
+    def load(name: str) -> tuple[Path, dict[str, Any]] | None:
+        loaded = catalog.get(name.upper())
+        if loaded is None:
+            return None
+        path, content = loaded
+        if path not in used_paths:
+            used_paths.append(path)
+        return path, content
+
+    def site_edge(site: dict[str, Any]) -> tuple[str, str] | None:
+        statement = str(site.get("statement", ""))
+        match = re.search(
+            r"\bMOVE\s+(.+?)\s+TO\s+([A-Z][A-Z0-9-]*)(?:\([^)]*\))?",
+            statement,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        source = " ".join(match.group(1).strip().rstrip(".").split())
+        target = match.group(2).upper()
+        return source, target
+
+    def mentions(expression: str, name: str) -> bool:
+        return bool(re.search(
+            rf"(?<![A-Z0-9-]){re.escape(name)}(?![A-Z0-9-])",
+            expression.upper(),
+        ))
+
+    def render_edge(source: str, target: str, site: dict[str, Any], label: str) -> None:
+        paragraph = str(site.get("paragraph") or "unknown paragraph")
+        line = site.get("line_start")
+        line_label = f"line {line}" if isinstance(line, int) and line >= 0 else "line unavailable"
+        statement = str(site.get("statement", "")).strip()
+        lines.append(
+            f"- {label}: {source} -> {target} in {paragraph}, {line_label}: `{statement}`"
+        )
+
+    def walk(name: str, depth: int) -> None:
+        if depth > max_depth or name in expanded:
+            return
+        loaded = load(name)
+        if loaded is None:
+            return
+        _, content = loaded
+        expanded.add(name)
+        evidence = content.get("evidence", {}) if isinstance(content.get("evidence"), dict) else {}
+        sites = _unique_sites([
+            *evidence.get("write_sites", []),
+            *evidence.get("read_sites", []),
+        ])
+        for site in sites:
+            edge = site_edge(site)
+            if edge is None:
+                continue
+            source, target = edge
+            key = (
+                source.upper(), target,
+                str(site.get("paragraph", "")), str(site.get("line_start", "")),
+            )
+            if target == name and depth == 0 and key not in seen_edges:
+                seen_edges.add(key)
+                render_edge(source, target, site, "inbound assignment")
+            if not mentions(source, name) or key in seen_edges:
+                continue
+            seen_edges.add(key)
+            render_edge(source, target, site, f"downstream hop {depth + 1}")
+            walk(target, depth + 1)
+
+    walk(variable, 0)
+    return lines, used_paths
+
+
+def _variable_control_outcomes(
+    root: Path,
+    program: str,
+    variable: str,
+    control_sites: list[dict[str, Any]],
+) -> tuple[list[str], list[Path]]:
+    """Join a variable condition to its recorded branch/error outcomes."""
+    lines: list[str] = []
+    used_paths: list[Path] = []
+    seen: set[tuple[str, str, str]] = set()
+    all_sites = _all_variable_sites(root)
+
+    for path in sorted((root / "business_rule").glob("business_rule.*.json")):
+        payload = _read_json(path)
+        if not isinstance(payload, dict) or payload.get("program") != program:
+            continue
+        content = payload.get("content", {})
+        condition = str(content.get("condition") or "")
+        if not _identifier_in(variable, condition):
+            continue
+        action = str(content.get("action") or "unrecorded action")
+        scope = str(content.get("scope") or "unknown paragraph")
+        evidence = content.get("evidence", {}) if isinstance(content.get("evidence"), dict) else {}
+        source_file = str(evidence.get("source_file") or "COBOL source")
+        line_start = evidence.get("line_start")
+        line_end = evidence.get("line_end", line_start)
+        line_label = _line_label(line_start, line_end)
+        raw = str(evidence.get("raw_evidence") or "").strip()
+        key = (condition, action, str(line_start))
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(
+            f"- Condition `{condition}` causes `{action}` in {scope}; "
+            f"{source_file} {line_label}: `{raw or action}`"
+        )
+        if path not in used_paths:
+            used_paths.append(path)
+
+        condition_lines = [
+            site.get("line_start") for site in control_sites
+            if site.get("paragraph") == scope
+            and isinstance(site.get("line_start"), int)
+            and site.get("line_start") >= 0
+        ]
+        if condition_lines and isinstance(line_start, int):
+            first = min(condition_lines)
+            supporting = _sites_in_window(all_sites, {scope}, first + 1, line_start)
+            for site in supporting:
+                statement = str(site.get("statement") or "").strip()
+                if not statement or statement.upper() == raw.upper():
+                    continue
+                lines.append(
+                    f"  - Supporting statement at {scope}, line {site['line_start']}: `{statement}`"
+                )
+                if site["path"] not in used_paths:
+                    used_paths.append(site["path"])
+
+    if not lines:
+        seen_following: set[tuple[str, int, str]] = set()
+        for control_site in control_sites:
+            control_line = control_site.get("line_start")
+            paragraph = str(control_site.get("paragraph") or "")
+            if not isinstance(control_line, int) or control_line < 0:
+                continue
+            for site in _sites_in_window(all_sites, {paragraph}, control_line + 1, control_line + 6):
+                statement = str(site.get("statement") or "").strip()
+                key = (paragraph, int(site["line_start"]), _normalized_statement(statement))
+                if not statement or key in seen_following:
+                    continue
+                seen_following.add(key)
+                lines.append(
+                    f"- Following direct statement in {paragraph}, line {site['line_start']}: `{statement}`"
+                )
+                if site["path"] not in used_paths:
+                    used_paths.append(site["path"])
+
+    rich_path = _artifact_path(root, "quality.error_paths.rich/quality.error_paths.rich.json")
+    rich = _read_json(rich_path)
+    error_paragraphs: set[str] = set()
+    error_targets: set[str] = set()
+    if isinstance(rich, dict):
+        for chunk in rich.get("chunks", []):
+            preview = str(chunk.get("text_preview") or "")
+            trigger = _labeled_preview_value(preview, "Trigger", ("Message/code", "Target", "Evidence"))
+            if not trigger or not _identifier_in(variable, trigger):
+                continue
+            message = _labeled_preview_value(preview, "Message/code", ("Target", "Evidence"))
+            target = _labeled_preview_value(preview, "Target", ("Evidence",))
+            evidence = "" if preview.rstrip().endswith("...") else _labeled_preview_value(preview, "Evidence", ())
+            key = (trigger, target, evidence)
+            if key in seen:
+                continue
+            seen.add(key)
+            details = [f"trigger `{trigger}`"]
+            if message:
+                details.append(f"message/code `{message}`")
+            if target:
+                details.append(f"target `{target}`")
+            if evidence:
+                details.append(f"evidence `{evidence}`")
+            paragraph = str(chunk.get("paragraph") or "unknown paragraph")
+            error_paragraphs.add(paragraph)
+            if target:
+                error_targets.add(target)
+            lines.append(f"- Error-path evidence in {paragraph}: " + "; ".join(details))
+            if rich_path not in used_paths:
+                used_paths.append(rich_path)
+
+    contexts_path = _artifact_path(root, "integration.paragraph_contexts/integration.paragraph_contexts.json")
+    contexts = _read_json(contexts_path)
+    if isinstance(contexts, dict) and error_paragraphs:
+        seen_outcomes: set[tuple[str, str, str]] = set()
+        for context in contexts.get("contexts", []):
+            paragraph = str(context.get("paragraph") or "")
+            if paragraph not in error_paragraphs:
+                continue
+            mapa = context.get("mapa_record", {}) if isinstance(context.get("mapa_record"), dict) else {}
+            for outgoing in mapa.get("outgoing", []):
+                target = str(outgoing.get("to") or "")
+                cics_ops = [str(value) for value in outgoing.get("cics_ops", [])]
+                if target not in error_targets and not cics_ops:
+                    continue
+                key = (paragraph, target, str(outgoing.get("type") or ""))
+                if key in seen_outcomes:
+                    continue
+                seen_outcomes.add(key)
+                operation = f"; CICS operation(s): {', '.join(cics_ops)}" if cics_ops else ""
+                evidence = str(outgoing.get("evidence") or "evidence text unavailable")
+                lines.append(
+                    f"- Paragraph outcome from {paragraph}: {outgoing.get('type')} -> {target}{operation}; "
+                    f"`{evidence}`"
+                )
+                if contexts_path not in used_paths:
+                    used_paths.append(contexts_path)
+
+    return lines, used_paths
+
+
+def _variable_composition_context(
+    root: Path,
+    variable: str,
+    write_sites: list[dict[str, Any]],
+    read_sites: list[dict[str, Any]],
+) -> tuple[list[str], list[Path]]:
+    """Collect direct statements that build a group before its downstream MOVE."""
+    anchors = [
+        site for site in (*write_sites, *read_sites)
+        if isinstance(site.get("line_start"), int) and site.get("line_start") >= 0
+    ]
+    if not anchors:
+        return [], []
+    clear_pattern = re.compile(
+        rf"\bMOVE\s+(?:SPACE|SPACES|LOW-VALUE|LOW-VALUES|HIGH-VALUE|HIGH-VALUES|ZERO|ZEROS)"
+        rf"\s+TO\s+{re.escape(variable)}(?![A-Z0-9-])",
+        flags=re.IGNORECASE,
+    )
+    clearing = [site for site in write_sites if clear_pattern.search(str(site.get("statement", "")))]
+    if clearing:
+        start = min(int(site["line_start"]) for site in clearing)
+        later_reads = [int(site["line_start"]) for site in read_sites if int(site.get("line_start", -1)) > start]
+        end = min(later_reads) if later_reads else start + 80
+    else:
+        end = min(int(site["line_start"]) for site in read_sites or anchors)
+        start = max(0, end - 12)
+    if end - start > 120:
+        end = start + 120
+    paragraphs = {
+        str(site.get("paragraph") or "") for site in anchors
+        if start <= int(site.get("line_start", -1)) <= end
+    }
+    sites = _sites_in_window(_all_variable_sites(root), paragraphs, start, end)
+    allowed_statement = re.compile(
+        r"^\s*(?:THEN\s+|ELSE\s+)?(?:MOVE|IF|ADD|SUBTRACT|COMPUTE|DIVIDE|MULTIPLY|STRING|UNSTRING)\b",
+        flags=re.IGNORECASE,
+    )
+    lines: list[str] = []
+    used_paths: list[Path] = []
+    seen: set[tuple[int, str]] = set()
+    for site in sites:
+        statement = str(site.get("statement") or "").strip()
+        key = (int(site["line_start"]), " ".join(statement.upper().split()))
+        if not allowed_statement.search(statement) or key in seen:
+            continue
+        seen.add(key)
+        lines.append(
+            f"- {site.get('paragraph') or 'unknown paragraph'}, line {site['line_start']}: `{statement}`"
+        )
+        if site["path"] not in used_paths:
+            used_paths.append(site["path"])
+    direct_statements = {
+        _normalized_statement(line.split("`", 2)[1])
+        for line in lines if "`" in line
+    }
+    screen_lines, screen_paths = _screen_construction_statements(
+        root, paragraphs, direct_statements,
+    )
+    lines.extend(screen_lines)
+    used_paths.extend(path for path in screen_paths if path not in used_paths)
+    return lines, used_paths
+
+
+def _variable_call_option_usage(root: Path, variable: str) -> tuple[list[str], list[Path]]:
+    path = _artifact_path(root, "architecture.call_parameters.json")
+    payload = _read_json(path)
+    if not isinstance(payload, dict):
+        return [], []
+    lines: list[str] = []
+    for call in payload.get("calls", []):
+        if not isinstance(call, dict):
+            continue
+        statement = str(call.get("statement") or "")
+        roles: list[str] = []
+        if str(call.get("length") or "").upper() == variable:
+            roles.append("the LENGTH option")
+        if str(call.get("commarea") or "").upper() == variable:
+            roles.append("the COMMAREA option")
+        if variable in {str(value).upper() for value in call.get("parameters", [])}:
+            roles.append("a call parameter")
+        if not roles and not _identifier_in(variable, statement):
+            continue
+        if not roles:
+            roles.append("a statement operand")
+        line_start = call.get("line_start")
+        line_end = call.get("line_end", line_start)
+        target = str(call.get("target") or "unknown target")
+        paragraph = str(call.get("paragraph") or "unknown paragraph")
+        if isinstance(line_start, int) and (not isinstance(line_end, int) or line_end == line_start):
+            variable_record = _variable_catalog(root).get(variable)
+            content = variable_record[1] if variable_record else {}
+            evidence = content.get("evidence", {}) if isinstance(content.get("evidence"), dict) else {}
+            continuation_lines = [
+                site.get("line_start")
+                for site in (*evidence.get("read_sites", []), *evidence.get("write_sites", []))
+                if site.get("paragraph") == paragraph
+                and isinstance(site.get("line_start"), int)
+                and site.get("line_start") >= line_start
+                and _identifier_in(variable, str(site.get("statement") or ""))
+            ]
+            if continuation_lines:
+                line_end = max(line_start, *continuation_lines)
+        commarea = str(call.get("commarea") or "none")
+        lines.append(
+            f"- In {paragraph}, {_line_label(line_start, line_end)}, {variable} supplies "
+            f"{' and '.join(roles)} for {target}; COMMAREA={commarea}. "
+            f"Exact statement: `{statement or 'statement unavailable'}`"
+        )
+    return lines, [path] if lines else []
+
+
+def _variable_lineage_completion(
+    root: Path,
+    variable: str,
+    question: str,
+    max_depth: int = 4,
+) -> tuple[list[str], list[Path]]:
+    """Identify terminal MOVE destinations, intervening overwrites, and nearby branches."""
+    sites = _all_variable_sites(root)
+    edges: list[dict[str, Any]] = []
+    seen_edges: set[tuple[str, str, str, int]] = set()
+    for site in sites:
+        edge = _move_edge(str(site.get("statement") or ""))
+        if edge is None:
+            continue
+        source, target = edge
+        key = (source.upper(), target, str(site.get("paragraph") or ""), int(site["line_start"]))
+        if key in seen_edges:
+            continue
+        seen_edges.add(key)
+        edges.append({**site, "source": source, "target": target})
+
+    frontier = [(variable.upper(), 0)]
+    visited = {variable.upper()}
+    path_edges: list[dict[str, Any]] = []
+    while frontier:
+        current, depth = frontier.pop(0)
+        if depth >= max_depth:
+            continue
+        for edge in edges:
+            if not _identifier_in(current, edge["source"]):
+                continue
+            target = str(edge["target"]).upper()
+            if target == current:
+                continue
+            if edge not in path_edges:
+                path_edges.append(edge)
+            if target not in visited:
+                visited.add(target)
+                frontier.append((target, depth + 1))
+    if not path_edges:
+        return [], []
+
+    terminals = sorted(
+        node for node in visited if node != variable.upper()
+        and not any(_identifier_in(node, edge["source"]) for edge in edges)
+    )
+    lines: list[str] = []
+    used_paths: list[Path] = []
+    catalog = _variable_catalog(root)
+    for terminal in terminals:
+        origin = "UNKNOWN"
+        loaded = catalog.get(terminal)
+        if loaded:
+            origin = str(loaded[1].get("origin") or "UNKNOWN")
+            if loaded[0] not in used_paths:
+                used_paths.append(loaded[0])
+        lines.append(
+            f"- Terminal destination: {terminal} (origin: {origin}); no downstream MOVE from it is recorded."
+        )
+
+    path_keys = {
+        (edge["source"].upper(), edge["target"], edge.get("paragraph"), edge["line_start"])
+        for edge in path_edges
+    }
+    path_lines = [int(edge["line_start"]) for edge in path_edges]
+    first_line, last_line = min(path_lines), max(path_lines)
+    path_paragraphs = {str(edge.get("paragraph") or "") for edge in path_edges}
+    alternatives: list[dict[str, Any]] = []
+    for edge in edges:
+        key = (edge["source"].upper(), edge["target"], edge.get("paragraph"), edge["line_start"])
+        if key in path_keys or edge["target"] not in visited:
+            continue
+        if str(edge.get("paragraph") or "") not in path_paragraphs:
+            continue
+        if not first_line <= int(edge["line_start"]) <= last_line:
+            continue
+        alternatives.append(edge)
+    if alternatives:
+        lines.append("- Possible overwrites before the terminal transfer:")
+        for edge in alternatives:
+            lines.append(
+                f"  - {edge['source']} -> {edge['target']} in {edge.get('paragraph')}, "
+                f"line {edge['line_start']}: `{edge.get('statement')}`"
+            )
+            if edge["path"] not in used_paths:
+                used_paths.append(edge["path"])
+
+    nearby_rules: list[tuple[Path, dict[str, Any]]] = []
+    for path in sorted((root / "business_rule").glob("business_rule.*.json")):
+        payload = _read_json(path)
+        content = payload.get("content", {}) if isinstance(payload, dict) else {}
+        evidence = content.get("evidence", {}) if isinstance(content.get("evidence"), dict) else {}
+        rule_line = evidence.get("line_start")
+        if str(content.get("scope") or "") not in path_paragraphs or not isinstance(rule_line, int):
+            continue
+        if first_line - 3 <= rule_line <= last_line + 3:
+            nearby_rules.append((path, content))
+    if nearby_rules:
+        lines.append("- Nearby branch outcomes affecting this lineage:")
+        for path, content in nearby_rules:
+            evidence = content.get("evidence", {})
+            lines.append(
+                f"  - `{content.get('condition')}` causes `{content.get('action')}` in "
+                f"{content.get('scope')}, line {evidence.get('line_start')}."
+            )
+            if path not in used_paths:
+                used_paths.append(path)
+
+    if re.search(r"\b(?:display|displayed|screen|map field)\b", question.lower()):
+        terminal_text = ", ".join(terminals) if terminals else "the last recorded variable"
+        lines.append(
+            f"- Display boundary: direct MOVE evidence ends at {terminal_text}; "
+            "no further MOVE to a screen/map field is proven by the variable artifacts."
+        )
+    for edge in path_edges:
+        if edge["path"] not in used_paths:
+            used_paths.append(edge["path"])
+    return lines, used_paths
+
+
+def _variable_catalog(root: Path) -> dict[str, tuple[Path, dict[str, Any]]]:
+    catalog: dict[str, tuple[Path, dict[str, Any]]] = {}
+    for path in (root / "dataflow.variable").glob("dataflow.variable.*.json"):
+        payload = _read_json(path)
+        content = payload.get("content", {}) if isinstance(payload, dict) else {}
+        variable = str(content.get("variable") or "").upper()
+        if variable:
+            catalog[variable] = (path, content)
+    return catalog
+
+
+def _all_variable_sites(root: Path) -> list[dict[str, Any]]:
+    sites: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for variable, (path, content) in _variable_catalog(root).items():
+        evidence = content.get("evidence", {}) if isinstance(content.get("evidence"), dict) else {}
+        for role in ("write_sites", "read_sites", "control_sites"):
+            for site in evidence.get(role, []):
+                if not isinstance(site, dict) or not isinstance(site.get("line_start"), int):
+                    continue
+                key = (
+                    str(site.get("paragraph") or ""), str(site.get("line_start")),
+                    " ".join(str(site.get("statement") or "").upper().split()), role,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                sites.append({**site, "variable": variable, "role": role, "path": path})
+    return sites
+
+
+def _sites_in_window(
+    sites: list[dict[str, Any]],
+    paragraphs: set[str],
+    start: int,
+    end: int,
+) -> list[dict[str, Any]]:
+    return sorted(
+        (
+            site for site in sites
+            if start <= int(site.get("line_start", -1)) <= end
+            and (not paragraphs or str(site.get("paragraph") or "") in paragraphs)
+        ),
+        key=lambda site: (int(site["line_start"]), str(site.get("statement") or "")),
+    )
+
+
+def _screen_construction_statements(
+    root: Path,
+    paragraphs: set[str],
+    existing: set[str],
+) -> tuple[list[str], list[Path]]:
+    path = _artifact_path(root, "screen.interaction/screen.interaction.json")
+    payload = _read_json(path)
+    if not isinstance(payload, dict):
+        return [], []
+    lines: list[str] = []
+    seen = set(existing)
+    entry_pattern = re.compile(
+        r"(?:^|\s)-\s+([A-Z0-9-]+):\s*(.*?)(?=(?:\s+-\s+[A-Z0-9-]+:)|$)",
+        flags=re.DOTALL,
+    )
+    useful = re.compile(
+        r"^(?:MOVE|IF|ADD|SUBTRACT|COMPUTE|DIVIDE|MULTIPLY|STRING|UNSTRING|PERFORM)\b",
+        flags=re.IGNORECASE,
+    )
+    for chunk in payload.get("chunks", []):
+        if str(chunk.get("chunk_type") or "") != "screen.row_build":
+            continue
+        preview = str(chunk.get("text_preview") or "")
+        for match in entry_pattern.finditer(preview):
+            paragraph, statement = match.group(1), " ".join(match.group(2).split())
+            normalized = _normalized_statement(statement)
+            if (
+                paragraph not in paragraphs or not useful.search(statement)
+                or len(statement) > 240 or normalized in seen
+                or statement.endswith("-.")
+            ):
+                continue
+            seen.add(normalized)
+            lines.append(
+                f"- {paragraph}, physical line unavailable in screen artifact: `{statement}`"
+            )
+    return lines, [path] if lines else []
+
+
+def _normalized_statement(statement: str) -> str:
+    return " ".join(re.findall(r"[A-Z0-9'-]+", statement.upper()))
+
+
+def _move_edge(statement: str) -> tuple[str, str] | None:
+    match = re.search(
+        r"\bMOVE\s+(.+?)\s+TO\s+([A-Z][A-Z0-9-]*)(?:\([^)]*\))?",
+        statement,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return " ".join(match.group(1).strip().rstrip(".").split()), match.group(2).upper()
+
+
+def _identifier_in(identifier: str, text: str) -> bool:
+    return bool(re.search(
+        rf"(?<![A-Z0-9-]){re.escape(identifier.upper())}(?![A-Z0-9-])",
+        text.upper(),
+    ))
+
+
+def _line_label(line_start: Any, line_end: Any = None) -> str:
+    if not isinstance(line_start, int):
+        return "line unavailable"
+    if not isinstance(line_end, int) or line_end == line_start:
+        return f"line {line_start}"
+    return f"lines {line_start}-{line_end}"
+
+
+def _labeled_preview_value(text: str, label: str, following: tuple[str, ...]) -> str:
+    stop = "|".join(re.escape(value) + r":" for value in following)
+    pattern = rf"\b{re.escape(label)}:\s*(.*?)(?=\s+(?:{stop})|$)" if stop else rf"\b{re.escape(label)}:\s*(.*)$"
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    return match.group(1).strip().rstrip(".") if match else ""
+
+
+def _normalized_variable_sites(
+    variable: str,
+    write_sites: list[dict[str, Any]],
+    read_sites: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    corrected_writes = list(write_sites)
+    corrected_reads: list[dict[str, Any]] = []
+    conflicts = 0
+    for site in read_sites:
+        statement = str(site.get("statement", "")).upper()
+        if re.search(rf"\bMOVE\b.+\bTO\s+{re.escape(variable)}(?![A-Z0-9-])", statement):
+            corrected_writes.append(site)
+            conflicts += 1
+        else:
+            corrected_reads.append(site)
+    return _unique_sites(corrected_writes), _unique_sites(corrected_reads), conflicts
+
+
+def _assigned_literal_values(variable: str, write_sites: list[dict[str, Any]]) -> list[str]:
+    values: list[str] = []
+    for site in write_sites:
+        statement = str(site.get("statement", ""))
+        match = re.search(
+            rf"\bMOVE\s+(.+?)\s+TO\s+{re.escape(variable)}(?![A-Z0-9-])",
+            statement,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            continue
+        expression = " ".join(match.group(1).strip().split())
+        if not re.fullmatch(r"(?:[+-]?\d+|'[^']*'|\"[^\"]*\")", expression):
+            continue
+        if expression not in values:
+            values.append(expression)
+    return values
+
+
+def _unique_sites(raw_sites: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_sites, list):
+        return []
+    sites: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for raw in raw_sites:
+        if not isinstance(raw, dict):
+            continue
+        key = (
+            str(raw.get("paragraph", "")),
+            str(raw.get("line_start", "")),
+            str(raw.get("statement", "")).strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        sites.append(raw)
+    return sites
+
+
+def _format_evidence_site(site: dict[str, Any]) -> str:
+    paragraph = site.get("paragraph") or "unknown paragraph"
+    line = site.get("line_start")
+    location = f"line {line}" if isinstance(line, int) and line >= 0 else "line unavailable"
+    statement = str(site.get("statement", "")).strip()
+    return f"- {paragraph}, {location}: `{statement}`"
+
+
+def _cobol_identifiers(text: str) -> list[str]:
+    ignored = {"AND", "EQUAL", "NOT", "OR", "SPACE", "SPACES", "THEN"}
+    result: list[str] = []
+    without_literals = re.sub(r"'[^']*'|\"[^\"]*\"", " ", text)
+    for token in re.findall(r"\b[A-Z][A-Z0-9-]*[A-Z0-9]\b", without_literals.upper()):
+        if token in ignored or token.isdigit() or token in result:
+            continue
+        result.append(token)
+    return result
+
+
+def _deduplicate_simple_or_terms(condition: str) -> str:
+    if " AND " in condition.upper() or " OR " not in condition.upper():
+        return condition
+    outer_parentheses = condition.startswith("(") and condition.endswith(")")
+    body = condition[1:-1] if outer_parentheses else condition
+    terms = re.split(r"\)\s+OR\s+\(", body, flags=re.IGNORECASE)
+    if len(terms) == 1:
+        terms = re.split(r"\s+OR\s+", body, flags=re.IGNORECASE)
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        normalized = term.strip().strip("()").strip()
+        key = re.sub(r"\s+", " ", normalized).upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(normalized)
+    if len(cleaned) == len(terms):
+        return condition
+    joined = ") OR (".join(cleaned)
+    return f"({joined})" if outer_parentheses else joined

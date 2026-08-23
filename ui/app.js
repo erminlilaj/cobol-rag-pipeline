@@ -70,6 +70,107 @@ function renderMarkdownLite(text) {
     return paragraphs.join('');
 }
 
+function renderDebugDetails(debug, traceId = '') {
+    if (!debug || !Object.keys(debug).length) return '';
+
+    const validation = debug.validation || {};
+    const retrieval = debug.retrieval || {};
+    const attempts = Array.isArray(debug.attempts) ? debug.attempts : [];
+    const subtasks = Array.isArray(debug.subtasks) ? debug.subtasks : [];
+    const evidence = Array.isArray(retrieval.evidence) ? retrieval.evidence : [];
+    const reasons = Array.isArray(validation.reasons) ? validation.reasons : [];
+    const status = debug.status || 'available';
+    const rejected = status === 'rejected' || validation.passed === false;
+
+    const candidate = debug.candidate_answer ? `
+        <section class="debug-section debug-warning-section">
+            <h5>Unverified candidate answer</h5>
+            <p class="debug-warning">This is an intermediate result for debugging. It was not accepted as the trusted answer.</p>
+            <pre>${escapeHTML(debug.candidate_answer)}</pre>
+        </section>` : '';
+
+    const validationBlock = `
+        <section class="debug-section">
+            <h5>Validation</h5>
+            <dl class="debug-facts">
+                <div><dt>Stage</dt><dd>${escapeHTML(validation.stage || 'none')}</dd></div>
+                <div><dt>Passed</dt><dd>${validation.passed === false ? 'No' : 'Yes'}</dd></div>
+                <div><dt>Guard</dt><dd>${escapeHTML(debug.guard_status || 'not applicable')}</dd></div>
+            </dl>
+            ${reasons.length
+                ? `<ul class="debug-reasons">${reasons.map(reason => `<li>${escapeHTML(reason)}</li>`).join('')}</ul>`
+                : '<p class="debug-muted">No validation failure reason was recorded.</p>'}
+        </section>`;
+
+    const attemptBlock = attempts.length ? `
+        <section class="debug-section">
+            <h5>Answer attempts (${attempts.length})</h5>
+            ${attempts.map((attempt, index) => {
+                const attemptReasons = Array.isArray(attempt.reasons) ? attempt.reasons : [];
+                const attemptAnswer = attempt.rendered_answer || attempt.candidate_answer || '';
+                return `<details class="debug-nested">
+                    <summary>Attempt ${index + 1}: ${escapeHTML(attempt.stage || 'unknown')} · ${attempt.passed ? 'accepted' : 'rejected'}</summary>
+                    ${attemptReasons.length ? `<p><strong>Reasons:</strong> ${escapeHTML(attemptReasons.join(', '))}</p>` : ''}
+                    ${attemptAnswer ? `<pre>${escapeHTML(attemptAnswer)}</pre>` : ''}
+                </details>`;
+            }).join('')}
+        </section>` : '';
+
+    const subtaskBlock = subtasks.length ? `
+        <section class="debug-section">
+            <h5>Semantic claim plan (${subtasks.length})</h5>
+            ${subtasks.map((subtask, index) => {
+                const subtaskAttempts = Array.isArray(subtask.attempts) ? subtask.attempts : [];
+                const subtaskSources = Array.isArray(subtask.sources) ? subtask.sources : [];
+                const subtaskReasons = Array.isArray(subtask.reasons) ? subtask.reasons : [];
+                return `<details class="debug-nested">
+                    <summary>Claim ${index + 1}: ${escapeHTML(subtask.capability || 'unknown')} · ${subtask.passed ? 'verified' : 'unresolved'}</summary>
+                    <p>${escapeHTML(subtask.description || '')}</p>
+                    <p class="debug-muted"><strong>Entities:</strong> ${escapeHTML((subtask.entity_values || []).join(', ') || 'program-wide')} · <strong>Sources:</strong> ${subtaskSources.length} · <strong>Attempts:</strong> ${subtaskAttempts.length}</p>
+                    ${subtaskReasons.length ? `<p><strong>Reasons:</strong> ${escapeHTML(subtaskReasons.join(', '))}</p>` : ''}
+                    ${subtaskAttempts.map(attempt => `<details class="debug-nested">
+                        <summary>${escapeHTML(attempt.stage || 'attempt')} · ${attempt.passed ? 'accepted' : 'rejected'}</summary>
+                        ${(attempt.reasons || []).length ? `<p><strong>Reasons:</strong> ${escapeHTML(attempt.reasons.join(', '))}</p>` : ''}
+                        ${attempt.candidate_answer ? `<pre>${escapeHTML(attempt.candidate_answer)}</pre>` : ''}
+                    </details>`).join('')}
+                </details>`;
+            }).join('')}
+        </section>` : '';
+
+    const evidenceBlock = `
+        <section class="debug-section">
+            <h5>Evidence inspected (${evidence.length})</h5>
+            ${evidence.length ? evidence.map(item => {
+                const label = item.source_file || item.source_id || `Evidence ${item.rank || ''}`;
+                const descriptors = [item.chunk_type, item.program, item.entity_key].filter(Boolean).join(' · ');
+                const score = item.score === null || item.score === undefined ? '' : ` · score ${Number(item.score).toFixed(4)}`;
+                return `<details class="debug-nested">
+                    <summary>${escapeHTML(label)}${score}</summary>
+                    ${descriptors ? `<p class="debug-muted">${escapeHTML(descriptors)}</p>` : ''}
+                    <pre>${escapeHTML(item.excerpt || 'No text excerpt available.')}</pre>
+                </details>`;
+            }).join('') : '<p class="debug-muted">No evidence record was attached to this route.</p>'}
+        </section>`;
+
+    const planBlock = `
+        <section class="debug-section">
+            <h5>Query plan</h5>
+            <pre>${escapeHTML(JSON.stringify(debug.plan || {}, null, 2))}</pre>
+        </section>`;
+
+    return `<details class="debug-panel${rejected ? ' rejected' : ''}">
+        <summary><span>Debug details</span><small>${escapeHTML(status)}${traceId ? ` · trace ${escapeHTML(traceId.slice(0, 8))}` : ''}</small></summary>
+        <div class="debug-body">
+            ${candidate}
+            ${validationBlock}
+            ${subtaskBlock}
+            ${attemptBlock}
+            ${evidenceBlock}
+            ${planBlock}
+        </div>
+    </details>`;
+}
+
 function setStatus(state, text) {
     statusIndicator.className = `status ${state}`;
     statusIndicator.textContent = text;
@@ -239,7 +340,7 @@ async function resetCollection() {
     }
 }
 
-function appendMessage(role, content, sources = []) {
+function appendMessage(role, content, sources = [], metadata = null) {
     const msgDiv = document.createElement('div');
     msgDiv.className = `message ${role}`;
 
@@ -251,20 +352,254 @@ function appendMessage(role, content, sources = []) {
     contentDiv.className = 'content';
     contentDiv.innerHTML = renderMarkdownLite(content);
 
+    if (role === 'assistant' && metadata?.execution_mode) {
+        const metaDiv = document.createElement('div');
+        metaDiv.className = 'answer-meta';
+        const category = metadata.plan?.category || metadata.route || '';
+        const planner = metadata.plan?.planner_source || '';
+        metaDiv.innerHTML = [
+            `<span>${escapeHTML(metadata.execution_mode.replaceAll('_', ' '))}</span>`,
+            category ? `<span>${escapeHTML(category.replaceAll('_', ' '))}</span>` : '',
+            planner ? `<span>${escapeHTML(planner.replaceAll('_', ' '))}</span>` : '',
+        ].filter(Boolean).join('');
+        contentDiv.prepend(metaDiv);
+    }
+
     if (sources?.length) {
         const sourcesDiv = document.createElement('div');
         sourcesDiv.className = 'sources-box';
         sourcesDiv.innerHTML = `<h4>Sources</h4><ul>${sources.map(source => {
-            const label = source.source_path || source.source_id || 'source';
-            const score = source.score == null ? 'N/A' : Number(source.score).toFixed(3);
-            return `<li>${escapeHTML(label)} · score ${escapeHTML(score)}</li>`;
+            const label = source.source_file || source.evidence_path || source.source_path || source.source_id || 'source';
+            const details = [source.chunk_type, source.paragraph, source.variable].filter(Boolean).join(' · ');
+            return `<li>${escapeHTML(label)}${details ? `<br><small>${escapeHTML(details)}</small>` : ''}</li>`;
         }).join('')}</ul>`;
         contentDiv.appendChild(sourcesDiv);
+    }
+
+    if (role === 'assistant' && metadata?.debug) {
+        const debugDiv = document.createElement('div');
+        debugDiv.innerHTML = renderDebugDetails(metadata.debug, metadata.trace_id || '');
+        if (debugDiv.firstElementChild) contentDiv.appendChild(debugDiv.firstElementChild);
     }
 
     msgDiv.append(avatar, contentDiv);
     chatHistory.appendChild(msgDiv);
     scrollChatToBottom();
+}
+
+function shuffleItems(items) {
+    const shuffled = [...items];
+    for (let index = shuffled.length - 1; index > 0; index -= 1) {
+        const randomIndex = Math.floor(Math.random() * (index + 1));
+        [shuffled[index], shuffled[randomIndex]] = [shuffled[randomIndex], shuffled[index]];
+    }
+    return shuffled;
+}
+
+function createWaitingExperience() {
+    const element = document.createElement('div');
+    element.className = 'message assistant loading waiting-experience';
+
+    const avatar = document.createElement('div');
+    avatar.className = 'avatar';
+    avatar.textContent = 'AI';
+
+    const content = document.createElement('div');
+    content.className = 'content waiting-content';
+
+    const header = document.createElement('div');
+    header.className = 'waiting-header';
+    const headerCopy = document.createElement('div');
+    const title = document.createElement('strong');
+    title.textContent = 'Working on your answer';
+    const subtitle = document.createElement('span');
+    subtitle.textContent = 'Play a quick game while evidence is being prepared.';
+    headerCopy.append(title, subtitle);
+    const elapsed = document.createElement('span');
+    elapsed.className = 'waiting-elapsed';
+    elapsed.textContent = '0s';
+    elapsed.setAttribute('aria-label', 'Elapsed time');
+    header.append(headerCopy, elapsed);
+
+    const tabs = document.createElement('div');
+    tabs.className = 'waiting-game-tabs';
+    tabs.setAttribute('role', 'tablist');
+    tabs.setAttribute('aria-label', 'Waiting games');
+
+    const panel = document.createElement('div');
+    panel.className = 'waiting-game-panel';
+    panel.setAttribute('aria-live', 'polite');
+
+    content.append(header, tabs, panel);
+    element.append(avatar, content);
+
+    const gameState = {
+        activeGame: 'bug',
+        bugScore: 0,
+        bugTarget: Math.floor(Math.random() * 12),
+        memoryDeck: shuffleItems(['MOVE', 'MOVE', 'PERFORM', 'PERFORM', 'LINK', 'LINK', 'XCTL', 'XCTL']),
+        memoryRevealed: new Set(),
+        memoryMatched: new Set(),
+        memoryLocked: false,
+        memoryMoves: 0,
+        destroyed: false,
+        timeouts: new Set(),
+    };
+
+    function schedule(callback, delay) {
+        const timeout = setTimeout(() => {
+            gameState.timeouts.delete(timeout);
+            if (!gameState.destroyed) callback();
+        }, delay);
+        gameState.timeouts.add(timeout);
+    }
+
+    function renderTabs() {
+        tabs.innerHTML = '';
+        [
+            ['bug', 'Bug Hunt'],
+            ['memory', 'COBOL Match'],
+        ].forEach(([game, label]) => {
+            const button = document.createElement('button');
+            const selected = gameState.activeGame === game;
+            button.type = 'button';
+            button.className = `waiting-game-tab${selected ? ' active' : ''}`;
+            button.textContent = label;
+            button.setAttribute('role', 'tab');
+            button.setAttribute('aria-selected', String(selected));
+            button.addEventListener('click', () => {
+                gameState.activeGame = game;
+                renderTabs();
+                renderGame();
+            });
+            tabs.appendChild(button);
+        });
+    }
+
+    function renderBugHunt() {
+        panel.innerHTML = '';
+        const status = document.createElement('div');
+        status.className = 'waiting-game-status';
+        status.innerHTML = `<span>Catch the moving bug.</span><strong>Score: ${gameState.bugScore}</strong>`;
+
+        const grid = document.createElement('div');
+        grid.className = 'bug-grid';
+        grid.setAttribute('aria-label', 'Bug hunt grid');
+        for (let index = 0; index < 12; index += 1) {
+            const cell = document.createElement('button');
+            const isTarget = index === gameState.bugTarget;
+            cell.type = 'button';
+            cell.className = `bug-cell${isTarget ? ' target' : ''}`;
+            cell.textContent = isTarget ? '◆' : '·';
+            cell.setAttribute('aria-label', isTarget ? 'Catch the bug' : 'Empty cell');
+            if (isTarget) {
+                cell.addEventListener('click', () => {
+                    gameState.bugScore += 1;
+                    moveBug();
+                });
+            }
+            grid.appendChild(cell);
+        }
+        panel.append(status, grid);
+    }
+
+    function moveBug() {
+        let nextTarget = Math.floor(Math.random() * 12);
+        if (nextTarget === gameState.bugTarget) {
+            nextTarget = (nextTarget + 1) % 12;
+        }
+        gameState.bugTarget = nextTarget;
+        if (gameState.activeGame === 'bug') renderBugHunt();
+    }
+
+    function renderMemory() {
+        panel.innerHTML = '';
+        const status = document.createElement('div');
+        status.className = 'waiting-game-status';
+        const pairs = gameState.memoryMatched.size / 2;
+        const message = pairs === 4 ? 'All pairs matched!' : 'Match the COBOL keywords.';
+        status.innerHTML = `<span>${message}</span><strong>${pairs}/4 pairs · ${gameState.memoryMoves} moves</strong>`;
+
+        const grid = document.createElement('div');
+        grid.className = 'memory-grid';
+        grid.setAttribute('aria-label', 'COBOL keyword memory cards');
+        gameState.memoryDeck.forEach((keyword, index) => {
+            const card = document.createElement('button');
+            const visible = gameState.memoryRevealed.has(index) || gameState.memoryMatched.has(index);
+            const matched = gameState.memoryMatched.has(index);
+            card.type = 'button';
+            card.className = `memory-card${visible ? ' revealed' : ''}${matched ? ' matched' : ''}`;
+            card.textContent = visible ? keyword : '?';
+            card.disabled = matched || gameState.memoryLocked;
+            card.setAttribute('aria-label', visible ? keyword : 'Hidden keyword card');
+            card.addEventListener('click', () => revealMemoryCard(index));
+            grid.appendChild(card);
+        });
+        panel.append(status, grid);
+    }
+
+    function revealMemoryCard(index) {
+        if (
+            gameState.memoryLocked ||
+            gameState.memoryMatched.has(index) ||
+            gameState.memoryRevealed.has(index)
+        ) return;
+
+        gameState.memoryRevealed.add(index);
+        const revealed = Array.from(gameState.memoryRevealed);
+        if (revealed.length === 2) {
+            gameState.memoryMoves += 1;
+            const [first, second] = revealed;
+            if (gameState.memoryDeck[first] === gameState.memoryDeck[second]) {
+                gameState.memoryMatched.add(first);
+                gameState.memoryMatched.add(second);
+                gameState.memoryRevealed.clear();
+            } else {
+                gameState.memoryLocked = true;
+                schedule(() => {
+                    gameState.memoryRevealed.clear();
+                    gameState.memoryLocked = false;
+                    if (gameState.activeGame === 'memory') renderMemory();
+                }, 700);
+            }
+        }
+        renderMemory();
+    }
+
+    function renderGame() {
+        if (gameState.activeGame === 'memory') {
+            renderMemory();
+        } else {
+            renderBugHunt();
+        }
+    }
+
+    renderTabs();
+    renderGame();
+
+    let seconds = 0;
+    const elapsedInterval = setInterval(() => {
+        seconds += 1;
+        elapsed.textContent = `${seconds}s`;
+    }, 1000);
+    const bugInterval = setInterval(() => {
+        if (!element.isConnected && seconds > 0) {
+            destroy();
+            return;
+        }
+        moveBug();
+    }, 1350);
+
+    function destroy() {
+        if (gameState.destroyed) return;
+        gameState.destroyed = true;
+        clearInterval(elapsedInterval);
+        clearInterval(bugInterval);
+        gameState.timeouts.forEach(timeout => clearTimeout(timeout));
+        gameState.timeouts.clear();
+    }
+
+    return { element, destroy };
 }
 
 async function sendMessage() {
@@ -276,10 +611,8 @@ async function sendMessage() {
     chatInput.style.height = 'auto';
     sendButton.disabled = true;
 
-    const loading = document.createElement('div');
-    loading.className = 'message assistant loading';
-    loading.innerHTML = '<div class="avatar">AI</div><div class="content">Thinking...</div>';
-    chatHistory.appendChild(loading);
+    const waiting = createWaitingExperience();
+    chatHistory.appendChild(waiting.element);
     scrollChatToBottom();
 
     try {
@@ -288,12 +621,16 @@ async function sendMessage() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ message: text }),
         });
-        loading.remove();
-        appendMessage('assistant', data.answer, data.sources);
+        waiting.destroy();
+        waiting.element.remove();
+        appendMessage('assistant', data.answer, data.sources, data);
     } catch (error) {
-        loading.remove();
+        waiting.destroy();
+        waiting.element.remove();
         appendMessage('assistant', `**Error:** ${error.message}`);
     } finally {
+        waiting.destroy();
+        waiting.element.remove();
         sendButton.disabled = false;
         chatInput.focus();
     }

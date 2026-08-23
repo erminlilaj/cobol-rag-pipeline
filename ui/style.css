@@ -399,6 +399,186 @@ h1 {
     background: rgba(255, 255, 255, 0.09);
 }
 
+.answer-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 10px;
+}
+
+.answer-meta span {
+    padding: 3px 7px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--muted);
+    background: var(--surface-2);
+    font-size: 0.72rem;
+    line-height: 1.2;
+    text-transform: capitalize;
+}
+
+.waiting-experience {
+    width: min(720px, 96%);
+}
+
+.waiting-content {
+    width: min(560px, 100%);
+    padding: 14px;
+}
+
+.waiting-header,
+.waiting-game-status {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.waiting-header > div {
+    display: grid;
+    gap: 2px;
+}
+
+.waiting-header strong {
+    font-size: 0.9rem;
+}
+
+.waiting-header span,
+.waiting-game-status {
+    color: var(--muted);
+    font-size: 0.76rem;
+}
+
+.waiting-elapsed {
+    flex: 0 0 auto;
+    min-width: 38px;
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--surface-2);
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+}
+
+.waiting-game-tabs {
+    display: flex;
+    gap: 7px;
+    margin: 12px 0 9px;
+}
+
+.waiting-game-tab {
+    min-height: 30px;
+    padding: 5px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface-2);
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 0.76rem;
+}
+
+.waiting-game-tab:hover,
+.waiting-game-tab.active {
+    border-color: var(--accent);
+    color: var(--text);
+    background: rgba(79, 140, 255, 0.14);
+}
+
+.waiting-game-tab:focus-visible,
+.bug-cell:focus-visible,
+.memory-card:focus-visible {
+    outline: 2px solid var(--accent-2);
+    outline-offset: 2px;
+}
+
+.waiting-game-panel {
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: #111419;
+}
+
+.waiting-game-status {
+    min-height: 24px;
+    margin-bottom: 8px;
+}
+
+.waiting-game-status strong {
+    color: var(--text);
+    font-size: 0.74rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.bug-grid,
+.memory-grid {
+    display: grid;
+    gap: 6px;
+}
+
+.bug-grid {
+    grid-template-columns: repeat(6, minmax(34px, 1fr));
+}
+
+.memory-grid {
+    grid-template-columns: repeat(4, minmax(58px, 1fr));
+}
+
+.bug-cell,
+.memory-card {
+    display: grid;
+    place-items: center;
+    min-height: 42px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface-2);
+    color: #697381;
+    cursor: pointer;
+    font-weight: 750;
+}
+
+.bug-cell:hover,
+.memory-card:hover:not(:disabled) {
+    border-color: #556072;
+    background: var(--surface-3);
+}
+
+.bug-cell.target {
+    border-color: var(--danger);
+    background: rgba(243, 107, 107, 0.16);
+    color: #ff9a9a;
+    animation: target-pulse 0.85s ease-in-out infinite alternate;
+}
+
+.memory-card {
+    color: var(--muted);
+    font-size: 0.72rem;
+    letter-spacing: 0.02em;
+}
+
+.memory-card.revealed {
+    border-color: var(--accent);
+    background: rgba(79, 140, 255, 0.16);
+    color: var(--text);
+}
+
+.memory-card.matched {
+    border-color: var(--accent-2);
+    background: rgba(92, 200, 167, 0.14);
+    color: #8ce2c8;
+    cursor: default;
+}
+
+@keyframes target-pulse {
+    from { transform: scale(0.92); }
+    to { transform: scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .bug-cell.target {
+        animation: none;
+    }
+}
+
 .sources-box {
     margin-top: 12px;
     padding-top: 10px;
@@ -416,6 +596,140 @@ h1 {
 .sources-box ul {
     margin: 0;
     padding-left: 18px;
+}
+
+.debug-panel {
+    margin-top: 12px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: #111419;
+    overflow: hidden;
+}
+
+.debug-panel.rejected {
+    border-color: rgba(243, 107, 107, 0.52);
+}
+
+.debug-panel > summary,
+.debug-nested > summary {
+    cursor: pointer;
+    user-select: none;
+}
+
+.debug-panel > summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 9px 11px;
+    color: var(--muted);
+    font-size: 0.79rem;
+    font-weight: 700;
+}
+
+.debug-panel > summary:hover,
+.debug-nested > summary:hover {
+    color: var(--text);
+    background: rgba(255, 255, 255, 0.035);
+}
+
+.debug-panel > summary small {
+    color: var(--muted);
+    font-size: 0.68rem;
+    font-weight: 500;
+    text-transform: capitalize;
+}
+
+.debug-panel.rejected > summary small {
+    color: #ff9a9a;
+}
+
+.debug-body {
+    padding: 0 11px 11px;
+    border-top: 1px solid var(--border);
+}
+
+.debug-section {
+    padding: 11px 0;
+    border-bottom: 1px solid var(--border);
+}
+
+.debug-section:last-child {
+    padding-bottom: 0;
+    border-bottom: 0;
+}
+
+.debug-section h5 {
+    margin: 0 0 8px;
+    font-size: 0.76rem;
+    color: var(--text);
+}
+
+.debug-section pre {
+    max-height: 280px;
+    margin: 7px 0 0;
+    padding: 9px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-size: 0.72rem;
+    line-height: 1.45;
+}
+
+.debug-warning {
+    color: #ffb0b0;
+    font-size: 0.74rem;
+}
+
+.debug-muted {
+    color: var(--muted);
+    font-size: 0.72rem;
+}
+
+.debug-facts {
+    display: grid;
+    gap: 5px;
+    margin: 0;
+}
+
+.debug-facts div {
+    display: grid;
+    grid-template-columns: 72px minmax(0, 1fr);
+    gap: 8px;
+    font-size: 0.72rem;
+}
+
+.debug-facts dt {
+    color: var(--muted);
+}
+
+.debug-facts dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+}
+
+.debug-reasons {
+    margin: 8px 0 0;
+    padding-left: 18px;
+    color: #ffb0b0;
+    font-size: 0.72rem;
+}
+
+.debug-nested {
+    margin-top: 7px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+.debug-nested > summary {
+    padding: 7px 9px;
+    color: var(--muted);
+    font-size: 0.71rem;
+}
+
+.debug-nested > p,
+.debug-nested > pre {
+    margin: 0 9px 9px;
 }
 
 .chat-input-container {
@@ -567,5 +881,18 @@ input[type="checkbox"] {
 
     .message {
         width: 100%;
+    }
+
+    .waiting-header,
+    .waiting-game-status {
+        align-items: flex-start;
+    }
+
+    .bug-grid {
+        grid-template-columns: repeat(4, minmax(34px, 1fr));
+    }
+
+    .memory-grid {
+        grid-template-columns: repeat(2, minmax(72px, 1fr));
     }
 }

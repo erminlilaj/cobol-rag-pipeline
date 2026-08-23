@@ -12,6 +12,7 @@ from typing import Any
 from cobol_rag.capability_router import (
     CAPABILITY_DEFAULT_TASKS,
     CAPABILITY_DESCRIPTORS,
+    confident_aspects,
     CapabilityMatch,
     eligible_capabilities,
     router_for,
@@ -19,6 +20,8 @@ from cobol_rag.capability_router import (
 from cobol_rag.config import AppConfig
 from cobol_rag.final_scripts_answers import (
     answer_from_final_scripts,
+    capability_manifest,
+    unavailable_capabilities,
     find_final_scripts_root,
     find_program_artifact_root,
 )
@@ -34,6 +37,7 @@ from cobol_rag.query_plan import (
     EvidenceSubtask,
     QueryPlan,
     build_query_plan,
+    derive_evidence_subtasks,
     detect_message_language,
     language_marker_scores,
     merge_semantic_plan,
@@ -344,6 +348,7 @@ def answer_query(
             if routing.planner_source in _MERGEABLE_PLANNER_SOURCES
             else replace(refined_base, planner_source="deterministic_fallback")
         )
+        initial_plan = _refine_variable_tasks(question, config, initial_plan)
         initial_scope = replace(refined_scope, intent=initial_plan.intent)
         if initial_plan.requires_clarification:
             return finish(
@@ -492,6 +497,7 @@ def answer_query(
         if routing.planner_source in _MERGEABLE_PLANNER_SOURCES
         else base_plan
     )
+    plan = _refine_variable_tasks(question, config, plan)
     scope = replace(scope, intent=plan.intent)
     if scope.ambiguous:
         return finish(scope.reason, [], route="unclear", scope=scope, plan=plan)
@@ -1742,8 +1748,16 @@ def _rank_question_capabilities(
     scope: QueryScope | None,
 ) -> tuple[CapabilityMatch, ...]:
     """Rank evidence capabilities semantically, restricted by verified entity scope."""
+    # A capability the analysis proved this program has no evidence for cannot
+    # answer anything, so it is removed before ranking rather than after, which
+    # keeps a confident-looking match from pointing at an empty artifact.
+    missing = unavailable_capabilities(scope.program if scope else None)
     allowed = eligible_capabilities(
         entity_types=tuple(entity.entity_type for entity in (scope.entities if scope else ())),
+        available=(
+            tuple(name for name in CAPABILITY_DESCRIPTORS if name not in missing)
+            if missing else None
+        ),
     )
     try:
         started = time.perf_counter()
@@ -1801,6 +1815,81 @@ def _capability_routing_decision(
 
 
 _MERGEABLE_PLANNER_SOURCES = {"semantic_llm", "semantic_router", "capability_router"}
+
+
+_DATAFLOW_DIRECTION_PROMPT = """A user asked about one COBOL field. Decide what they want to know about it.
+
+writes = where the field gets its value: assigned, computed, calculated, moved into, initialised, produced.
+reads  = where its value is used: tested, compared, checked, inspected, copied out.
+both   = the question asks for both sides.
+
+Return JSON only: {{"aspect":"writes"}} or {{"aspect":"reads"}} or {{"aspect":"both"}}
+
+Question: {question}
+"""
+
+_DIRECTION_TASKS = {
+    "writes": ("variable_writes",),
+    "reads": ("variable_reads",),
+    "both": ("variable_reads", "variable_writes"),
+}
+
+
+def _resolve_dataflow_direction(question: str, config: AppConfig) -> str:
+    """Decide whether a question is about producing a value, consuming it, or both.
+
+    This is the one judgement embedding similarity could not make: reads and
+    writes are the same topic with opposite polarity, and similarity does not
+    carry polarity. A deliberately tiny prompt does carry it, and measured
+    identical on every repeated run, which a routing floor needs more than it
+    needs to be occasionally more precise.
+
+    Ambiguity resolves to both. The measured failure mode is answering both when
+    one side would do, which returns extra evidence rather than the wrong side.
+    """
+    started = time.perf_counter()
+    try:
+        response = build_llm(
+            config, json_mode=True, max_output_tokens=40, temperature=0.0,
+        ).complete(_DATAFLOW_DIRECTION_PROMPT.format(question=question))
+        aspect = str(json.loads(str(response.text)).get("aspect", "")).strip().lower()
+    except Exception as error:  # provider and JSON failures are both recoverable
+        _log_stage_latency(
+            "dataflow_direction", time.perf_counter() - started,
+            f"ERROR={type(error).__name__} -> both",
+        )
+        return "both"
+    _log_stage_latency("dataflow_direction", time.perf_counter() - started, f"aspect={aspect}")
+    return aspect if aspect in _DIRECTION_TASKS else "both"
+
+
+def _refine_variable_tasks(question: str, config: AppConfig, plan: QueryPlan) -> QueryPlan:
+    """Replace verb matching with an understanding of what was asked about a variable.
+
+    Which aspect of a named variable a question wants is a question of meaning,
+    not of which verb it happens to use, so "calculated", "set" and "produces"
+    must reach the same evidence without any of them being listed anywhere.
+    """
+    if plan.intent != "variable_dataflow":
+        return plan
+    if not plan.entity_values_for("variable", "unknown_identifier"):
+        return plan
+    try:
+        router = router_for(config)
+        aspects = confident_aspects(router.rank_aspects(question))
+    except Exception as error:  # embedding availability is provider-specific
+        _log_stage_latency("variable_aspects", 0.0, f"ERROR={type(error).__name__}")
+        return plan
+
+    direction = _resolve_dataflow_direction(question, config)
+    tasks = _unique_tasks((*aspects, *_DIRECTION_TASKS[direction]))
+    if set(tasks) == set(plan.tasks):
+        return plan
+    return replace(plan, tasks=tasks, subtasks=derive_evidence_subtasks(replace(plan, tasks=tasks)))
+
+
+def _unique_tasks(values: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(value for value in values if value))
 
 
 _CANDIDATE_SCORE_FLOOR = 0.45
@@ -2331,6 +2420,9 @@ def _build_compact_routing_prompt(
     state = json.dumps(session_state.as_dict(), sort_keys=True) if session_state else "None"
     required_language = preliminary_plan.response_language if preliminary_plan else "en"
     language_source = preliminary_plan.response_language_source if preliminary_plan else "default"
+    evidence_block = _capability_evidence_block(
+        preliminary_plan.program if preliminary_plan else None
+    )
     return f"""Classify and plan one message for a COBOL evidence assistant. Return JSON only; never answer the technical question.
 Routes: technical, conversational, unclear. Conversational includes greetings, farewells, thanks, assistant identity, and language-preference requests. Unrelated non-COBOL questions are unclear.
 Intents: artifact_inventory, variable_inventory, variable_dataflow, copybooks, business_rules, external_programs, control_flow, cics_operations, static_values, dead_code, db2_sql, datasets_tables, ui_navigation, source_metrics, program_summary, general.
@@ -2343,9 +2435,48 @@ Required response language: {required_language} (resolved from: {language_source
 Language precedence is: explicit request in this message, clear current-message language, saved session preference, then English.
 Schema: {{"route":"technical|conversational|unclear","category":"single_source|multi_source_synthesis|multi_source_comparison|clarification|conversational|out_of_scope","domain":"domain","intent":"intent","tasks":["task"],"relations":["relation"],"subtasks":[{{"description":"one requested claim","capability":"evidence capability","tasks":["task"],"entity_values":["exact identifier"],"relations":["relation"],"source_domains":["domain"],"output_fields":["field"],"required":true}}],"operations":["operation"],"excluded_operations":["XCTL"],"source_domains":[],"output_fields":[],"response_language":"en","requires_comparison":false,"requires_clarification":false,"confidence":0.0,"reply":""}}
 Set response_language exactly to {required_language}. For technical, reply is empty. For conversational/unclear, provide a short natural reply only in {required_language}; answer the message rather than echoing it. Do not add a translation or a second-language version.
+{evidence_block}
+
 Session: {state}
 Message: {question}
 """
+
+
+def _capability_evidence_block(program: str | None) -> str:
+    """State what evidence this program actually has, so routing is a choice among facts.
+
+    The planner otherwise picks from an abstract list of capabilities with no way
+    to know which of them this program has anything to say about, which is how a
+    question about batch JCL becomes a program summary. Counts come from the
+    analysis stage, so they also stop a total from being guessed.
+    """
+    manifest = capability_manifest(program)
+    if not manifest:
+        return ""
+    capabilities = manifest.get("capabilities", {})
+    if not isinstance(capabilities, dict) or not capabilities:
+        return ""
+    present = [
+        f"{name} ({entry.get('count')})"
+        for name, entry in capabilities.items()
+        if isinstance(entry, dict) and entry.get("available")
+    ]
+    missing = [
+        f"{name}" + (f" — {entry.get('reason')}" if entry.get("reason") else "")
+        for name, entry in capabilities.items()
+        if isinstance(entry, dict) and not entry.get("available")
+    ]
+    lines = [f"Analyzed evidence held for {program}, as capability (item count):"]
+    if present:
+        lines.append("  available: " + ", ".join(present))
+    if missing:
+        lines.append("  no evidence: " + "; ".join(missing))
+    lines.append(
+        "  Choose a capability that has evidence. If the question asks about one "
+        "with no evidence, keep that capability so the answer can say so, rather "
+        "than substituting a different one."
+    )
+    return "\n".join(lines)
 
 
 def _build_routing_prompt(
@@ -2362,6 +2493,9 @@ def _build_routing_prompt(
     deterministic_scope = json.dumps(preliminary_scope.as_dict(), sort_keys=True) if preliminary_scope else "None"
     required_language = preliminary_plan.response_language if preliminary_plan else "en"
     language_source = preliminary_plan.response_language_source if preliminary_plan else "default"
+    evidence_block = _capability_evidence_block(
+        preliminary_scope.program if preliminary_scope else None
+    )
     return f"""You are the primary semantic query planner for an evidence-based COBOL assistant.
 
 Classify the message and decompose technical requests into a hierarchical plan. Never answer the COBOL question. Return valid JSON only.
@@ -2434,6 +2568,8 @@ Planning examples. Reason from the meaning of the request; these are illustratio
 
 Return exactly this schema:
 {{"route":"technical|conversational|unclear","category":"category","domain":"domain","intent":"intent","tasks":["task"],"relations":["relation"],"subtasks":[{{"description":"claim to verify","capability":"capability","tasks":["task"],"entity_values":["exact identifier"],"relations":["relation"],"source_domains":["domain"],"output_fields":["field"],"required":true}}],"operations":["operation"],"excluded_operations":["XCTL"],"source_domains":["domain"],"output_fields":["field"],"response_language":"en","requires_comparison":false,"requires_clarification":false,"confidence":0.0,"reply":""}}
+
+{evidence_block}
 
 Deterministically resolved scope:
 <scope>
@@ -2987,15 +3123,21 @@ def _render_structured_claims(
     return "\n".join(rendered) if rendered else None
 
 
-_ABSENCE_CLAIM_PATTERN = re.compile(
-    r"\b(?:has|have|had|contains?|uses?|includes?|declares?|defines?|returns?)\s+"
-    r"(?:any\s+)?(?:no|none|zero)\b"
-    r"|\bthere\s+(?:is|are|were|was)\s+(?:no|none|not\s+any)\b"
-    r"|\b(?:does|do|did|is|are|was|were)\s+not\s+"
-    r"(?:have|contain|use|include|declare|define|exist|appear|present)\b"
-    r"|\b(?:no|none|zero)\s+(?:\w+\s+){0,2}"
-    r"(?:at\s+all|exist|exists|are\s+present|is\s+present|were\s+found|are\s+found)\b"
-    r"|\bnot\s+present\s+in\b|\bnever\s+(?:used|called|read|written|modified)\b",
+# Words that assert non-existence, matched as a class rather than as verb pairs.
+#
+# The earlier pattern enumerated verb-and-quantifier combinations, so "has no
+# variables" was refused while "calls nothing" was accepted and cited. Absence is
+# a single concept; recognising it by listing the verbs it can attach to is the
+# same losing game as listing the verbs that mean "written". Any assertion of
+# nothingness is refused here, whatever carries it.
+_NULLITY_WORDS = frozenset({
+    "no", "none", "nothing", "never", "nowhere", "neither", "nor", "zero",
+    "absent", "lacks", "lacking", "without", "empty", "nonexistent",
+})
+
+_NEGATED_ASSERTION = re.compile(
+    r"\b(?:does|do|did|is|are|was|were|has|have|had|can|could|will|would)"
+    r"(?:\s+not\b|n['’]t\b)",
     re.IGNORECASE,
 )
 
@@ -3014,8 +3156,15 @@ def _unsupported_assertion_reason(claim: str) -> str | None:
     the role of narrating verified evidence rather than introducing new facts.
     """
     text = re.sub(r"\[Source\s+\d+\]", " ", claim, flags=re.IGNORECASE)
+    # Quoted code and bare COBOL statements carry their own NOT, as in
+    # "IF PXCSEMAF-OUTCOME NOT = SPACE". That is evidence being shown, not the
+    # model asserting that something is missing, so it is removed before the
+    # remaining prose is judged.
     text = re.sub(r"`[^`]*`", " ", text)
-    if _ABSENCE_CLAIM_PATTERN.search(text):
+    text = re.sub(r"\b[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+\b", " ", text)
+    text = re.sub(r"\b(?:IF|MOVE|GO\s+TO|PERFORM|EXEC|CALL|NOT|SPACE|SPACES|ZERO)\b", " ", text)
+    prose_words = {word.lower() for word in re.findall(r"[A-Za-z']+", text)}
+    if prose_words & _NULLITY_WORDS or _NEGATED_ASSERTION.search(text):
         return "unverifiable_absence_claim"
     without_lines = re.sub(r"\blines?\s+\d+\b", " ", text, flags=re.IGNORECASE)
     if _QUANTITY_CLAIM_PATTERN.search(without_lines):

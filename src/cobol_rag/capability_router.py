@@ -101,6 +101,41 @@ CAPABILITY_DESCRIPTORS: dict[str, str] = {
     ),
 }
 
+# What a question can want to know about one named variable, described by meaning.
+#
+# Reads and writes are deliberately absent. Measurement showed embedding
+# similarity ranks them almost interchangeably, and inverts them on questions
+# about where a value comes from: "which statement produces the value" scored
+# reads above writes. They are the same topic with opposite polarity, and
+# similarity does not carry polarity. Direction is decided separately.
+VARIABLE_ASPECT_DESCRIPTORS: dict[str, str] = {
+    "variable_definition": (
+        "Where the field is declared and what kind of storage it lives in, its "
+        "origin and the section that defines it."
+    ),
+    "variable_lineage": (
+        "How the value travels onward out of this field into other fields, the "
+        "chain of transfers and where it finally ends up."
+    ),
+    "control_outcome": (
+        "What the program does as a consequence of the value. Which branch is "
+        "taken, what happens when the condition holds, the resulting action."
+    ),
+    "literal_assignments": (
+        "The specific hard-coded constant values that are forced into the field."
+    ),
+    "variable_comparison": (
+        "How two different fields relate to each other, comparing one against another."
+    ),
+}
+
+# Calibrated on a small sample: correctly matched aspects scored 0.51 to 0.76
+# with a margin of 0.05 or more over the next aspect, while questions belonging
+# to no aspect stayed below. Re-measure before trusting these on a new corpus.
+MIN_ASPECT_SCORE = 0.45
+MIN_ASPECT_MARGIN = 0.05
+
+
 # Capabilities that describe one named entity. Without a resolved identifier they
 # have nothing to answer about, so deterministic scope removes them from ranking.
 ENTITY_REQUIRED_CAPABILITIES = frozenset({
@@ -211,6 +246,7 @@ class CapabilityRouter:
     def __init__(self, embed_text: Callable[[str], Sequence[float]]) -> None:
         self._embed_text = embed_text
         self._descriptor_vectors: dict[str, Sequence[float]] | None = None
+        self._aspect_vectors: dict[str, Sequence[float]] | None = None
 
     def descriptor_vectors(self) -> dict[str, Sequence[float]]:
         if self._descriptor_vectors is None:
@@ -232,6 +268,35 @@ class CapabilityRouter:
         return rank_capabilities(
             self._embed_text(text), self.descriptor_vectors(), allowed=allowed,
         )
+
+    def aspect_vectors(self) -> dict[str, Sequence[float]]:
+        if self._aspect_vectors is None:
+            self._aspect_vectors = {
+                aspect: self._embed_text(description)
+                for aspect, description in VARIABLE_ASPECT_DESCRIPTORS.items()
+            }
+        return self._aspect_vectors
+
+    def rank_aspects(self, question: str) -> tuple[CapabilityMatch, ...]:
+        """Rank what a question wants to know about a named variable."""
+        text = (question or "").strip()
+        if not text:
+            return ()
+        return rank_capabilities(self._embed_text(text), self.aspect_vectors())
+
+
+def confident_aspects(matches: tuple[CapabilityMatch, ...]) -> tuple[str, ...]:
+    """Keep only an aspect the question clearly asked for.
+
+    A question about reads or writes belongs to no aspect here, and must come
+    back empty rather than being assigned the nearest unrelated one.
+    """
+    if not matches:
+        return ()
+    best = matches[0]
+    if best.score < MIN_ASPECT_SCORE or best.margin < MIN_ASPECT_MARGIN:
+        return ()
+    return (best.capability,)
 
 
 _ROUTER_CACHE: dict[tuple[str, str], CapabilityRouter] = {}

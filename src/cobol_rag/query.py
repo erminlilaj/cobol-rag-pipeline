@@ -11,6 +11,7 @@ from typing import Any
 
 from cobol_rag.capability_router import (
     CAPABILITY_DEFAULT_TASKS,
+    ENTITY_REQUIRED_CAPABILITIES,
     CAPABILITY_DESCRIPTORS,
     confident_aspects,
     CapabilityMatch,
@@ -375,6 +376,9 @@ def answer_query(
             else replace(refined_base, planner_source="deterministic_fallback")
         )
         initial_plan = _refine_variable_tasks(question, config, initial_plan)
+        initial_plan = _supplement_missing_capability(
+            question, config, initial_scope, initial_plan,
+        )
         initial_scope = replace(refined_scope, intent=initial_plan.intent)
         if initial_plan.requires_clarification:
             return finish(
@@ -524,6 +528,7 @@ def answer_query(
         else base_plan
     )
     plan = _refine_variable_tasks(question, config, plan)
+    plan = _supplement_missing_capability(question, config, scope, plan)
     scope = replace(scope, intent=plan.intent)
     if scope.ambiguous:
         return finish(scope.reason, [], route="unclear", scope=scope, plan=plan)
@@ -877,6 +882,19 @@ def _entity_contract_failed(result: EvidenceSubtaskResult) -> bool:
     return any(reason.startswith(_ENTITY_CONTRACT_PREFIX) for reason in result.reasons)
 
 
+def _claim_should_be_rerouted(result: EvidenceSubtaskResult) -> bool:
+    """True when a required claim failed and another capability may still serve it.
+
+    Off-entity evidence is the clearest case, but any unresolved required claim
+    means the capability it was given could not answer it. Leaving that as a gap
+    while a different capability holds the evidence is what turned a request for
+    CICS commands into a partial answer about control flow.
+    """
+    if result.passed or not result.subtask.required:
+        return False
+    return True
+
+
 def _capability_indexes_entities(capability: str, entity_types: frozenset[str]) -> bool:
     supported = _CAPABILITY_ENTITY_TYPES.get(capability)
     return bool(supported) and bool(entity_types & set(supported))
@@ -890,20 +908,31 @@ def _rerouted_subtask(
     subtask: EvidenceSubtask,
     tried: frozenset[str],
 ) -> EvidenceSubtask | None:
-    """Re-route a claim to the best untried capability that indexes its entity.
+    """Re-route a claim to the best untried capability that can still answer it.
 
-    Only capabilities that actually catalogue this kind of entity are considered,
-    so the retry is chosen by what the evidence layer can hold rather than by
-    anything read off the wording of the question.
+    For a claim about an identifier, only capabilities that catalogue that kind
+    of entity are considered, so the retry is chosen by what the evidence layer
+    can hold rather than by anything read off the wording of the question.
+
+    A claim about the whole program has no entity to narrow by, so the ranking
+    decides on its own and is required to be confident before it may override
+    the planner. That is the case the two disagree on: asking for the CICS SEND
+    and RECEIVE commands ranks unambiguously as CICS evidence while the planner
+    reaches for control flow, and without an arbiter the wrong one stands.
     """
     entity_types = frozenset(entity.entity_type for entity in plan.entities)
-    if not entity_types:
-        return None
-    candidates = {
-        capability
-        for capability in eligible_capabilities(entity_types=entity_types)
-        if capability not in tried and _capability_indexes_entities(capability, entity_types)
-    }
+    if entity_types:
+        candidates = {
+            capability
+            for capability in eligible_capabilities(entity_types=entity_types)
+            if capability not in tried and _capability_indexes_entities(capability, entity_types)
+        }
+    else:
+        candidates = {
+            capability
+            for capability in eligible_capabilities()
+            if capability not in tried
+        }
     if not candidates:
         return None
     try:
@@ -912,11 +941,15 @@ def _rerouted_subtask(
         return None
     if not matches:
         return None
-    capability = matches[0].capability
+    best = matches[0]
+    # Without an entity the candidate set was never narrowed, so an unconfident
+    # top match is only the nearest of many and must not displace the planner.
+    if not entity_types and not best.confident:
+        return None
     return replace(
         subtask,
-        capability=capability,
-        tasks=_CAPABILITY_TASKS.get(capability, ()),
+        capability=best.capability,
+        tasks=_CAPABILITY_TASKS.get(best.capability, ()),
         source_domains=(),
         relations=(),
     )
@@ -964,7 +997,7 @@ def _execute_evidence_subtask(
             reroute_available=remaining > 0,
         )
         attempts.extend(result.attempts)
-        if not _entity_contract_failed(result):
+        if not _claim_should_be_rerouted(result):
             break
         rerouted = _rerouted_subtask(
             question=question,
@@ -1864,7 +1897,14 @@ def _direct_handler_supports(plan: QueryPlan) -> bool:
             "variable_comparison", "variable_lineage", "literal_assignments",
             "control_outcome", "variable_composition", "call_option_usage",
             "lineage_terminal",
-        } and set(plan.relations) <= {"reads", "writes", "compares", "condition_causes"}
+        } and set(plan.relations) <= {
+            "reads", "writes", "compares", "condition_causes",
+            # Ordering around a call does not change what the variable evidence
+            # says, and the claim that answers it is the sibling call_context
+            # one. Disqualifying the variable formatter here sent the claim to
+            # free-form generation, which invented lines that were then rejected.
+            "before", "after",
+        }
     unsupported_tasks = {
         "paragraph_references", "paragraph_body", "division_section",
         "path_from_paragraph", "call_context", "copybook_usage",
@@ -2106,6 +2146,47 @@ def _resolve_dataflow_direction(question: str, config: AppConfig) -> str:
         return "both"
     _log_stage_latency("dataflow_direction", time.perf_counter() - started, f"aspect={aspect}")
     return aspect if aspect in _DIRECTION_TASKS else "both"
+
+
+def _supplement_missing_capability(
+    question: str, config: AppConfig, scope: QueryScope | None, plan: QueryPlan,
+) -> QueryPlan:
+    """Add the capability the ranking is confident about when no claim uses it.
+
+    Planner and ranking usually agree, and where they agree this does nothing.
+    A confident ranking for a capability that no claim collects means the
+    question named evidence the plan does not gather, and because each claim is
+    validated only against its own capability such a plan can pass every
+    contract while never answering what was asked: a request for the CICS
+    commands came back as verified control flow that listed no CICS command.
+
+    The claim is added rather than substituted. The planner's reading of the
+    question survives next to it, so a ranking that is confident and wrong costs
+    an extra claim instead of replacing a correct one.
+    """
+    if plan.route != "technical" or not plan.subtasks:
+        return plan
+    matches = _rank_question_capabilities(question, config, scope)
+    if not matches or not matches[0].confident:
+        return plan
+    capability = matches[0].capability
+    if any(subtask.capability == capability for subtask in plan.subtasks):
+        return plan
+    entity_values = tuple(
+        entity.value for entity in plan.entities
+        if _capability_indexes_entities(capability, frozenset({entity.entity_type}))
+    )
+    if capability in ENTITY_REQUIRED_CAPABILITIES and not entity_values:
+        return plan
+    target = ", ".join(entity_values) if entity_values else (plan.program or "the program")
+    supplement = EvidenceSubtask(
+        claim_id=f"claim_{len(plan.subtasks) + 1}",
+        description=f"Verify {capability.replace('_', ' ')} evidence for {target}",
+        capability=capability,
+        tasks=_CAPABILITY_TASKS.get(capability, ()),
+        entity_values=entity_values,
+    )
+    return replace(plan, subtasks=(*plan.subtasks, supplement))
 
 
 def _refine_variable_tasks(question: str, config: AppConfig, plan: QueryPlan) -> QueryPlan:

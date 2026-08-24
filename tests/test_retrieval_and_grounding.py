@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import ANY, Mock, patch
 
@@ -10,6 +11,7 @@ from cobol_rag.chat import ChatSession, ChatTurn
 from cobol_rag.config import AppConfig
 from cobol_rag.loaders.rag_documents import RagDocumentsLoader
 from cobol_rag.capability_router import (
+    CAPABILITY_DESCRIPTORS,
     VARIABLE_ASPECT_DESCRIPTORS,
     CapabilityMatch,
     confident_aspects,
@@ -22,8 +24,10 @@ from cobol_rag.query import (
     _build_routing_prompt,
     _absent_capability_request,
     _attempt_evidence_subtask,
+    _claim_should_be_rerouted,
     _entity_contract_failed,
     _rerouted_subtask,
+    _supplement_missing_capability,
     EvidenceSubtaskResult,
     _decision_respects_candidates,
     _routing_candidates,
@@ -1616,6 +1620,19 @@ class CompoundAspectSelectionTest(unittest.TestCase):
             confident_aspects(matches), ("control_outcome", "literal_assignments"),
         )
 
+    def test_a_flat_cluster_behind_a_weak_leader_selects_nothing(self) -> None:
+        # Three aspects within a thousandth of each other, all just over the
+        # floor, is a question that matched nothing clearly. Reading them as
+        # three requests produced a claim whose evidence did not exist, so the
+        # leader has to be confident before it can introduce companions.
+        matches = self._matches(
+            ("variable_definition", 0.562),
+            ("variable_composition", 0.561),
+            ("literal_assignments", 0.559),
+        )
+
+        self.assertEqual(confident_aspects(matches), ())
+
     def test_a_close_runner_up_below_the_bar_is_still_treated_as_noise(self) -> None:
         # A follow-up about reads belongs to no aspect. Its runner-up is close
         # but never confident on its own, so the pair must not be admitted.
@@ -1642,6 +1659,23 @@ class CompoundAspectSelectionTest(unittest.TestCase):
         )
 
         self.assertEqual(confident_aspects(matches), ())
+
+    def test_a_capability_names_every_command_family_it_holds(self) -> None:
+        # Queue commands were absent from the CICS description, so asking whether
+        # the program writes to a queue drifted to the nearest storage-shaped
+        # capability and reported an absence that was true of JCL, not of queues.
+        cics = CAPABILITY_DESCRIPTORS["cics_evidence"].lower()
+        for command_family in ("queue", "send", "receive", "link", "abend"):
+            with self.subTest(family=command_family):
+                self.assertIn(command_family, cics)
+
+    def test_outbound_lineage_describes_where_a_value_arrives(self) -> None:
+        # The aspect has to win on "reaches", "ends up" and "feeds into", which
+        # is how an outbound question is actually phrased.
+        lineage = VARIABLE_ASPECT_DESCRIPTORS["variable_lineage"].lower()
+        self.assertIn("reach", lineage)
+        self.assertIn("downstream", lineage)
+        self.assertNotIn("declared", lineage)
 
     def test_inbound_composition_is_an_aspect_a_question_can_ask_for(self) -> None:
         # Without it, "what is this field built from" could only be answered by
@@ -1920,6 +1954,166 @@ class OffEntityClaimReroutingTest(unittest.TestCase):
             )
 
         retrieve_for_plan.assert_called_once()
+
+    def test_a_confidently_ranked_capability_no_claim_uses_is_added(self) -> None:
+        # Each claim is validated only against its own capability, so a plan that
+        # collects the wrong evidence can pass every contract while never
+        # answering the question. Asking for CICS commands returned verified
+        # control flow that listed no CICS command.
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), route="technical",
+            intent="control_flow", domain="control_flow",
+            subtasks=(EvidenceSubtask(
+                claim_id="claim_1", description="Verify control flow evidence",
+                capability="control_flow", tasks=("complete_program_flow",),
+            ),),
+        )
+
+        with patch(
+            "cobol_rag.query._rank_question_capabilities",
+            return_value=(CapabilityMatch("cics_evidence", 0.77, 0.09),),
+        ):
+            supplemented = _supplement_missing_capability(
+                "Find all CICS SEND and RECEIVE commands in PDCBVC.",
+                Mock(), QueryScope(intent="control_flow", program="PDCBVC"), plan,
+            )
+
+        self.assertEqual(
+            [s.capability for s in supplemented.subtasks], ["control_flow", "cics_evidence"],
+        )
+        # Added, never substituted: a confident but wrong ranking costs one extra
+        # claim rather than displacing a correct one.
+        self.assertEqual(supplemented.subtasks[0].capability, "control_flow")
+
+    def test_agreement_between_planner_and_ranking_changes_nothing(self) -> None:
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), route="technical",
+            intent="cics_operations", domain="integration",
+            subtasks=(EvidenceSubtask(
+                claim_id="claim_1", description="Verify cics evidence",
+                capability="cics_evidence", tasks=("cics_operations",),
+            ),),
+        )
+
+        with patch(
+            "cobol_rag.query._rank_question_capabilities",
+            return_value=(CapabilityMatch("cics_evidence", 0.77, 0.09),),
+        ):
+            self.assertEqual(
+                _supplement_missing_capability("q", Mock(), None, plan).subtasks, plan.subtasks,
+            )
+
+    def test_an_unconfident_ranking_adds_nothing(self) -> None:
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), route="technical",
+            intent="control_flow", domain="control_flow",
+            subtasks=(EvidenceSubtask(
+                claim_id="claim_1", description="Verify control flow evidence",
+                capability="control_flow", tasks=("complete_program_flow",),
+            ),),
+        )
+
+        with patch(
+            "cobol_rag.query._rank_question_capabilities",
+            return_value=(CapabilityMatch("cics_evidence", 0.48, 0.01),),
+        ):
+            self.assertEqual(
+                _supplement_missing_capability("q", Mock(), None, plan).subtasks, plan.subtasks,
+            )
+
+    def test_a_capability_needing_an_identifier_is_not_added_without_one(self) -> None:
+        # variable_access has nothing to say without a resolved variable, so a
+        # confident ranking cannot introduce an empty claim.
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), route="technical",
+            intent="program_summary", domain="program_structure",
+            subtasks=(EvidenceSubtask(
+                claim_id="claim_1", description="Verify program summary",
+                capability="program_summary", tasks=("program_summary",),
+            ),),
+        )
+
+        with patch(
+            "cobol_rag.query._rank_question_capabilities",
+            return_value=(CapabilityMatch("variable_access", 0.80, 0.10),),
+        ):
+            self.assertEqual(
+                _supplement_missing_capability("q", Mock(), None, plan).subtasks, plan.subtasks,
+            )
+
+    def test_a_program_wide_claim_reroutes_on_a_confident_disagreement(self) -> None:
+        # Asking for the CICS commands ranks unambiguously as CICS evidence while
+        # the planner reaches for control flow. With no entity to narrow by, the
+        # ranking arbitrates only when it is confident.
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent="control_flow",
+            domain="control_flow", tasks=("complete_program_flow",),
+        )
+        subtask = replace(self._subtask("control_flow"), entity_values=())
+
+        with (
+            patch("cobol_rag.query.unavailable_capabilities", return_value=frozenset()),
+            patch(
+                "cobol_rag.query.router_for",
+                return_value=Mock(rank=lambda q, allowed=None: (CapabilityMatch("cics_evidence", 0.77, 0.09),)),
+            ),
+        ):
+            rerouted = _rerouted_subtask(
+                question="Find all CICS SEND and RECEIVE commands in PDCBVC.",
+                config=Mock(), plan=plan, subtask=subtask,
+                tried=frozenset({"control_flow"}),
+            )
+
+        self.assertIsNotNone(rerouted)
+        self.assertEqual(rerouted.capability, "cics_evidence")
+
+    def test_an_unconfident_ranking_never_overrides_the_planner(self) -> None:
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent="control_flow",
+            domain="control_flow", tasks=("complete_program_flow",),
+        )
+        subtask = replace(self._subtask("control_flow"), entity_values=())
+
+        with (
+            patch("cobol_rag.query.unavailable_capabilities", return_value=frozenset()),
+            patch(
+                "cobol_rag.query.router_for",
+                return_value=Mock(rank=lambda q, allowed=None: (CapabilityMatch("cics_evidence", 0.48, 0.01),)),
+            ),
+        ):
+            self.assertIsNone(_rerouted_subtask(
+                question="Tell me about this program.",
+                config=Mock(), plan=plan, subtask=subtask,
+                tried=frozenset({"control_flow"}),
+            ))
+
+    def test_any_unresolved_required_claim_is_retried(self) -> None:
+        # An off-entity answer is the clearest case, but any required claim the
+        # capability could not answer leaves a gap another capability may fill.
+        plan = self._plan()
+        subtask = self._subtask("condition_outcome")
+        for reasons in (
+            ("missing_requested_entity:NPAGT",),
+            ("unsupported_claim_line:1",),
+            ("missing_requested_section:control_outcome",),
+        ):
+            with self.subTest(reasons=reasons):
+                self.assertTrue(_claim_should_be_rerouted(EvidenceSubtaskResult(
+                    subtask=subtask, plan=plan, passed=False, reasons=reasons,
+                )))
+
+    def test_a_passing_or_optional_claim_is_never_retried(self) -> None:
+        plan = self._plan()
+        passing = EvidenceSubtaskResult(
+            subtask=self._subtask("variable_access"), plan=plan, passed=True, answer="grounded",
+        )
+        optional = EvidenceSubtaskResult(
+            subtask=replace(self._subtask("condition_outcome"), required=False),
+            plan=plan, passed=False, reasons=("unsupported_claim_line:1",),
+        )
+
+        self.assertFalse(_claim_should_be_rerouted(passing))
+        self.assertFalse(_claim_should_be_rerouted(optional))
 
     def test_only_an_off_entity_failure_triggers_a_reroute(self) -> None:
         plan = self._plan()

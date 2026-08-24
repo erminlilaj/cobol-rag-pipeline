@@ -68,9 +68,14 @@ CAPABILITY_DESCRIPTORS: dict[str, str] = {
         "What the program prepares immediately before one specific call, and what "
         "it inspects, tests or does with the result once that call returns control."
     ),
+    # Queue commands were missing from this list, so asking whether the program
+    # writes to a queue drifted to the nearest storage-shaped capability, JCL
+    # datasets, and came back reporting an absence that was true of JCL but not
+    # of the question. A capability has to name every command family it holds.
     "cics_evidence": (
-        "The CICS commands the program issues, such as sending and receiving maps, "
-        "linking, transferring control, returning or abending, and where each occurs."
+        "Every CICS command the program executes: map send and receive, queue writes "
+        "and reads to temporary storage, program link and transfer, syncpoint, return "
+        "and abend, with the paragraph and line of each."
     ),
     "copybook_evidence": (
         "The copybooks or COPY members the program includes, which of them are "
@@ -114,8 +119,8 @@ VARIABLE_ASPECT_DESCRIPTORS: dict[str, str] = {
         "origin and the section that defines it."
     ),
     "variable_lineage": (
-        "How the value travels onward out of this field into other fields, the "
-        "chain of transfers and where it finally ends up."
+        "What this field's value eventually reaches, which destination fields or "
+        "screen positions receive it downstream, and where the trail ends."
     ),
     # The inbound direction of lineage. Without it, asking what a field is built
     # from could only be answered by its write sites, which name the statements
@@ -145,6 +150,12 @@ MIN_ASPECT_MARGIN = 0.05
 # its own. Measured on the same sample: genuine pairs sat at 0.59 and above,
 # while the runner-up behind a single-aspect question stayed near 0.52.
 MIN_COMPOUND_ASPECT_SCORE = 0.55
+# Companions are read off the leader, so a weak leader cannot introduce them: a
+# flat cluster just above the floor means the question matched nothing clearly,
+# not that it asked for three things at once. Measured leaders of real compound
+# questions sat at 0.62 and above; a three-way tie of unrelated aspects led at
+# 0.56 and produced a claim the evidence could not support.
+MIN_COMPOUND_LEADER_SCORE = 0.60
 
 
 # Capabilities that describe one named entity. Without a resolved identifier they
@@ -317,7 +328,8 @@ def confident_aspects(matches: tuple[CapabilityMatch, ...]) -> tuple[str, ...]:
     companions = tuple(
         match.capability
         for match in matches[1:]
-        if match.score >= MIN_COMPOUND_ASPECT_SCORE
+        if best.score >= MIN_COMPOUND_LEADER_SCORE
+        and match.score >= MIN_COMPOUND_ASPECT_SCORE
         and best.score - match.score <= MIN_ASPECT_MARGIN
     )
     if companions:

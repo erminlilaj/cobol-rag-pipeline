@@ -39,6 +39,7 @@ from cobol_rag.query import (
     _try_structured_plan_answer,
     _semantic_route_hint,
     answer_query,
+    QueryAnswer,
     QueryRoutingDecision,
 )
 from cobol_rag.query_plan import (
@@ -1288,6 +1289,65 @@ class PromptGroundingTest(unittest.TestCase):
         history = session._history_context()
         self.assertIn("What are the rules?", history or "")
         self.assertNotIn("Invented customer account claim", history or "")
+
+    def test_cancelled_question_leaves_no_trace_in_chat_memory(self) -> None:
+        # The worker thread cannot be interrupted, so the answer still arrives.
+        # What must not happen is the next question resolving against a turn the
+        # user stopped waiting for.
+        session = ChatSession(config=AppConfig())
+
+        def answer_after_a_cancel(**kwargs):
+            session.cancel()
+            return QueryAnswer(
+                question="Which paragraphs modify NPAGT?",
+                answer="NPAGT direct COBOL access evidence: line 397.",
+                sources=[],
+                route="technical",
+                scope=QueryScope(intent="variable_dataflow", program="PDCBVC"),
+            )
+
+        with patch("cobol_rag.chat.answer_query", side_effect=answer_after_a_cancel):
+            result = session.ask("Which paragraphs modify NPAGT?")
+
+        self.assertEqual(result.execution_mode, "cancelled")
+        self.assertEqual(session.turns, [])
+        self.assertIsNone(session._history_context())
+
+    def test_uncancelled_question_is_recorded_as_usual(self) -> None:
+        session = ChatSession(config=AppConfig())
+        answer = QueryAnswer(
+            question="Which paragraphs modify NPAGT?",
+            answer="NPAGT direct COBOL access evidence: line 397.",
+            sources=[],
+            route="technical",
+            scope=QueryScope(intent="variable_dataflow", program="PDCBVC"),
+        )
+
+        with patch("cobol_rag.chat.answer_query", return_value=answer):
+            result = session.ask("Which paragraphs modify NPAGT?")
+
+        self.assertNotEqual(result.execution_mode, "cancelled")
+        self.assertEqual(len(session.turns), 1)
+        self.assertIn("Which paragraphs modify NPAGT?", session._history_context() or "")
+
+    def test_cancel_only_discards_the_question_that_was_running(self) -> None:
+        # A cancel raises the generation once; the question asked afterwards
+        # starts from the new generation and must be kept.
+        session = ChatSession(config=AppConfig())
+        session.cancel()
+        answer = QueryAnswer(
+            question="What gives NPAGT its value?",
+            answer="Modified at CALCOLA-NPAG, line 397.",
+            sources=[],
+            route="technical",
+            scope=QueryScope(intent="variable_dataflow", program="PDCBVC"),
+        )
+
+        with patch("cobol_rag.chat.answer_query", return_value=answer):
+            result = session.ask("What gives NPAGT its value?")
+
+        self.assertNotEqual(result.execution_mode, "cancelled")
+        self.assertEqual(len(session.turns), 1)
 
     def test_prompt_respects_evidence_character_budget(self) -> None:
         sources = [

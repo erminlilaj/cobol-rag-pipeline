@@ -26,8 +26,21 @@ class ChatSession:
     max_history: int = 3
     turns: list[ChatTurn] = field(default_factory=list)
     state: SessionState = field(default_factory=SessionState)
+    generation: int = 0
+
+    def cancel(self) -> int:
+        """Abandon the answer in flight so its result never reaches chat memory.
+
+        Generation is not the answer itself but the conversation it belongs to.
+        A question the user stopped waiting for still runs to completion in its
+        worker thread, and recording it would leave the next question resolving
+        pronouns against an answer nobody read.
+        """
+        self.generation += 1
+        return self.generation
 
     def ask(self, message: str, target_program: str | None = None) -> QueryAnswer:
+        generation = self.generation
         history = self._history_context()
         answer = answer_query(
             question=message,
@@ -38,6 +51,22 @@ class ChatSession:
             session_state=self.state,
             target_program=target_program,
         )
+        if generation != self.generation:
+            # Cancelled while this ran. The answer is still returned so a caller
+            # that wants it can use it, but the session is left as though the
+            # question had never been asked.
+            return QueryAnswer(
+                question=message,
+                answer=answer.answer,
+                sources=answer.sources,
+                route=answer.route,
+                scope=answer.scope,
+                trace_id=answer.trace_id,
+                guard_status=answer.guard_status,
+                plan=answer.plan,
+                execution_mode="cancelled",
+                debug=answer.debug,
+            )
         self.turns.append(
             ChatTurn(
                 user=message,

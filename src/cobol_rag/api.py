@@ -124,9 +124,27 @@ def chat(req: ChatRequest) -> Any:
     except QueryError as error:
         raise HTTPException(status_code=400, detail=str(error))
 
+@app.post("/api/chat/cancel")
+def chat_cancel() -> Any:
+    """Stop waiting on the current question and keep it out of chat memory.
+
+    The worker thread cannot be interrupted mid-generation, so the request runs
+    to completion; what this changes is that its result is discarded instead of
+    becoming the context the next question is resolved against.
+    """
+    session = get_chat_session()
+    generation = session.cancel()
+    return {
+        "status": "ok",
+        "generation": generation,
+        "message": "Stopped. The answer in progress will be discarded.",
+    }
+
+
 @app.post("/api/chat/reset")
 def chat_reset() -> Any:
     session = get_chat_session()
+    session.cancel()
     session.reset()
     return {"status": "ok", "message": "Chat memory cleared."}
 

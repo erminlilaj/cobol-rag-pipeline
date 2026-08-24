@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>COBOL RAG Pipeline</title>
-    <link rel="stylesheet" href="style.css?v=waiting-games-debug-details-20260821">
+    <link rel="stylesheet" href="style.css?v=waiting-games-stop-and-queue-20260824">
 </head>
 <body>
     <div class="app-container">
@@ -79,10 +79,18 @@
                 </div>
             </div>
 
+            <div id="queue-bar" class="queue-bar" hidden>
+                <span id="queue-status" class="queue-status"></span>
+                <ol id="queue-list" class="queue-list"></ol>
+            </div>
+
             <div class="chat-input-container">
-                <textarea id="chat-input" placeholder="Ask a question about your COBOL code..." rows="1" onkeydown="handleEnter(event)"></textarea>
-                <button id="send-btn" class="send-btn" onclick="sendMessage()" title="Send">
+                <textarea id="chat-input" placeholder="Ask a question — or put one question per line to queue several." rows="1" onkeydown="handleEnter(event)"></textarea>
+                <button id="send-btn" class="send-btn" onclick="sendMessage()" title="Send (Shift+Enter for a new line)">
                     <span>➤</span>
+                </button>
+                <button id="stop-btn" class="stop-btn" onclick="stopChat()" title="Stop the running question" hidden>
+                    <span>■</span>
                 </button>
             </div>
         </main>
@@ -96,6 +104,6 @@
             </div>
         </div>
     </div>
-    <script src="app.js?v=waiting-games-debug-details-20260821"></script>
+    <script src="app.js?v=waiting-games-stop-and-queue-20260824"></script>
 </body>
 </html>

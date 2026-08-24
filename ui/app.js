@@ -4,6 +4,10 @@ const modalBody = document.getElementById('modal-body');
 const chatHistory = document.getElementById('chat-history');
 const chatInput = document.getElementById('chat-input');
 const sendButton = document.getElementById('send-btn');
+const stopButton = document.getElementById('stop-btn');
+const queueBar = document.getElementById('queue-bar');
+const queueStatus = document.getElementById('queue-status');
+const queueList = document.getElementById('queue-list');
 const statusIndicator = document.getElementById('status-indicator');
 const collectionLabel = document.getElementById('collection-label');
 const treeFilter = document.getElementById('tree-filter');
@@ -602,47 +606,138 @@ function createWaitingExperience() {
     return { element, destroy };
 }
 
-async function sendMessage() {
-    const text = chatInput.value.trim();
-    if (!text || sendButton.disabled) return;
+// Questions waiting to be asked, and the controller for the one in flight.
+// Queued questions run strictly one at a time: each answer becomes context for
+// the next, so overlapping them would resolve follow-ups against the wrong turn.
+let pendingQuestions = [];
+let runningRequest = null;
 
+function splitQuestions(text) {
+    return text
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean);
+}
+
+function renderQueue() {
+    queueList.innerHTML = '';
+    if (!pendingQuestions.length) {
+        queueBar.hidden = true;
+        return;
+    }
+    queueBar.hidden = false;
+    queueStatus.textContent = `${pendingQuestions.length} question${pendingQuestions.length === 1 ? '' : 's'} queued`;
+    pendingQuestions.forEach(question => {
+        const item = document.createElement('li');
+        item.textContent = question;
+        queueList.appendChild(item);
+    });
+}
+
+function setRunning(isRunning) {
+    sendButton.hidden = isRunning;
+    stopButton.hidden = !isRunning;
+    sendButton.disabled = isRunning;
+}
+
+async function askOne(text) {
     appendMessage('user', text);
-    chatInput.value = '';
-    chatInput.style.height = 'auto';
-    sendButton.disabled = true;
-
     const waiting = createWaitingExperience();
     chatHistory.appendChild(waiting.element);
     scrollChatToBottom();
 
+    runningRequest = new AbortController();
     try {
         const data = await apiFetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ message: text }),
+            signal: runningRequest.signal,
         });
-        waiting.destroy();
-        waiting.element.remove();
         appendMessage('assistant', data.answer, data.sources, data);
+        return true;
     } catch (error) {
-        waiting.destroy();
-        waiting.element.remove();
+        if (error.name === 'AbortError') {
+            appendMessage('assistant', 'Stopped. This answer was discarded and is not part of the chat memory.');
+            return false;
+        }
         appendMessage('assistant', `**Error:** ${error.message}`);
+        return true;
     } finally {
+        runningRequest = null;
         waiting.destroy();
         waiting.element.remove();
-        sendButton.disabled = false;
+    }
+}
+
+async function drainQueue() {
+    setRunning(true);
+    try {
+        while (pendingQuestions.length) {
+            const next = pendingQuestions.shift();
+            renderQueue();
+            const keepGoing = await askOne(next);
+            if (!keepGoing) {
+                // A stop applies to the whole batch: the questions behind it were
+                // queued expecting the earlier answers to be in context.
+                const skipped = pendingQuestions.length;
+                pendingQuestions = [];
+                renderQueue();
+                if (skipped) {
+                    appendMessage('assistant', `${skipped} queued question${skipped === 1 ? '' : 's'} cancelled.`);
+                }
+                break;
+            }
+        }
+    } finally {
+        setRunning(false);
+        renderQueue();
         chatInput.focus();
     }
 }
 
+async function sendMessage() {
+    const questions = splitQuestions(chatInput.value);
+    if (!questions.length) return;
+
+    chatInput.value = '';
+    chatInput.style.height = 'auto';
+    pendingQuestions.push(...questions);
+    renderQueue();
+
+    // Already draining means this batch was appended to the running queue and
+    // will be picked up in turn, so a second loop must not start.
+    if (runningRequest || sendButton.hidden) return;
+    await drainQueue();
+}
+
+async function stopChat() {
+    if (runningRequest) {
+        runningRequest.abort();
+    }
+    try {
+        await apiFetch('/api/chat/cancel', { method: 'POST' });
+    } catch (error) {
+        // The abort above already stopped the wait; a failed cancel only means
+        // the discarded answer may still land in memory, which reset clears.
+        console.warn('cancel request failed', error);
+    }
+}
+
 async function resetChat() {
+    pendingQuestions = [];
+    renderQueue();
+    if (runningRequest) {
+        runningRequest.abort();
+    }
     try {
         await apiFetch('/api/chat/reset', { method: 'POST' });
         chatHistory.innerHTML = '';
         appendMessage('assistant', 'Chat memory cleared. What should we inspect next?');
     } catch (error) {
         showModal('Chat Reset Failed', `<p>${escapeHTML(error.message)}</p>`);
+    } finally {
+        setRunning(false);
     }
 }
 

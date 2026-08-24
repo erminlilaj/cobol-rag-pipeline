@@ -1498,6 +1498,46 @@ class AbsentCapabilityRoutingTest(unittest.TestCase):
         self.assertEqual(capability, "jcl_evidence")
         self.assertIn("jcl_evidence", captured["allowed"])
 
+    def test_absence_is_not_the_answer_when_present_evidence_covers_the_entity(self) -> None:
+        # Asking how a variable reaches a screen field is answerable from its
+        # dataflow even with no screen lineage produced. Reporting the missing
+        # capability there refused a question the evidence could answer.
+        scope = QueryScope(
+            intent="general", program="PDCBVC",
+            entities=(EntityReference("PDCBVC", "variable", "RIGA-MAPPA", "PDCBVC|VARIABLE|RIGA-MAPPA"),),
+        )
+        with (
+            patch("cobol_rag.query.unavailable_capabilities", return_value=frozenset({"screen_lineage"})),
+            patch(
+                "cobol_rag.query.router_for",
+                return_value=Mock(rank=lambda q, allowed=None: (CapabilityMatch("screen_lineage", 0.71, 0.12),)),
+            ),
+        ):
+            self.assertIsNone(_absent_capability_request(
+                "Explain how RIGA-MAPPA is built and which map field receives it.",
+                Mock(),
+                scope,
+            ))
+
+    def test_absence_still_answers_when_no_entity_can_be_served(self) -> None:
+        # No identifier means no per-entity evidence to fall back on, so the
+        # manifest's recorded absence remains the answer.
+        with (
+            patch("cobol_rag.query.unavailable_capabilities", return_value=frozenset({"jcl_evidence"})),
+            patch(
+                "cobol_rag.query.router_for",
+                return_value=Mock(rank=lambda q, allowed=None: (CapabilityMatch("jcl_evidence", 0.69, 0.21),)),
+            ),
+        ):
+            self.assertEqual(
+                _absent_capability_request(
+                    "Is there any batch JCL associated with PDCBVC?",
+                    Mock(),
+                    QueryScope(intent="general", program="PDCBVC"),
+                ),
+                "jcl_evidence",
+            )
+
     def test_an_unconfident_match_does_not_claim_absence(self) -> None:
         with (
             patch("cobol_rag.query.unavailable_capabilities", return_value=frozenset({"jcl_evidence"})),
@@ -1543,6 +1583,96 @@ class AbsentCapabilityRoutingTest(unittest.TestCase):
             "cobol_rag.final_scripts_answers.capability_manifest", return_value=self.MANIFEST,
         ):
             self.assertIsNone(absent_capability_answer("PDCBVC", "program_summary"))
+
+
+class SectionContractAcceptsRendererVocabularyTest(unittest.TestCase):
+    """A contract checks for the finding, not for one renderer's heading."""
+
+    RULE_ANSWER = "\n".join([
+        "PDCBVC business rules (1 matching unique direct-evidence rule(s)):",
+        "- BR-018",
+        "  Condition: PXCSEMAF-OUTCOME NOT = SPACE",
+        "  Action: CALL -> ABEND00",
+        "  Paragraph: READ-TAB-SEMAF",
+        "  Source location: PDCBVC.CBL line 765",
+    ])
+
+    @staticmethod
+    def _plan(value: str, **kwargs) -> QueryPlan:
+        return QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",),
+            entities=(EntityReference("PDCBVC", "variable", value, f"PDCBVC|VARIABLE|{value}"),),
+            **kwargs,
+        )
+
+    def test_control_outcome_is_satisfied_by_a_rule_action(self) -> None:
+        # The business-rule renderer states the outcome as "Action: CALL -> X".
+        # Demanding one heading discarded this cited, line-accurate answer.
+        plan = self._plan(
+            "PXCSEMAF-OUTCOME", intent="business_rules", domain="control_flow",
+            tasks=("control_outcome",),
+        )
+
+        self.assertTrue(validate_plan_answer(plan, self.RULE_ANSWER).passed)
+
+    def test_an_answer_with_no_outcome_at_all_is_still_rejected(self) -> None:
+        plan = self._plan(
+            "PXCSEMAF-OUTCOME", intent="business_rules", domain="control_flow",
+            tasks=("control_outcome",),
+        )
+
+        contract = validate_plan_answer(plan, "PXCSEMAF-OUTCOME is checked somewhere.")
+
+        self.assertFalse(contract.passed)
+        self.assertIn("missing_requested_section:control_outcome", contract.reasons)
+
+    def test_exhaustiveness_is_satisfied_by_a_coverage_ratio(self) -> None:
+        # "5/5 direct site(s) returned" is the same completeness claim as an
+        # item count, and is the only form the variable renderer emits.
+        plan = self._plan(
+            "M1MSGO", intent="variable_dataflow", domain="dataflow",
+            tasks=("variable_writes", "literal_assignments"), result_scope="all",
+        )
+        answer = "\n".join([
+            "M1MSGO direct COBOL access evidence:",
+            "Modified at:",
+            "- BROWSE-FASE1, line 285: MOVE KFINE-DATI TO M1MSGO.",
+            "Write coverage: 5/5 direct site(s) returned.",
+        ])
+
+        self.assertTrue(validate_plan_answer(plan, answer).passed)
+
+    def test_an_exhaustive_answer_claiming_no_completeness_is_still_rejected(self) -> None:
+        plan = self._plan(
+            "M1MSGO", intent="variable_dataflow", domain="dataflow",
+            tasks=("variable_writes", "literal_assignments"), result_scope="all",
+        )
+
+        contract = validate_plan_answer(plan, "M1MSGO is assigned in several paragraphs.")
+
+        self.assertFalse(contract.passed)
+        self.assertIn("missing_exhaustive_result_count", contract.reasons)
+
+    def test_item_count_is_still_cross_checked_against_the_listed_lines(self) -> None:
+        plan = QueryPlan(
+            program="PDCBVC", intent="static_values", tasks=("literal_assignments",),
+            result_scope="all",
+        )
+        answer = "Literal assignments: 3 matching item(s).\n- line 226: X\n- line 288: Y"
+
+        self.assertIn(
+            "exhaustive_result_count_mismatch:2/3",
+            validate_plan_answer(plan, answer).reasons,
+        )
+
+    def test_truncation_is_still_refused_however_completeness_is_worded(self) -> None:
+        plan = self._plan(
+            "M1MSGO", intent="variable_dataflow", domain="dataflow",
+            tasks=("variable_writes",), result_scope="all",
+        )
+        answer = "M1MSGO modified at:\nshowing only the first 5 items.\nWrite coverage: 5/5 direct site(s) returned."
+
+        self.assertIn("exhaustive_result_truncated", validate_plan_answer(plan, answer).reasons)
 
 
 class OffEntityClaimReroutingTest(unittest.TestCase):

@@ -1039,6 +1039,19 @@ def _subtask_description(
     return f"Verify {capability.replace('_', ' ')} evidence for {target}"
 
 
+# An exhaustive answer has to say how much it returned. Renderers state that
+# either as an item count or as a coverage ratio; both are a completeness claim
+# the reader can check, so either satisfies the contract. Only the item-count
+# form can be cross-checked against the listed lines, so the count comparison
+# stays attached to it.
+_EXHAUSTIVE_ITEM_COUNT = re.compile(r":\s*(\d+)\s+matching item\(s\)\.")
+_EXHAUSTIVE_COVERAGE = re.compile(
+    r"\b\d+\s*/\s*\d+\s+(?:\w+\s+)*?(?:site|item|rule|entry)\(s\)\s+returned\b"
+    r"|\b\d+\s+matching unique direct-evidence rule\(s\)",
+    re.IGNORECASE,
+)
+
+
 def validate_plan_answer(plan: QueryPlan, answer: str) -> PlanContractValidation:
     if not answer.strip():
         return PlanContractValidation(False, ("empty_answer",))
@@ -1089,11 +1102,18 @@ def validate_plan_answer(plan: QueryPlan, answer: str) -> PlanContractValidation
     ):
         reasons.append("missing_requested_field:source_line")
 
+    # Each capability renders in its own vocabulary, so a section is satisfied by
+    # any wording that carries the substance. A control outcome stated as a rule
+    # action ("Action: JUMP -> ABEND00") is the same finding as one under a
+    # "Resulting control-flow actions:" heading, and rejecting it discarded a
+    # cited, line-accurate answer the retrieval layer had already found.
     required_sections = {
         "variable_reads": ("tested/read at:", "read sites:"),
         "variable_writes": ("modified at:", "write sites:"),
         "variable_lineage": ("lineage:", "downstream lineage:"),
-        "control_outcome": ("resulting control-flow actions:",),
+        "control_outcome": (
+            "resulting control-flow actions:", "control-flow use:", "action:",
+        ),
         "variable_composition": ("construction/context evidence:",),
         "call_option_usage": ("cics/call option usage:",),
         "lineage_terminal": ("lineage completion:",),
@@ -1112,15 +1132,15 @@ def validate_plan_answer(plan: QueryPlan, answer: str) -> PlanContractValidation
         if re.search(r"\bshowing (?:only )?(?:the )?(?:first|top)\b", lowered):
             reasons.append("exhaustive_result_truncated")
         if "literal_assignments" in plan.tasks:
-            count_match = re.search(r":\s*(\d+)\s+matching item\(s\)\.", answer)
-            if not count_match:
-                reasons.append("missing_exhaustive_result_count")
-            else:
+            count_match = _EXHAUSTIVE_ITEM_COUNT.search(answer)
+            if count_match:
                 returned = sum(1 for line in answer.splitlines() if line.startswith("- line "))
                 if returned != int(count_match.group(1)):
                     reasons.append(
                         f"exhaustive_result_count_mismatch:{returned}/{count_match.group(1)}"
                     )
+            elif not _EXHAUSTIVE_COVERAGE.search(answer):
+                reasons.append("missing_exhaustive_result_count")
 
     return PlanContractValidation(not reasons, tuple(dict.fromkeys(reasons)))
 

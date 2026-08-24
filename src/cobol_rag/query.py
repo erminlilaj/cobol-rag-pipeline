@@ -1947,14 +1947,24 @@ def _absent_capability_request(
     Absence is itself a recorded finding, so the unfiltered ranking is consulted
     first and a confident match on a capability the analysis proved empty is
     reported as empty instead of being answered by its nearest neighbour.
+
+    Absence answers a question only when nothing available can. A question that
+    names an identifier some present capability catalogues is answerable from
+    that evidence, and the missing capability is one lens on it rather than the
+    verdict: asking how a variable reaches a screen field is answered by its
+    dataflow even when no screen lineage was produced.
     """
     program = scope.program if scope else None
     missing = unavailable_capabilities(program)
     if not missing:
         return None
-    allowed = eligible_capabilities(
-        entity_types=tuple(entity.entity_type for entity in (scope.entities if scope else ())),
-    )
+    entity_types = frozenset(entity.entity_type for entity in (scope.entities if scope else ()))
+    allowed = eligible_capabilities(entity_types=tuple(entity_types))
+    if entity_types and any(
+        capability not in missing and _capability_indexes_entities(capability, entity_types)
+        for capability in allowed
+    ):
+        return None
     try:
         matches = router_for(config).rank(question, allowed=allowed)
     except Exception as error:  # embedding availability is provider-specific

@@ -10,7 +10,9 @@ from cobol_rag.chat import ChatSession, ChatTurn
 from cobol_rag.config import AppConfig
 from cobol_rag.loaders.rag_documents import RagDocumentsLoader
 from cobol_rag.capability_router import (
+    VARIABLE_ASPECT_DESCRIPTORS,
     CapabilityMatch,
+    confident_aspects,
     eligible_capabilities,
     rank_capabilities,
 )
@@ -1583,6 +1585,109 @@ class AbsentCapabilityRoutingTest(unittest.TestCase):
             "cobol_rag.final_scripts_answers.capability_manifest", return_value=self.MANIFEST,
         ):
             self.assertIsNone(absent_capability_answer("PDCBVC", "program_summary"))
+
+
+class CompoundAspectSelectionTest(unittest.TestCase):
+    """One question can ask about two aspects of the same variable."""
+
+    @staticmethod
+    def _matches(*pairs: tuple[str, float]) -> tuple[CapabilityMatch, ...]:
+        ordered = sorted(pairs, key=lambda item: -item[1])
+        return tuple(
+            CapabilityMatch(
+                name,
+                score,
+                (score - ordered[index + 1][1]) if index == 0 and index + 1 < len(ordered) else 0.0,
+            )
+            for index, (name, score) in enumerate(ordered)
+        )
+
+    def test_two_aspects_that_stand_alone_are_both_kept(self) -> None:
+        # "what values can it take, and how does each affect execution" asks
+        # about assigned constants and resulting control flow at once. Requiring
+        # the leader to beat the runner-up rejected both.
+        matches = self._matches(
+            ("control_outcome", 0.6266),
+            ("literal_assignments", 0.5916),
+            ("variable_comparison", 0.5079),
+        )
+
+        self.assertEqual(
+            confident_aspects(matches), ("control_outcome", "literal_assignments"),
+        )
+
+    def test_a_close_runner_up_below_the_bar_is_still_treated_as_noise(self) -> None:
+        # A follow-up about reads belongs to no aspect. Its runner-up is close
+        # but never confident on its own, so the pair must not be admitted.
+        matches = self._matches(
+            ("variable_definition", 0.5595),
+            ("variable_comparison", 0.5180),
+            ("literal_assignments", 0.4643),
+        )
+
+        self.assertEqual(confident_aspects(matches), ())
+
+    def test_a_clear_single_aspect_is_unchanged(self) -> None:
+        matches = self._matches(
+            ("literal_assignments", 0.6319),
+            ("variable_definition", 0.5530),
+            ("variable_comparison", 0.5297),
+        )
+
+        self.assertEqual(confident_aspects(matches), ("literal_assignments",))
+
+    def test_nothing_above_the_floor_selects_nothing(self) -> None:
+        matches = self._matches(
+            ("variable_lineage", 0.41), ("literal_assignments", 0.40),
+        )
+
+        self.assertEqual(confident_aspects(matches), ())
+
+    def test_inbound_composition_is_an_aspect_a_question_can_ask_for(self) -> None:
+        # Without it, "what is this field built from" could only be answered by
+        # write sites, which name statements but never the contributing fields.
+        self.assertIn("variable_composition", VARIABLE_ASPECT_DESCRIPTORS)
+        self.assertIn(
+            "variable_composition", _CAPABILITY_TASKS["variable_lineage"],
+        )
+
+
+class PerItemRequestsKeepTheirFormatterTest(unittest.TestCase):
+    """Asking for detail on each item must not disqualify a list formatter."""
+
+    @staticmethod
+    def _plan(tasks: tuple[str, ...], intent: str) -> QueryPlan:
+        return QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), route="technical",
+            intent=intent, domain="integration", tasks=tasks,
+            relations=("example_per_item",),
+            output_fields=("target", "paragraph", "commarea", "source_line", "length"),
+        )
+
+    def test_call_inventory_still_uses_its_formatter(self) -> None:
+        # The formatter already lists every call with its own fields, which is
+        # what the request asks for. Refusing it sent a well-specified inventory
+        # question to free-form generation, which answered with uncited JSON.
+        self.assertTrue(_direct_handler_supports(
+            self._plan(("external_calls",), "external_programs"),
+        ))
+
+    def test_other_per_item_inventories_are_covered_too(self) -> None:
+        for tasks, intent in (
+            (("cics_operations",), "cics_operations"),
+            (("copybook_inventory",), "copybooks"),
+            (("literal_assignments",), "static_values"),
+        ):
+            with self.subTest(tasks=tasks):
+                self.assertTrue(_direct_handler_supports(self._plan(tasks, intent)))
+
+    def test_a_task_with_no_per_item_formatter_is_still_refused(self) -> None:
+        self.assertFalse(_direct_handler_supports(
+            self._plan(("path_from_paragraph",), "control_flow"),
+        ))
+        self.assertFalse(_direct_handler_supports(
+            self._plan(("program_summary",), "program_summary"),
+        ))
 
 
 class SectionContractAcceptsRendererVocabularyTest(unittest.TestCase):

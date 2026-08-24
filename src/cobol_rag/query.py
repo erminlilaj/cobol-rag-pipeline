@@ -1516,6 +1516,32 @@ def _structured_control_flow_path(
                     f"- {terminal} executes CICS {operation['command']}{location}: "
                     f"`{operation['statement']}` [Source {operation['source_index']}]"
                 )
+        # A short trace is otherwise indistinguishable from a truncated one, and
+        # a paragraph performed as a range leaves by returning to whoever called
+        # it rather than by an edge, so both are stated instead of left implicit.
+        outgoing_total = len(adjacency.get(start, []))
+        capped = len(paths) >= max_paths
+        lines.append(
+            f"Path coverage: {len(paths)} path(s) from {outgoing_total} recorded outgoing edge(s)"
+            + (f"; stopped at the {max_paths}-path limit." if capped else ", complete.")
+        )
+        callers = _unique_structured_edges([
+            edge for edge in _flat_control_flow_edges(sources)
+            if edge.get("to") == start and edge.get("from") != start
+        ])
+        if callers:
+            lines.append("Entered from:")
+            for edge in callers:
+                evidence = edge.get("evidence") or f"{edge.get('type', 'EDGE')} to {start}"
+                lines.append(
+                    f"- {edge.get('from', '?')} ({edge.get('type', 'EDGE')}): "
+                    f"`{evidence}` [Source {edge['source_index']}]"
+                )
+            if any(str(edge.get("type", "")).startswith("CALL") for edge in callers):
+                lines.append(
+                    "- Performed as a range, so control returns to the calling "
+                    "paragraph at the range exit rather than continuing forward."
+                )
     return "\n".join(lines) if lines else None
 
 
@@ -1813,6 +1839,13 @@ def _chunk_types_for_plan(plan: QueryPlan) -> list[str] | None:
     return sorted(concrete) if concrete else None
 
 
+# Tasks whose formatter renders one entry per item, carrying that item's own
+# fields. A request for per-item detail is already satisfied by their output.
+_PER_ITEM_RENDERED_TASKS = frozenset({
+    "external_calls", "cics_operations", "copybook_inventory", "literal_assignments",
+})
+
+
 def _direct_handler_supports(plan: QueryPlan) -> bool:
     """Return true only when a fixed formatter can fulfill the complete plan."""
     if plan.response_language not in {"", "en"}:
@@ -1842,9 +1875,17 @@ def _direct_handler_supports(plan: QueryPlan) -> bool:
         return False
     unsupported_relations = {
         "referenced_by", "contains", "starts_at", "ends_at", "before", "after",
-        "separate_categories", "example_per_item",
+        "separate_categories",
     }
     if set(plan.relations) & unsupported_relations:
+        return False
+    # Asking for detail on each item is what these formatters already do: they
+    # list every call, operation, copybook or assignment with its fields. Ruling
+    # them out sent a well-specified inventory question to free-form generation,
+    # which answered it with uncited JSON.
+    if "example_per_item" in plan.relations and not (
+        plan.tasks and set(plan.tasks) <= _PER_ITEM_RENDERED_TASKS
+    ):
         return False
     if plan.category in {"multi_source_comparison", "multi_source_synthesis"}:
         if plan.intent == "variable_dataflow":

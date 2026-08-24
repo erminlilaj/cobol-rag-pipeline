@@ -117,6 +117,13 @@ VARIABLE_ASPECT_DESCRIPTORS: dict[str, str] = {
         "How the value travels onward out of this field into other fields, the "
         "chain of transfers and where it finally ends up."
     ),
+    # The inbound direction of lineage. Without it, asking what a field is built
+    # from could only be answered by its write sites, which name the statements
+    # but never the fields that contribute the value.
+    "variable_composition": (
+        "Which variables contribute to this field's content, the pieces "
+        "gathered from elsewhere that together form its value."
+    ),
     "control_outcome": (
         "What the program does as a consequence of the value. Which branch is "
         "taken, what happens when the condition holds, the resulting action."
@@ -134,6 +141,10 @@ VARIABLE_ASPECT_DESCRIPTORS: dict[str, str] = {
 # to no aspect stayed below. Re-measure before trusting these on a new corpus.
 MIN_ASPECT_SCORE = 0.45
 MIN_ASPECT_MARGIN = 0.05
+# A second aspect is only a second request when it would have been confident on
+# its own. Measured on the same sample: genuine pairs sat at 0.59 and above,
+# while the runner-up behind a single-aspect question stayed near 0.52.
+MIN_COMPOUND_ASPECT_SCORE = 0.55
 
 
 # Capabilities that describe one named entity. Without a resolved identifier they
@@ -286,15 +297,32 @@ class CapabilityRouter:
 
 
 def confident_aspects(matches: tuple[CapabilityMatch, ...]) -> tuple[str, ...]:
-    """Keep only an aspect the question clearly asked for.
+    """Keep the aspects a question clearly asked for.
 
     A question about reads or writes belongs to no aspect here, and must come
     back empty rather than being assigned the nearest unrelated one.
+
+    One question can ask about more than one aspect: "what values can it take,
+    and how does each affect execution" is asking about both the assigned
+    constants and the resulting control flow. Requiring the leader to beat the
+    runner-up rejected exactly those, because the second thing being asked is
+    what closes the gap. A runner-up is therefore treated as a second request
+    when it stands on its own well above the bar, and as noise otherwise.
     """
     if not matches:
         return ()
     best = matches[0]
-    if best.score < MIN_ASPECT_SCORE or best.margin < MIN_ASPECT_MARGIN:
+    if best.score < MIN_ASPECT_SCORE:
+        return ()
+    companions = tuple(
+        match.capability
+        for match in matches[1:]
+        if match.score >= MIN_COMPOUND_ASPECT_SCORE
+        and best.score - match.score <= MIN_ASPECT_MARGIN
+    )
+    if companions:
+        return (best.capability, *companions)
+    if best.margin < MIN_ASPECT_MARGIN:
         return ()
     return (best.capability,)
 

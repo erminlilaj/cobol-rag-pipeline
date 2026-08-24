@@ -19,6 +19,7 @@ from cobol_rag.capability_router import (
 )
 from cobol_rag.config import AppConfig
 from cobol_rag.final_scripts_answers import (
+    absent_capability_answer,
     answer_from_final_scripts,
     capability_manifest,
     unavailable_capabilities,
@@ -302,6 +303,30 @@ def answer_query(
             initial_scope.reason, [], route="unclear", scope=initial_scope,
             execution_mode="clarification",
         )
+
+    # Asked before a capability is chosen, because once the missing one has been
+    # filtered out of the ranking the question has already been handed to its
+    # nearest available neighbour and the absence can no longer be reported.
+    absent_capability = _absent_capability_request(question, config, initial_scope)
+    if absent_capability:
+        absent_answer = absent_capability_answer(initial_scope.program, absent_capability)
+        if absent_answer:
+            absent_intent, absent_domain = _capability_route(absent_capability, ())
+            return finish(
+                absent_answer,
+                [],
+                route="technical",
+                scope=replace(initial_scope, intent=absent_intent),
+                plan=replace(
+                    initial_plan,
+                    route="technical",
+                    domain=absent_domain,
+                    intent=absent_intent,
+                    tasks=_CAPABILITY_TASKS.get(absent_capability, ()),
+                    planner_source="capability_manifest",
+                ),
+                execution_mode="manifest_absent_capability",
+            )
 
     routing: QueryRoutingDecision | None = None
     if initial_plan.requires_clarification:
@@ -1907,6 +1932,40 @@ def _rank_question_capabilities(
     except Exception as error:  # embedding availability is provider-specific
         _log_stage_latency("capability_router", 0.0, f"ERROR={type(error).__name__}")
         return ()
+
+
+def _absent_capability_request(
+    question: str,
+    config: AppConfig,
+    scope: QueryScope | None,
+) -> str | None:
+    """Name the capability a question confidently wants but the program lacks.
+
+    Ranking with the missing capabilities already removed forces such a question
+    onto the nearest capability that does hold evidence, which is how asking
+    whether a CICS program has any batch JCL came back as a program summary.
+    Absence is itself a recorded finding, so the unfiltered ranking is consulted
+    first and a confident match on a capability the analysis proved empty is
+    reported as empty instead of being answered by its nearest neighbour.
+    """
+    program = scope.program if scope else None
+    missing = unavailable_capabilities(program)
+    if not missing:
+        return None
+    allowed = eligible_capabilities(
+        entity_types=tuple(entity.entity_type for entity in (scope.entities if scope else ())),
+    )
+    try:
+        matches = router_for(config).rank(question, allowed=allowed)
+    except Exception as error:  # embedding availability is provider-specific
+        _log_stage_latency("absent_capability_router", 0.0, f"ERROR={type(error).__name__}")
+        return None
+    if not matches:
+        return None
+    best = matches[0]
+    if not best.confident or best.capability not in missing:
+        return None
+    return best.capability
 
 
 def _capability_routing_decision(

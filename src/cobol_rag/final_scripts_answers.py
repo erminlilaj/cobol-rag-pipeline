@@ -485,9 +485,14 @@ _INTENT_SOLE_CAPABILITY = {
 }
 
 
-def _absent_capability_answer(root: Path, program: str, intent: str | None) -> str | None:
-    capability = _INTENT_SOLE_CAPABILITY.get(str(intent or ""))
-    if not capability:
+def absent_capability_answer(program: str | None, capability: str) -> str | None:
+    """State that a program has no evidence of a kind, and why the analysis says so.
+
+    Absence is a finding, not a gap to route around: the manifest records both
+    that a capability produced nothing and the reason it produced nothing, so
+    the answer is a lookup rather than something inferred from empty retrieval.
+    """
+    if not program or not capability:
         return None
     manifest = capability_manifest(program)
     if not manifest:
@@ -496,11 +501,21 @@ def _absent_capability_answer(root: Path, program: str, intent: str | None) -> s
     if not isinstance(entry, dict) or entry.get("available", True):
         return None
     reason = str(entry.get("reason") or "").strip()
+    # Capability names already end in "_evidence" for most families, so the noun
+    # is dropped from the label rather than repeated in the sentence.
+    label = capability[: -len("_evidence")] if capability.endswith("_evidence") else capability
     return (
-        f"{program} has no {capability.replace('_', ' ')} evidence in the analyzed artifacts"
+        f"{program} has no {label.replace('_', ' ')} evidence in the analyzed artifacts"
         + (f": {reason}." if reason else ".")
         + f" Source: `{entry.get('artifact', 'program.capability_manifest.json')}`."
     )
+
+
+def _absent_capability_answer(root: Path, program: str, intent: str | None) -> str | None:
+    capability = _INTENT_SOLE_CAPABILITY.get(str(intent or ""))
+    if not capability:
+        return None
+    return absent_capability_answer(program, capability)
 
 
 def capability_manifest(program: str | None) -> dict[str, Any] | None:

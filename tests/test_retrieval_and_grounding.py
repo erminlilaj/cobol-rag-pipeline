@@ -18,6 +18,7 @@ from cobol_rag.query import (
     _build_prompt,
     _build_constrained_routing_prompt,
     _build_routing_prompt,
+    _absent_capability_request,
     _attempt_evidence_subtask,
     _entity_contract_failed,
     _rerouted_subtask,
@@ -53,6 +54,7 @@ from cobol_rag.query_plan import (
     resolve_response_language,
     validate_plan_answer,
 )
+from cobol_rag.final_scripts_answers import absent_capability_answer
 from cobol_rag.retrieve import (
     EvidenceGuard, RetrievalOutcome, RetrievalResult, _deduplicate_results, _detect_intent,
 )
@@ -1396,6 +1398,91 @@ class EntityScopedEvidenceContractTest(unittest.TestCase):
         self.assertFalse(
             [reason for reason in contract.reasons if reason.startswith("missing_requested_entity")]
         )
+
+
+class AbsentCapabilityRoutingTest(unittest.TestCase):
+    """A capability the analysis proved empty answers as empty, not by proxy."""
+
+    MANIFEST = {
+        "capabilities": {
+            "jcl_evidence": {
+                "available": False,
+                "count": 0,
+                "reason": "no program-to-JCL linkage in the parsed job steps",
+                "artifact": "program.capability_manifest.json",
+            },
+            "program_summary": {"available": True, "count": 1},
+            "cics_evidence": {"available": True, "count": 18},
+        }
+    }
+
+    def test_missing_capability_is_offered_to_the_ranker_not_filtered_out(self) -> None:
+        # Removing the missing capability before ranking is what sent "is there
+        # any batch JCL" to the nearest capability that did have evidence.
+        captured: dict[str, object] = {}
+
+        def rank(question: str, *, allowed=None):
+            captured["allowed"] = set(allowed)
+            return (CapabilityMatch("jcl_evidence", 0.69, 0.21),)
+
+        with (
+            patch("cobol_rag.query.unavailable_capabilities", return_value=frozenset({"jcl_evidence"})),
+            patch("cobol_rag.query.router_for", return_value=Mock(rank=rank)),
+        ):
+            capability = _absent_capability_request(
+                "Is there any batch JCL associated with PDCBVC?",
+                Mock(),
+                QueryScope(intent="general", program="PDCBVC"),
+            )
+
+        self.assertEqual(capability, "jcl_evidence")
+        self.assertIn("jcl_evidence", captured["allowed"])
+
+    def test_an_unconfident_match_does_not_claim_absence(self) -> None:
+        with (
+            patch("cobol_rag.query.unavailable_capabilities", return_value=frozenset({"jcl_evidence"})),
+            patch(
+                "cobol_rag.query.router_for",
+                return_value=Mock(rank=lambda q, allowed=None: (CapabilityMatch("jcl_evidence", 0.31, 0.001),)),
+            ),
+        ):
+            self.assertIsNone(_absent_capability_request(
+                "What does this program do?",
+                Mock(),
+                QueryScope(intent="general", program="PDCBVC"),
+            ))
+
+    def test_a_confident_match_on_present_evidence_is_left_to_normal_routing(self) -> None:
+        with (
+            patch("cobol_rag.query.unavailable_capabilities", return_value=frozenset({"jcl_evidence"})),
+            patch(
+                "cobol_rag.query.router_for",
+                return_value=Mock(rank=lambda q, allowed=None: (CapabilityMatch("cics_evidence", 0.82, 0.10),)),
+            ),
+        ):
+            self.assertIsNone(_absent_capability_request(
+                "Which CICS commands does PDCBVC issue?",
+                Mock(),
+                QueryScope(intent="general", program="PDCBVC"),
+            ))
+
+    def test_absence_answer_carries_the_analysis_reason_and_its_source(self) -> None:
+        with patch(
+            "cobol_rag.final_scripts_answers.capability_manifest", return_value=self.MANIFEST,
+        ):
+            answer = absent_capability_answer("PDCBVC", "jcl_evidence")
+
+        self.assertIsNotNone(answer)
+        self.assertIn("PDCBVC has no jcl evidence in the analyzed artifacts", answer)
+        self.assertNotIn("evidence evidence", answer)
+        self.assertIn("no program-to-JCL linkage in the parsed job steps", answer)
+        self.assertIn("program.capability_manifest.json", answer)
+
+    def test_available_capability_produces_no_absence_answer(self) -> None:
+        with patch(
+            "cobol_rag.final_scripts_answers.capability_manifest", return_value=self.MANIFEST,
+        ):
+            self.assertIsNone(absent_capability_answer("PDCBVC", "program_summary"))
 
 
 class OffEntityClaimReroutingTest(unittest.TestCase):

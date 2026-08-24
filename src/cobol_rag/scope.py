@@ -341,15 +341,31 @@ def contextualize_question(question: str, scope: QueryScope) -> str:
     return question.rstrip() + "\nResolved context: " + " ".join(additions)
 
 
+# A pronoun points back at a previously discussed entity only when it stands in
+# for one. Before a present participle it is the subject of a progressive verb
+# instead — "how its going", "hows it going" — which is small talk, not a
+# question about the last variable. Inheriting an entity there answers a
+# greeting with dataflow evidence. "being" is excepted because it is the
+# progressive auxiliary of a passive: "where is it being used" does refer back.
+_PROGRESSIVE_AFTER_PRONOUN = r"(?!\s+(?!being\b)\w+ing\b)"
+_PRONOUN_REFERENCE = re.compile(rf"\b(?:it|them)\b{_PROGRESSIVE_AFTER_PRONOUN}", re.IGNORECASE)
+# A possessive refers back only when it qualifies a noun: "its callers", "their
+# parameters". Bare "its" before a participle is the misspelt contraction.
+_POSSESSIVE_REFERENCE = re.compile(r"\b(?:its|their)\s+(?!\w+ing\b)\w+\b", re.IGNORECASE)
+_NAMED_REFERENCE = re.compile(
+    r"\b(this one|that one|the same (?:variable|field|call|paragraph)|"
+    r"the variable|the field|the call|that call|this call|that paragraph|those paragraphs|"
+    r"previously discussed variable|previous variable)\b",
+    re.IGNORECASE,
+)
+
+
 def _looks_like_followup(question: str) -> bool:
     q = question.lower().strip()
     return bool(
-        re.search(
-            r"\b(it|its|them|their|this one|that one|the same (?:variable|field|call|paragraph)|"
-            r"the variable|the field|the call|that call|this call|that paragraph|those paragraphs|"
-            r"previously discussed variable|previous variable)\b",
-            q,
-        )
+        _PRONOUN_REFERENCE.search(q)
+        or _POSSESSIVE_REFERENCE.search(q)
+        or _NAMED_REFERENCE.search(q)
         or re.match(r"^(?:and\s+)?(?:where|what|how|why|when)\s+else\b", q)
         or re.match(r"^(?:and\s+)?(?:what|how)\s+about\b", q)
         or re.match(

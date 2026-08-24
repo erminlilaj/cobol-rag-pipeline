@@ -24,7 +24,13 @@ from cobol_rag.retrieve import (
     _prompt_injection_signals,
     _validate_evidence,
 )
-from cobol_rag.scope import QueryScope, SessionState, resolve_query_scope
+from cobol_rag.scope import (
+    QueryScope,
+    SessionState,
+    _looks_like_followup,
+    _should_reuse_state_entities,
+    resolve_query_scope,
+)
 
 
 class AnswerDebugPayloadTest(unittest.TestCase):
@@ -592,6 +598,56 @@ class ObservabilityTest(unittest.TestCase):
         with patch("cobol_rag.evaluation.answer_query", return_value=answer):
             report = evaluate_cases([case], AppConfig())
         self.assertEqual(report["metrics"]["pass_rate"], 1.0)
+
+
+class SmallTalkDoesNotInheritEntitiesTest(unittest.TestCase):
+    """A pronoun in small talk must not drag the last entity into a greeting."""
+
+    @staticmethod
+    def _state_holding(value: str) -> SessionState:
+        state = SessionState()
+        state.current_program = "PDCBVC"
+        state.current_entity_value = value
+        state.current_entity_type = "variable"
+        state.current_entity_key = f"PDCBVC|VARIABLE|{value}"
+        return state
+
+    def test_progressive_pronoun_is_not_a_reference_to_the_last_entity(self) -> None:
+        # "how its going" is a misspelt contraction, not a question about NPAGT.
+        # Treating it as one answered a greeting with dataflow evidence.
+        for greeting in (
+            "how its going",
+            "hows it going",
+            "how is it going",
+            "its going well",
+        ):
+            with self.subTest(greeting=greeting):
+                self.assertFalse(_looks_like_followup(greeting))
+                self.assertFalse(
+                    _should_reuse_state_entities(greeting, None, self._state_holding("NPAGT"))
+                )
+
+    def test_a_real_follow_up_still_carries_the_entity_forward(self) -> None:
+        for question in (
+            "And where is it tested?",
+            "where else is it used",
+            "what about its callers",
+            "what about their parameters",
+            "where is it being used",
+            "who calls it",
+        ):
+            with self.subTest(question=question):
+                self.assertTrue(_looks_like_followup(question))
+                self.assertTrue(
+                    _should_reuse_state_entities(question, None, self._state_holding("NPAGT"))
+                )
+
+    def test_greeting_resolves_to_no_entity_even_with_a_sticky_session(self) -> None:
+        scope = resolve_query_scope(
+            "how its going", intent=None, state=self._state_holding("NPAGT"),
+        )
+        self.assertIsNone(scope.entity_value)
+        self.assertNotEqual(scope.entity_source, "session")
 
 
 if __name__ == "__main__":

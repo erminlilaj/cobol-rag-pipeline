@@ -104,6 +104,13 @@ CAPABILITY_DESCRIPTORS: dict[str, str] = {
     "screen_lineage": (
         "How a value reaches a field displayed on a screen or map."
     ),
+    # An address, not a meaning. Ranking cannot resolve one, so this descriptor
+    # exists to advertise the capability and to keep line questions away from
+    # capabilities that would answer them by similarity.
+    "source_line_lookup": (
+        "The exact text at a physical source address: a specific line number or "
+        "range of line numbers in a program or copybook member, shown verbatim."
+    ),
 }
 
 # What a question can want to know about one named variable, described by meaning.

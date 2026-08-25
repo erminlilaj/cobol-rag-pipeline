@@ -437,6 +437,68 @@ def _state_entities_for_followup(
     return list(state.current_entities)
 
 
+# A number after "line" is an address, not a quantity. Both forms are required
+# to carry a digit so that asking for the source line *field* ("include the
+# source line") never resolves to an address.
+_LINE_RANGE = re.compile(
+    r"\blines?\s+(\d{1,6})\s*(?:-|–|—|to|through|thru|until)\s*(\d{1,6})\b", re.IGNORECASE,
+)
+_LINE_SINGLE = re.compile(r"\blines?\s+(\d{1,6})\b", re.IGNORECASE)
+_SOURCE_MEMBER = re.compile(r"\b([A-Z][A-Z0-9-]{1,30}\.(?:CBL|CPY|COB))\b", re.IGNORECASE)
+# "five lines around", "3 lines either side" — a window, not an address.
+_CONTEXT_WINDOW = re.compile(
+    r"\b(\d{1,3})\s+lines?\s+(?:of\s+)?(?:context|around|either side|before and after|surrounding)",
+    re.IGNORECASE,
+)
+
+
+def source_address_in(question: str) -> dict[str, Any] | None:
+    """Read an explicit physical source address out of a question.
+
+    Returns the span and any named member, or None when the question does not
+    name a numeric address. This is deliberately literal: an address is exact,
+    so guessing one from wording would defeat the point of the capability.
+    """
+    text = question or ""
+    range_match = _LINE_RANGE.search(text)
+    if range_match:
+        start, end = int(range_match.group(1)), int(range_match.group(2))
+    else:
+        single = _LINE_SINGLE.search(text)
+        if not single:
+            return None
+        start = end = int(single.group(1))
+    if start < 1 or end < 1:
+        return None
+    if end < start:
+        start, end = end, start
+    member = _SOURCE_MEMBER.search(text)
+    window = _CONTEXT_WINDOW.search(text)
+    context = int(window.group(1)) if window else 0
+    return {
+        "line_start": start,
+        "line_end": end,
+        "source_file": member.group(1).upper() if member else None,
+        "context_before": context,
+        "context_after": context,
+    }
+
+
+def source_address_entity(program: str | None, address: dict[str, Any]) -> EntityReference:
+    """Represent an address as a typed entity so the plan can carry it."""
+    start, end = address["line_start"], address["line_end"]
+    value = str(start) if start == end else f"{start}-{end}"
+    member = address.get("source_file")
+    if member:
+        value = f"{member}:{value}"
+    return EntityReference(
+        program=program or "",
+        entity_type="source_address",
+        value=value,
+        entity_key=f"{program or ''}|SOURCE_ADDRESS|{value}",
+    )
+
+
 def _looks_like_followup(question: str) -> bool:
     q = question.lower().strip()
     return bool(

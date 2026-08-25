@@ -560,6 +560,7 @@ _CAPABILITY_TASKS = {
     "quality_evidence": ("commented_code", "unreachable_code", "unused_copybooks", "review_copybooks"),
     "pagination_evidence": ("pagination_logic",),
     "screen_lineage": ("screen_lineage",),
+    "source_line_lookup": ("source_lines",),
 }
 
 # Entity types that are exact identifiers copied from the user's question, and so
@@ -1488,6 +1489,7 @@ def _capability_route(
         "quality_evidence": ("dead_code", "quality"),
         "pagination_evidence": ("control_flow", "control_flow"),
         "screen_lineage": ("ui_navigation", "program_structure"),
+        "source_line_lookup": ("source_lines", "program_structure"),
     }
     intent, domain = mapping.get(capability, ("general", "general"))
     return intent, domain

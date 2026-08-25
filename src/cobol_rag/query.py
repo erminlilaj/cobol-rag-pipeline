@@ -26,6 +26,7 @@ from cobol_rag.evidence import (
 )
 from cobol_rag.final_scripts_answers import (
     absent_capability_answer,
+    answer_source_lines,
     answer_from_final_scripts,
     capability_manifest,
     unavailable_capabilities,
@@ -72,6 +73,8 @@ from cobol_rag.retrieve import (
 )
 from cobol_rag.scope import (
     QueryScope,
+    source_address_entity,
+    source_address_in,
     SessionState,
     contextualize_question,
     resolve_query_scope,
@@ -492,6 +495,43 @@ def answer_query(
             initial_scope.reason, [], route="unclear", scope=initial_scope,
             execution_mode="clarification",
         )
+
+    # A physical source address is exact, so it is resolved before anything that
+    # ranks or generates. Embeddings find meaning, not addresses: asking a vector
+    # index for "line 227" can only return something that reads like line 227.
+    address = source_address_in(question)
+    if address and initial_scope.program:
+        located = answer_source_lines(
+            initial_scope.program,
+            address["line_start"],
+            address["line_end"],
+            source_file=address["source_file"],
+            context_before=address["context_before"],
+            context_after=address["context_after"],
+        )
+        if located:
+            address_entity = source_address_entity(initial_scope.program, address)
+            return finish(
+                located,
+                [],
+                route="technical",
+                scope=replace(
+                    initial_scope, intent="source_lines", entities=(address_entity,),
+                    entity_type=address_entity.entity_type,
+                    entity_value=address_entity.value,
+                    entity_key=address_entity.entity_key,
+                ),
+                plan=replace(
+                    initial_plan,
+                    route="technical",
+                    domain="program_structure",
+                    intent="source_lines",
+                    tasks=("source_lines",),
+                    entities=(address_entity,),
+                    planner_source="source_address",
+                ),
+                execution_mode="source_address_lookup",
+            )
 
     # Asked before a capability is chosen, because once the missing one has been
     # filtered out of the ranking the question has already been handed to its

@@ -511,6 +511,123 @@ _INTENT_SOLE_CAPABILITY = {
 }
 
 
+SOURCE_LINES_ARTIFACT = "program.source_lines.jsonl"
+
+
+def _read_source_lines(root: Path, program: str) -> list[dict[str, Any]]:
+    """Load the physical source-address map, or nothing if it was not built."""
+    path = _artifact_path(root, SOURCE_LINES_ARTIFACT)
+    if not path.is_file():
+        return []
+    records: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as handle:
+        for raw in handle:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                record = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict) and record.get("program") == program:
+                records.append(record)
+    return records
+
+
+def _resolve_source_file(
+    records: list[dict[str, Any]], requested: str | None,
+) -> tuple[str | None, list[str]]:
+    """Pick the member an address refers to, defaulting to the main program."""
+    files = list(dict.fromkeys(record["source_file"] for record in records))
+    if requested:
+        wanted = requested.upper()
+        for name in files:
+            if name.upper() == wanted or name.upper().split(".")[0] == wanted.split(".")[0]:
+                return name, files
+        return None, files
+    main = [r["source_file"] for r in records if r.get("source_file", "").upper().endswith(".CBL")]
+    return (main[0] if main else (files[0] if files else None)), files
+
+
+def answer_source_lines(
+    program: str | None,
+    line_start: int,
+    line_end: int | None = None,
+    *,
+    source_file: str | None = None,
+    context_before: int = 0,
+    context_after: int = 0,
+) -> str | None:
+    """Return the exact text at a source address, read rather than retrieved.
+
+    An address is not a meaning, so nothing here consults an embedding or a
+    model. The requested span is read from the published map and echoed with
+    the metadata the analysis recorded for it; asking for a line the file does
+    not have says so and reports the range that exists, because inventing a
+    plausible line would be the worst possible failure for this capability.
+    """
+    if not program or line_start < 1:
+        return None
+    root = find_final_scripts_root()
+    if root is None:
+        return None
+    program_root = find_program_artifact_root(root, program)
+    if program_root is None:
+        return None
+    records = _read_source_lines(program_root, program)
+    if not records:
+        return None
+
+    resolved_file, available = _resolve_source_file(records, source_file)
+    if resolved_file is None:
+        listed = ", ".join(f"`{name}`" for name in available) or "none"
+        return (
+            f"`{source_file}` is not a recorded source member of {program}. "
+            f"Members with a published source map: {listed}."
+        )
+
+    member = [record for record in records if record["source_file"] == resolved_file]
+    by_line = {record["line"]: record for record in member}
+    last = max(by_line) if by_line else 0
+    end = line_end if line_end is not None else line_start
+    if end < line_start:
+        line_start, end = end, line_start
+
+    if line_start > last:
+        return (
+            f"{resolved_file} has {last} physical line(s); line {line_start} does not exist. "
+            f"Source: `{SOURCE_LINES_ARTIFACT}`."
+        )
+
+    window_start = max(1, line_start - max(0, context_before))
+    window_end = min(last, end + max(0, context_after))
+    window = [by_line[n] for n in range(window_start, window_end + 1) if n in by_line]
+    if not window:
+        return None
+
+    requested = [record for record in window if line_start <= record["line"] <= end]
+    located = next((r for r in requested if not r["is_blank"]), requested[0] if requested else window[0])
+    where = " / ".join(
+        part for part in (located.get("division"), located.get("section"), located.get("paragraph")) if part
+    )
+
+    span = f"line {line_start}" if line_start == end else f"lines {line_start}-{end}"
+    header = f"{program} {resolved_file} {span}"
+    if where:
+        header += f" ({where})"
+    lines = [f"{header}:"]
+    for record in window:
+        marker = " " if line_start <= record["line"] <= end else "·"
+        lines.append(f"{marker} {record['line']:>5}  {record['text']}")
+
+    if end > last:
+        lines.append(f"Requested through line {end}, but {resolved_file} ends at line {last}.")
+    truncated = window_end - window_start + 1
+    lines.append(f"Returned {truncated} physical line(s) exactly as written; no line was inferred.")
+    lines.append(f"Source: `{SOURCE_LINES_ARTIFACT}`.")
+    return "\n".join(lines)
+
+
 def absent_capability_answer(program: str | None, capability: str) -> str | None:
     """State that a program has no evidence of a kind, and why the analysis says so.
 

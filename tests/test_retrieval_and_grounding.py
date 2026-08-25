@@ -70,12 +70,18 @@ from cobol_rag.query_plan import (
     validate_plan_answer,
     validate_evidence_answer,
 )
-from cobol_rag.final_scripts_answers import absent_capability_answer
+from cobol_rag.final_scripts_answers import absent_capability_answer, answer_source_lines
 from cobol_rag.retrieve import (
     EvidenceGuard, RetrievalOutcome, RetrievalResult, _deduplicate_results, _detect_intent,
     _expand_context, _lexical_from_collection, clear_retrieval_cache,
 )
-from cobol_rag.scope import EntityReference, QueryScope, SessionState
+from cobol_rag.scope import (
+    EntityReference,
+    QueryScope,
+    SessionState,
+    source_address_entity,
+    source_address_in,
+)
 
 
 class MetadataLoaderTest(unittest.TestCase):
@@ -2244,6 +2250,136 @@ class PerItemRequestsKeepTheirFormatterTest(unittest.TestCase):
         self.assertFalse(_direct_handler_supports(
             self._plan(("program_summary",), "program_summary"),
         ))
+
+
+class SourceAddressDetectionTest(unittest.TestCase):
+    """A number after "line" is an address; the word alone is not."""
+
+    def test_single_and_range_addresses_are_read(self) -> None:
+        self.assertEqual(source_address_in("What is on line 227 of PDCBVC?")["line_start"], 227)
+        span = source_address_in("Show me lines 395 to 401 of PDCBVC.")
+        self.assertEqual((span["line_start"], span["line_end"]), (395, 401))
+        for phrasing in ("lines 10-20", "lines 10 through 20", "lines 10 thru 20", "lines 10 until 20"):
+            with self.subTest(phrasing=phrasing):
+                got = source_address_in(phrasing)
+                self.assertEqual((got["line_start"], got["line_end"]), (10, 20))
+
+    def test_a_reversed_range_is_normalised(self) -> None:
+        got = source_address_in("show lines 401 to 395")
+        self.assertEqual((got["line_start"], got["line_end"]), (395, 401))
+
+    def test_the_source_line_field_is_not_an_address(self) -> None:
+        # These ask for line numbers to be *included*, not for a line to be read.
+        # Treating them as addresses would hijack ordinary evidence questions.
+        for question in (
+            "Where is NPAGT modified? Include every paragraph and source line.",
+            "List the COPY statements with the copybook name and source line.",
+            "Show the source lines for each call.",
+        ):
+            with self.subTest(question=question):
+                self.assertIsNone(source_address_in(question))
+
+    def test_a_named_member_and_a_context_window_are_carried(self) -> None:
+        got = source_address_in("Show line 9 of PDSAVTW2.CPY")
+        self.assertEqual(got["source_file"], "PDSAVTW2.CPY")
+        window = source_address_in("Show 3 lines around line 397")
+        self.assertEqual(window["context_before"], 3)
+        self.assertEqual(window["context_after"], 3)
+        self.assertEqual(window["line_start"], 397)
+
+    def test_an_address_becomes_a_typed_entity(self) -> None:
+        entity = source_address_entity("PDCBVC", source_address_in("lines 10-20"))
+        self.assertEqual(entity.entity_type, "source_address")
+        self.assertEqual(entity.value, "10-20")
+        self.assertEqual(entity.entity_key, "PDCBVC|SOURCE_ADDRESS|10-20")
+
+
+class SourceAddressLookupTest(unittest.TestCase):
+    """Reading an address must be a lookup, never a similarity match."""
+
+    @staticmethod
+    def _corpus(directory: Path, program: str = "PDCBVC") -> Path:
+        root = directory / program
+        root.mkdir(parents=True)
+        rows = [
+            {"program": program, "source_file": f"{program}.CBL", "line": n,
+             "text": f"      line {n} text", "normalized": f"line {n} text",
+             "indicator": " ", "is_comment": False, "is_continuation": False,
+             "is_blank": False, "division": "PROCEDURE DIVISION", "section": None,
+             "paragraph": "MAIN", "sha256": "0" * 16}
+            for n in range(1, 6)
+        ]
+        rows.append({"program": program, "source_file": "MEMBER.CPY", "line": 1,
+                     "text": "      copybook line", "normalized": "copybook line",
+                     "indicator": " ", "is_comment": False, "is_continuation": False,
+                     "is_blank": False, "division": None, "section": None,
+                     "paragraph": None, "sha256": "0" * 16})
+        (root / "program.source_lines.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8",
+        )
+        return root
+
+    def _answer(self, directory: str, *args, **kwargs) -> str | None:
+        root = Path(directory)
+        with (
+            patch("cobol_rag.final_scripts_answers.find_final_scripts_root", return_value=root),
+            patch("cobol_rag.final_scripts_answers.find_program_artifact_root",
+                  side_effect=lambda r, p: Path(r) / p),
+        ):
+            return answer_source_lines(*args, **kwargs)
+
+    def test_the_exact_line_is_returned_verbatim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._corpus(Path(directory))
+            answer = self._answer(directory, "PDCBVC", 3)
+            self.assertIn("      line 3 text", answer)
+            self.assertIn("PROCEDURE DIVISION", answer)
+            self.assertIn("no line was inferred", answer)
+
+    def test_a_range_returns_every_line_in_the_span(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._corpus(Path(directory))
+            answer = self._answer(directory, "PDCBVC", 2, 4)
+            for n in (2, 3, 4):
+                self.assertIn(f"line {n} text", answer)
+            self.assertNotIn("line 5 text", answer)
+
+    def test_a_line_beyond_the_file_is_refused_with_the_real_bound(self) -> None:
+        # Inventing a plausible line is the worst failure this capability could
+        # have, so an out-of-range address reports the range that exists.
+        with tempfile.TemporaryDirectory() as directory:
+            self._corpus(Path(directory))
+            answer = self._answer(directory, "PDCBVC", 900)
+            self.assertIn("5 physical line(s)", answer)
+            self.assertIn("does not exist", answer)
+
+    def test_context_is_marked_apart_from_the_requested_span(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._corpus(Path(directory))
+            answer = self._answer(directory, "PDCBVC", 3, context_before=1, context_after=1)
+            requested = [l for l in answer.splitlines() if l.startswith("  ") and "line 3 text" in l]
+            context = [l for l in answer.splitlines() if l.startswith("\u00b7")]
+            self.assertTrue(requested)
+            self.assertEqual(len(context), 2)
+
+    def test_a_named_member_selects_that_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._corpus(Path(directory))
+            answer = self._answer(directory, "PDCBVC", 1, source_file="MEMBER.CPY")
+            self.assertIn("copybook line", answer)
+            self.assertNotIn("line 1 text", answer)
+
+    def test_an_unknown_member_lists_what_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._corpus(Path(directory))
+            answer = self._answer(directory, "PDCBVC", 1, source_file="NOPE.CPY")
+            self.assertIn("not a recorded source member", answer)
+            self.assertIn("MEMBER.CPY", answer)
+
+    def test_a_program_with_no_source_map_declines(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "PDCBVC").mkdir()
+            self.assertIsNone(self._answer(directory, "PDCBVC", 1))
 
 
 class SectionContractAcceptsRendererVocabularyTest(unittest.TestCase):

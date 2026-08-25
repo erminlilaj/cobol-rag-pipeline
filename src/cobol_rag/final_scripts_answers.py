@@ -4,6 +4,7 @@ import json
 import os
 import re
 from pathlib import Path
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -487,9 +488,27 @@ def _answer_artifact_inventory(root: Path, program: str) -> str | None:
         if count:
             detail_groups.append((directory.name, count))
 
-    if not top_level and not detail_groups:
+    # "Which COBOL files do you have?" is a question about source members, not
+    # about the JSON the analysis produced from them. The published source map
+    # already records the member each physical line came from, so the members are
+    # reported alongside the evidence rather than left out of an inventory that
+    # claims to say what is available.
+    source_members: list[tuple[str, int]] = []
+    counts: dict[str, int] = {}
+    for record in _read_source_lines(root, program):
+        name = str(record.get("source_file") or "")
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    source_members = sorted(counts.items())
+
+    if not top_level and not detail_groups and not source_members:
         return None
     lines = [f"Analyzed evidence available for {program}:"]
+    if source_members:
+        lines.append("COBOL source members (physical source, line-addressable):")
+        lines.extend(
+            f"- `{name}` — {count} physical line(s)" for name, count in source_members
+        )
     if top_level:
         lines.append("Aggregate files:")
         lines.extend(f"- `{name}`" for name in top_level)
@@ -626,6 +645,66 @@ def answer_source_lines(
     lines.append(f"Returned {truncated} physical line(s) exactly as written; no line was inferred.")
     lines.append(f"Source: `{SOURCE_LINES_ARTIFACT}`.")
     return "\n".join(lines)
+
+
+_RETURNED_COUNT = re.compile(r"^Returned (\d+) physical line", re.MULTILINE)
+
+
+def answer_source_line_spans(
+    program: str | None,
+    addresses: Sequence[Mapping[str, Any]],
+) -> str | None:
+    """Answer every source address a question named, and account for each one.
+
+    A question that names two addresses has two answers. Returning only the
+    first looks indistinguishable from a complete answer, so each requested
+    address is rendered in the order asked and the footer states how many of
+    them were resolved -- an address the map cannot satisfy is reported, never
+    dropped.
+    """
+    if not program or not addresses:
+        return None
+    sections: list[str] = []
+    unresolved: list[str] = []
+    returned = 0
+    for address in addresses:
+        start = int(address["line_start"])
+        end = int(address.get("line_end") or start)
+        rendered = answer_source_lines(
+            program, start, end,
+            source_file=address.get("source_file"),
+            context_before=int(address.get("context_before") or 0),
+            context_after=int(address.get("context_after") or 0),
+        )
+        label = f"line {start}" if start == end else f"lines {start}-{end}"
+        if not rendered:
+            unresolved.append(label)
+            continue
+        count = _RETURNED_COUNT.search(rendered)
+        if count:
+            returned += int(count.group(1))
+        body = "\n".join(
+            line for line in rendered.splitlines()
+            if not line.startswith("Returned ") and not line.startswith("Source: `")
+        ).rstrip()
+        sections.append(body)
+    if not sections and not unresolved:
+        return None
+    if not sections:
+        return None
+    answer = "\n\n".join(sections)
+    footer = [
+        f"Returned {returned} physical line(s) exactly as written; no line was inferred.",
+    ]
+    if len(addresses) > 1 or unresolved:
+        resolved = len(addresses) - len(unresolved)
+        footer.append(
+            f"Address coverage: {resolved}/{len(addresses)} requested address(es) answered."
+        )
+    if unresolved:
+        footer.append("No published source map entry for: " + ", ".join(unresolved) + ".")
+    footer.append(f"Source: `{SOURCE_LINES_ARTIFACT}`.")
+    return answer + "\n" + "\n".join(footer)
 
 
 def absent_capability_answer(program: str | None, capability: str) -> str | None:

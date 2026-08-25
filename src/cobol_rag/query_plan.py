@@ -632,16 +632,23 @@ _INTENT_DOMAIN = {
 }
 
 
+# Below the 0.9 authority gate in merge_semantic_plan, so a topical intent
+# informs the plan without vetoing the planner's reading of the question.
+_TOPICAL_INTENT_CONFIDENCE = 0.7
+
+
 def build_query_plan(
     question: str,
     scope: QueryScope,
     *,
     intent: str | None = None,
+    intent_basis: str = "explicit",
     state: SessionState | None = None,
 ) -> QueryPlan:
     q = question.lower()
     upper = question.upper()
     resolved_intent = intent or scope.intent or "general"
+    detected_intent = resolved_intent
     explicit_followup = _is_explicit_followup(q)
     if explicit_followup and resolved_intent == "general" and state and state.current_intent:
         resolved_intent = state.current_intent
@@ -899,6 +906,13 @@ def build_query_plan(
         and not any(entity.entity_type == "variable" for entity in scope.entities)
     )
     confidence = 0.95 if resolved_intent != "general" else 0.45
+    if intent_basis == "topical" and resolved_intent == detected_intent:
+        # The intent rested on a common English noun rather than on anything this
+        # layer can verify, so it stays below the authority threshold and the
+        # semantic planner is free to overrule it. If one of the explicit rules
+        # above re-derived the intent, resolved_intent no longer matches what the
+        # keyword pass produced and full confidence is kept.
+        confidence = min(confidence, _TOPICAL_INTENT_CONFIDENCE)
     if not operations:
         confidence = min(confidence, 0.7)
     domain = _INTENT_DOMAIN.get(resolved_intent, "general")

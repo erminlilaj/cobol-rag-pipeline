@@ -71,18 +71,26 @@ from cobol_rag.query_plan import (
     validate_plan_answer,
     validate_evidence_answer,
 )
-from cobol_rag.final_scripts_answers import absent_capability_answer, answer_source_lines
+from cobol_rag.final_scripts_answers import (
+    _answer_artifact_inventory,
+    absent_capability_answer,
+    answer_source_line_spans,
+    answer_source_lines,
+)
 from cobol_rag.index import compose_prose
 from cobol_rag.retrieve import (
     EvidenceGuard, RetrievalOutcome, RetrievalResult, _deduplicate_results, _detect_intent,
     _expand_context, _lexical_from_collection, clear_retrieval_cache,
+    detect_intent_with_basis,
 )
 from cobol_rag.scope import (
     EntityReference,
     QueryScope,
     SessionState,
+    resolve_query_scope,
     source_address_entity,
     source_address_in,
+    source_addresses_in,
 )
 
 
@@ -2403,6 +2411,57 @@ class PerItemRequestsKeepTheirFormatterTest(unittest.TestCase):
         ))
 
 
+class IntentAuthorityTest(unittest.TestCase):
+    """A keyword match is a hint; only a specific one may overrule the planner."""
+
+    def test_an_intent_resting_on_a_common_noun_is_reported_as_topical(self) -> None:
+        # Observed production failures. "name me cobol files that you have access
+        # to" and "PDCBVC doesn't write to any queue, does it?" were answered from
+        # JCL dataset evidence because the words "files" and "queue" produced a
+        # datasets_tables intent at authority confidence, which vetoed a planner
+        # that had correctly asked for an artifact inventory and CICS operations.
+        for question in (
+            "name me cobol files that you have access to",
+            "i didnt say JCL i meant .cbl files",
+            "PDCBVC doesn't write to any queue, does it?",
+        ):
+            with self.subTest(question=question):
+                _, basis = detect_intent_with_basis(question)
+                self.assertEqual(basis, "topical")
+
+    def test_an_intent_resting_on_domain_vocabulary_keeps_its_authority(self) -> None:
+        for question in (
+            "Find all CICS SEND and RECEIVE commands in PDCBVC.",
+            "What datasets does PDCBVC produce?",
+            "Which DB2 tables does PDCBVC access?",
+            "Show me the mapsets used by PDCBVC",
+            "What business rules are implemented in PDCBVC?",
+            "Which copybooks are unused in PDCBVC?",
+            "What hardcoded literals are in PDCBVC?",
+            "Which external programs does PDCBVC call with parameters?",
+            "Walk me through the control flow from start to termination",
+        ):
+            with self.subTest(question=question):
+                _, basis = detect_intent_with_basis(question)
+                self.assertEqual(basis, "explicit")
+
+    def test_a_topical_intent_stays_below_the_planner_veto_threshold(self) -> None:
+        # merge_semantic_plan only overrules the planner at confidence >= 0.9.
+        question = "PDCBVC doesn't write to any queue, does it?"
+        intent, basis = detect_intent_with_basis(question)
+        scope = resolve_query_scope(question, intent=intent, target_program="PDCBVC")
+        plan = build_query_plan(question, scope, intent=scope.intent, intent_basis=basis)
+        self.assertLess(plan.confidence, 0.9)
+        self.assertLess(plan.authority_confidence, 0.9)
+
+    def test_an_explicit_intent_keeps_full_confidence(self) -> None:
+        question = "Find all CICS SEND and RECEIVE commands in PDCBVC."
+        intent, basis = detect_intent_with_basis(question)
+        scope = resolve_query_scope(question, intent=intent, target_program="PDCBVC")
+        plan = build_query_plan(question, scope, intent=scope.intent, intent_basis=basis)
+        self.assertGreaterEqual(plan.confidence, 0.9)
+
+
 class SourceAddressDetectionTest(unittest.TestCase):
     """A number after "line" is an address; the word alone is not."""
 
@@ -2437,6 +2496,38 @@ class SourceAddressDetectionTest(unittest.TestCase):
         self.assertEqual(window["context_before"], 3)
         self.assertEqual(window["context_after"], 3)
         self.assertEqual(window["line_start"], 397)
+
+    def test_every_address_in_the_question_is_read(self) -> None:
+        # Observed production failure: "What is on line 227 and 229 of PDCBVC?"
+        # answered line 227 only. The reader stopped at the first match, so a
+        # truncated answer was indistinguishable from a complete one.
+        for question, expected in (
+            ("What is on line 227 and 229 of PDCBVC?", [(227, 227), (229, 229)]),
+            ("what is on lines 10-20 and 30 of PDCBVC?", [(10, 20), (30, 30)]),
+            ("show lines 5, 7 and 9", [(5, 5), (7, 7), (9, 9)]),
+            ("Show me lines 1-12 of PDCBVC", [(1, 12)]),
+            ("lines 100 to 110", [(100, 110)]),
+        ):
+            with self.subTest(question=question):
+                got = [
+                    (a["line_start"], a["line_end"])
+                    for a in source_addresses_in(question)
+                ]
+                self.assertEqual(got, expected)
+
+    def test_a_second_address_does_not_appear_out_of_ordinary_wording(self) -> None:
+        # The list reader must not turn evidence questions into address lookups,
+        # and a context window states a window rather than a second address.
+        for question in (
+            "Where is NPAGT modified? Include every paragraph and source line.",
+            "How many lines does PDCBVC have?",
+            "Which copybooks are unused?",
+        ):
+            with self.subTest(question=question):
+                self.assertEqual(source_addresses_in(question), ())
+        window = source_addresses_in("show me line 300 with 3 lines of context")
+        self.assertEqual([(a["line_start"], a["line_end"]) for a in window], [(300, 300)])
+        self.assertEqual(window[0]["context_before"], 3)
 
     def test_an_address_becomes_a_typed_entity(self) -> None:
         entity = source_address_entity("PDCBVC", source_address_in("lines 10-20"))
@@ -2478,6 +2569,53 @@ class SourceAddressLookupTest(unittest.TestCase):
                   side_effect=lambda r, p: Path(r) / p),
         ):
             return answer_source_lines(*args, **kwargs)
+
+    def _spans(self, directory: str, program: str, addresses) -> str | None:
+        root = Path(directory)
+        with (
+            patch("cobol_rag.final_scripts_answers.find_final_scripts_root", return_value=root),
+            patch("cobol_rag.final_scripts_answers.find_program_artifact_root",
+                  side_effect=lambda r, p: Path(r) / p),
+        ):
+            return answer_source_line_spans(program, addresses)
+
+    def test_two_addresses_are_both_answered_and_accounted_for(self) -> None:
+        # Observed production failure: "line 227 and 229" answered 227 only, with
+        # nothing in the reply to show a second address had been asked for.
+        with tempfile.TemporaryDirectory() as directory:
+            self._corpus(Path(directory))
+            answer = self._spans(directory, "PDCBVC", [
+                {"line_start": 2, "line_end": 2},
+                {"line_start": 4, "line_end": 4},
+            ])
+            self.assertIn("line 2 text", answer)
+            self.assertIn("line 4 text", answer)
+            self.assertNotIn("line 3 text", answer)
+            self.assertIn("2/2 requested address(es)", answer)
+            self.assertIn("Returned 2 physical line(s)", answer)
+
+    def test_an_unreachable_address_is_reported_rather_than_dropped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._corpus(Path(directory))
+            answer = self._spans(directory, "PDCBVC", [
+                {"line_start": 2, "line_end": 2},
+                {"line_start": 900, "line_end": 900},
+            ])
+            self.assertIn("line 2 text", answer)
+            # The out-of-range address still reports the real bound rather than
+            # disappearing from the answer.
+            self.assertIn("does not exist", answer)
+
+    def test_the_inventory_names_the_cobol_source_members(self) -> None:
+        # "name me cobol files that you have access to" was answered with a list
+        # of analysis JSON only, which never mentions a .CBL or .CPY member.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._corpus(root)
+            answer = _answer_artifact_inventory(root / "PDCBVC", "PDCBVC")
+            self.assertIn("PDCBVC.CBL", answer)
+            self.assertIn("MEMBER.CPY", answer)
+            self.assertIn("physical line(s)", answer)
 
     def test_the_exact_line_is_returned_verbatim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

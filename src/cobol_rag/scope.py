@@ -452,36 +452,78 @@ _CONTEXT_WINDOW = re.compile(
 )
 
 
-def source_address_in(question: str) -> dict[str, Any] | None:
-    """Read an explicit physical source address out of a question.
+# One address expression: "227", "10-20", "100 to 110".
+_ADDRESS_SPAN = re.compile(
+    r"(\d{1,6})\s*(?:(?:-|–|—|to|through|thru|until)\s*(\d{1,6}))?", re.IGNORECASE,
+)
+# The separators that continue a list of addresses after the "line(s)" anchor.
+# No leading "^": .match(text, pos) already anchors at pos, while "^" would only
+# ever match at the start of the whole question.
+_ADDRESS_SEPARATOR = re.compile(r"\s*(?:,|;|&|\+|and\b|ed?\b)\s*", re.IGNORECASE)
+_LINE_ANCHOR = re.compile(
+    r"\b(?:lines?|line[ae])\b\s*(?:number|no\.?|#)?\s*", re.IGNORECASE,
+)
 
-    Returns the span and any named member, or None when the question does not
-    name a numeric address. This is deliberately literal: an address is exact,
-    so guessing one from wording would defeat the point of the capability.
+
+def source_addresses_in(question: str) -> tuple[dict[str, Any], ...]:
+    """Read every physical source address a question names, in the order asked.
+
+    The single-address reader this replaces stopped at the first match, so
+    "line 227 and 229" quietly became line 227 alone -- the caller had no way to
+    tell a one-address question from a two-address question it had truncated.
+    Every address the question names is returned, and a caller that cannot
+    resolve one is expected to say so rather than drop it.
     """
     text = question or ""
-    range_match = _LINE_RANGE.search(text)
-    if range_match:
-        start, end = int(range_match.group(1)), int(range_match.group(2))
-    else:
-        single = _LINE_SINGLE.search(text)
-        if not single:
-            return None
-        start = end = int(single.group(1))
-    if start < 1 or end < 1:
-        return None
-    if end < start:
-        start, end = end, start
     member = _SOURCE_MEMBER.search(text)
     window = _CONTEXT_WINDOW.search(text)
     context = int(window.group(1)) if window else 0
-    return {
-        "line_start": start,
-        "line_end": end,
-        "source_file": member.group(1).upper() if member else None,
-        "context_before": context,
-        "context_after": context,
-    }
+    consumed_by_window = set()
+    if window:
+        consumed_by_window = set(range(window.start(), window.end()))
+
+    addresses: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    for anchor in _LINE_ANCHOR.finditer(text):
+        if anchor.start() in consumed_by_window:
+            # "3 lines of context" states a window, not an address to fetch.
+            continue
+        cursor = anchor.end()
+        while True:
+            span = _ADDRESS_SPAN.match(text, cursor)
+            if not span:
+                break
+            start = int(span.group(1))
+            end = int(span.group(2)) if span.group(2) else start
+            cursor = span.end()
+            if start >= 1 and end >= 1:
+                if end < start:
+                    start, end = end, start
+                if (start, end) not in seen:
+                    seen.add((start, end))
+                    addresses.append({
+                        "line_start": start,
+                        "line_end": end,
+                        "source_file": member.group(1).upper() if member else None,
+                        "context_before": context,
+                        "context_after": context,
+                    })
+            separator = _ADDRESS_SEPARATOR.match(text, cursor)
+            if not separator:
+                break
+            cursor = separator.end()
+    return tuple(addresses)
+
+
+def source_address_in(question: str) -> dict[str, Any] | None:
+    """Read the first physical source address in a question, or None.
+
+    Kept for callers that genuinely want a single address; anything answering a
+    user's question should use source_addresses_in so a second address is not
+    silently discarded.
+    """
+    addresses = source_addresses_in(question)
+    return addresses[0] if addresses else None
 
 
 def source_address_entity(program: str | None, address: dict[str, Any]) -> EntityReference:

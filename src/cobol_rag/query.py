@@ -26,6 +26,7 @@ from cobol_rag.evidence import (
 )
 from cobol_rag.final_scripts_answers import (
     absent_capability_answer,
+    answer_source_line_spans,
     answer_source_lines,
     answer_from_final_scripts,
     capability_manifest,
@@ -68,10 +69,12 @@ from cobol_rag.retrieve import (
     RetrievalOutcome,
     RetrievalResult,
     _detect_intent,
+    detect_intent_with_basis,
     retrieve,
     retrieve_with_trace,
 )
 from cobol_rag.scope import (
+    source_addresses_in,
     QueryScope,
     source_address_entity,
     source_address_in,
@@ -411,9 +414,10 @@ def answer_query(
     target_program: str | None = None,
 ) -> QueryAnswer:
     started = time.perf_counter()
+    detected_intent, detected_intent_basis = detect_intent_with_basis(question)
     initial_scope = resolve_query_scope(
         question,
-        intent=_detect_intent(question),
+        intent=detected_intent,
         state=session_state,
         target_program=target_program,
     )
@@ -421,6 +425,7 @@ def answer_query(
         question,
         initial_scope,
         intent=initial_scope.intent,
+        intent_basis=detected_intent_basis,
         state=session_state,
     )
     initial_scope = replace(initial_scope, intent=initial_plan.intent)
@@ -499,24 +504,21 @@ def answer_query(
     # A physical source address is exact, so it is resolved before anything that
     # ranks or generates. Embeddings find meaning, not addresses: asking a vector
     # index for "line 227" can only return something that reads like line 227.
-    address = source_address_in(question)
-    if address and initial_scope.program:
-        located = answer_source_lines(
-            initial_scope.program,
-            address["line_start"],
-            address["line_end"],
-            source_file=address["source_file"],
-            context_before=address["context_before"],
-            context_after=address["context_after"],
-        )
+    addresses = source_addresses_in(question)
+    if addresses and initial_scope.program:
+        located = answer_source_line_spans(initial_scope.program, addresses)
         if located:
-            address_entity = source_address_entity(initial_scope.program, address)
+            address_entities = tuple(
+                source_address_entity(initial_scope.program, address)
+                for address in addresses
+            )
+            address_entity = address_entities[0]
             return finish(
                 located,
                 [],
                 route="technical",
                 scope=replace(
-                    initial_scope, intent="source_lines", entities=(address_entity,),
+                    initial_scope, intent="source_lines", entities=address_entities,
                     entity_type=address_entity.entity_type,
                     entity_value=address_entity.value,
                     entity_key=address_entity.entity_key,

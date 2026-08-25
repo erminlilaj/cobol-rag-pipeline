@@ -650,6 +650,48 @@ def _intent_rerank(
     return ranked[:top_k]
 
 
+# Ordinary English words that also name a COBOL concept in passing. They are a
+# topic hint, never a reading of the question: "name me cobol files", "does it
+# write to any queue" and "summary of the results" all land on an intent chosen
+# by one common noun. This is a property of English, not of any one question, so
+# the list does not grow per bug.
+_TOPICAL_INTENT_TERMS: tuple[str, ...] = (
+    "tables", "table", "files", "file", "queues", "queue",
+    "resources", "resource", "dependencies", "dependency",
+    "comments", "comment", "what does", "purpose", "overview", "summary",
+)
+
+INTENT_BASIS_EXPLICIT = "explicit"
+INTENT_BASIS_TOPICAL = "topical"
+
+
+def detect_intent_with_basis(query: str) -> tuple[str, str]:
+    """Classify the question, and report whether the classification is load-bearing.
+
+    Detection is keyword-driven, and a keyword match cannot tell "I recognised
+    EXEC CICS" from "the question contained the word file". Both used to arrive
+    as certainty, and certainty outranks the semantic planner -- so "name me
+    cobol files" and "does PDCBVC write to any queue" were answered from JCL
+    dataset evidence, over a planner that had correctly asked for an artifact
+    inventory and for CICS operations.
+
+    The basis is decided by counterfactual: strip the generic vocabulary and
+    classify again. An intent that survives rested on something specific and
+    keeps its authority. An intent that disappears rested on a common noun, and
+    is reported as topical so the planner can overrule it.
+    """
+    intent = _detect_intent(query)
+    if intent == "general":
+        return intent, INTENT_BASIS_EXPLICIT
+    stripped = query
+    for term in _TOPICAL_INTENT_TERMS:
+        stripped = re.sub(rf"(?<![A-Za-z0-9_-]){re.escape(term)}(?![A-Za-z0-9_-])",
+                          " ", stripped, flags=re.IGNORECASE)
+    if _detect_intent(stripped) != intent:
+        return intent, INTENT_BASIS_TOPICAL
+    return intent, INTENT_BASIS_EXPLICIT
+
+
 def _detect_intent(query: str) -> str:
     q = query.lower()
     # "Do you have a file called X?" asks whether an analyzed program exists;

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Sequence
 import threading
 import time
 from collections import Counter, OrderedDict
@@ -665,7 +666,9 @@ INTENT_BASIS_EXPLICIT = "explicit"
 INTENT_BASIS_TOPICAL = "topical"
 
 
-def detect_intent_with_basis(query: str) -> tuple[str, str]:
+def detect_intent_with_basis(
+    query: str, ignore_identifiers: Sequence[str] = (),
+) -> tuple[str, str]:
     """Classify the question, and report whether the classification is load-bearing.
 
     Detection is keyword-driven, and a keyword match cannot tell "I recognised
@@ -680,6 +683,13 @@ def detect_intent_with_basis(query: str) -> tuple[str, str]:
     keeps its authority. An intent that disappears rested on a common noun, and
     is reported as topical so the planner can overrule it.
     """
+    # A keyword that occurs only inside an identifier the user named says
+    # nothing about the question. "What triggers XCTL-LIV4?" is a question about
+    # a paragraph, but the letters "xctl" inside its name routed it to outgoing
+    # calls and answered with the program's five call sites.
+    for identifier in ignore_identifiers:
+        if identifier:
+            query = re.sub(re.escape(identifier), " ", query, flags=re.IGNORECASE)
     intent = _detect_intent(query)
     if intent == "general":
         return intent, INTENT_BASIS_EXPLICIT

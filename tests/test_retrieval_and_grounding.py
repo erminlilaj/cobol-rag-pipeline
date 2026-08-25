@@ -19,6 +19,7 @@ from cobol_rag.capability_router import (
     rank_capabilities,
 )
 from cobol_rag.query import (
+    REJECTED_EXECUTION_MODES,
     _build_prompt,
     _build_constrained_routing_prompt,
     _build_routing_prompt,
@@ -2417,6 +2418,86 @@ class PerItemRequestsKeepTheirFormatterTest(unittest.TestCase):
         self.assertFalse(_direct_handler_supports(
             self._plan(("program_summary",), "program_summary"),
         ))
+
+
+class RejectedTurnIsNotAnAntecedentTest(unittest.TestCase):
+    """A turn that refused to answer leaves nothing for a follow-up to continue."""
+
+    def _answer(self, mode: str) -> QueryAnswer:
+        return QueryAnswer(
+            question="how many paragraphs does PDCBVC have?",
+            answer="Relevant evidence was retrieved, but no generated claim could be verified.",
+            sources=[], route="technical", execution_mode=mode,
+            scope=QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="source_metrics"),
+        )
+
+    def test_a_rejected_turn_does_not_become_the_session_topic(self) -> None:
+        # Observed production failure: "how many paragraphs does PDCBVC have?"
+        # failed on the analyzers' paragraph-count disagreement, and "list them"
+        # inherited the failed intent and enumerated comment fragments. Session
+        # memory should record what was established, and nothing was.
+        for mode in sorted(REJECTED_EXECUTION_MODES):
+            with self.subTest(mode=mode):
+                session = ChatSession(config=AppConfig())
+                with patch("cobol_rag.chat.answer_query", return_value=self._answer(mode)):
+                    session.ask("how many paragraphs does PDCBVC have?")
+                self.assertIsNone(session.state.current_intent)
+                self.assertEqual(session.state.current_plan, {})
+
+    def test_an_answered_turn_still_becomes_the_session_topic(self) -> None:
+        session = ChatSession(config=AppConfig())
+        with patch("cobol_rag.chat.answer_query", return_value=self._answer("direct_artifact")):
+            session.ask("how many paragraphs does PDCBVC have?")
+        self.assertEqual(session.state.current_intent, "source_metrics")
+
+
+class KeywordInsideAnIdentifierTest(unittest.TestCase):
+    """A term that survives only inside a name is not evidence about the question."""
+
+    def test_a_keyword_spelled_into_an_identifier_does_not_route_the_question(self) -> None:
+        # Observed production failure: "What triggers XCTL-LIV4?" was answered
+        # with the program's five outgoing calls, because the letters "xctl"
+        # inside the paragraph's name matched the external-programs vocabulary.
+        for question, identifier in (
+            ("What triggers XCTL-LIV4?", "XCTL-LIV4"),
+            ("What reaches XCTL-LIV1?", "XCTL-LIV1"),
+            ("Which paragraph is LINK-PD1FS00?", "LINK-PD1FS00"),
+        ):
+            with self.subTest(question=question):
+                bare, _ = detect_intent_with_basis(question)
+                masked, _ = detect_intent_with_basis(question, ignore_identifiers=(identifier,))
+                self.assertEqual(bare, "external_programs")
+                self.assertNotEqual(masked, "external_programs")
+
+    def test_a_keyword_used_as_a_real_term_still_routes(self) -> None:
+        # The decoys: masking must only remove letters that belong to a name.
+        for question, identifier, expected in (
+            ("Which programs does PDCBVC XCTL to?", "PDCBVC", "external_programs"),
+            ("What external programs does PDCBVC link to?", "PDCBVC", "external_programs"),
+            ("What business rules involve TWCOB-FASE?", "TWCOB-FASE", "business_rules"),
+            ("Show all CICS operations issued by PDCBVC.", "PDCBVC", "cics_operations"),
+        ):
+            with self.subTest(question=question):
+                masked, _ = detect_intent_with_basis(question, ignore_identifiers=(identifier,))
+                self.assertEqual(masked, expected)
+
+    def test_a_named_paragraph_leaves_the_capability_to_the_planner(self) -> None:
+        # Deliberately NOT mapped to control_flow. Measured: forcing that intent
+        # gave it authority confidence, which vetoed the planner and broke
+        # "Which conditions lead to ABEND00?" -- a business-rules question that
+        # also names a paragraph. Removing the false keyword signal is enough;
+        # what the question is *about* stays the planner's decision.
+        plan = build_query_plan(
+            "What triggers XCTL-LIV4?",
+            QueryScope(
+                program="PDCBVC", programs=("PDCBVC",), intent="general",
+                entities=(EntityReference(
+                    "PDCBVC", "paragraph", "XCTL-LIV4", "PDCBVC|PARAGRAPH|XCTL-LIV4"),),
+            ),
+            intent="general",
+        )
+        self.assertEqual(plan.intent, "general")
+        self.assertLess(plan.confidence, 0.9)
 
 
 class CollectionFollowupTest(unittest.TestCase):

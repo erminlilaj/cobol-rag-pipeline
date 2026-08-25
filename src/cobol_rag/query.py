@@ -98,6 +98,17 @@ class QueryAnswer:
     debug: dict[str, Any] = field(default_factory=dict)
 
 
+# Execution modes in which the turn retrieved or selected evidence and then
+# refused to stand behind an answer. Nothing was established, so there is
+# nothing for a follow-up to continue -- see ChatSession.ask.
+REJECTED_EXECUTION_MODES = frozenset({
+    "evidence_rejected",
+    "direct_artifact_rejected",
+    "llm_contract_rejected",
+    "retrieved_renderer_rejected",
+})
+
+
 @dataclass(frozen=True)
 class QueryRoutingDecision:
     route: str
@@ -421,6 +432,19 @@ def answer_query(
         state=session_state,
         target_program=target_program,
     )
+    # Scope resolution is what turns a token into a known identifier, so the
+    # keyword pass is repeated once its names are known: a term that survives
+    # only inside an identifier was never evidence about the question.
+    resolved_identifiers = tuple(
+        entity.value for entity in initial_scope.entities if entity.value
+    )
+    if resolved_identifiers:
+        masked_intent, masked_basis = detect_intent_with_basis(
+            question, ignore_identifiers=resolved_identifiers,
+        )
+        if masked_intent != detected_intent:
+            detected_intent, detected_intent_basis = masked_intent, masked_basis
+            initial_scope = replace(initial_scope, intent=masked_intent)
     initial_plan = build_query_plan(
         question,
         initial_scope,

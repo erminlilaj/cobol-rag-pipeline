@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from cobol_rag.config import AppConfig
-from cobol_rag.query import QueryAnswer, answer_query
+from cobol_rag.query import REJECTED_EXECUTION_MODES, QueryAnswer, answer_query
 from cobol_rag.retrieve import RetrievalResult
 from cobol_rag.scope import QueryScope, SessionState
 
@@ -80,7 +80,12 @@ class ChatSession:
         self.turns = self.turns[-self.max_history :]
         if answer.plan and answer.plan.response_language:
             self.state.response_language = answer.plan.response_language
-        if answer.route == "technical":
+        # A turn that refused to stand behind an answer must not become the
+        # antecedent for the next one. "How many paragraphs does PDCBVC have?"
+        # fails on the analyzers' paragraph-count disagreement, and "list them"
+        # then inherited the failed intent and enumerated comment fragments.
+        # If nothing was established, there is nothing to continue.
+        if answer.route == "technical" and answer.execution_mode not in REJECTED_EXECUTION_MODES:
             self.state.update(
                 answer.scope,
                 [str(source.metadata.get("source_id", "")) for source in answer.sources],

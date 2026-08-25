@@ -1828,6 +1828,10 @@ class PromptGroundingTest(unittest.TestCase):
         switched = compose.call_args.kwargs["system"]
         self.assertIn("English", switched)
         self.assertIn("asked for replies in English", switched)
+        # Regression: composing from a bare "helpful assistant" prompt answered
+        # "What is the weather in Rome today?" with a temperature, where the
+        # planner's own reply had declined for want of live data.
+        self.assertIn("no internet access", switched)
 
         with patch("cobol_rag.query.compose_prose") as compose:
             compose.return_value = "Hello!"

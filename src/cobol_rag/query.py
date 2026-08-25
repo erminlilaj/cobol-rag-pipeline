@@ -3172,7 +3172,16 @@ def _repair_conversational_reply(
     # it recite the preamble at "hi". Clauses below are therefore appended only
     # in the situation that needs them, and phrased as statements rather than
     # orders, because an imperative gets echoed into the reply verbatim.
-    system = f"You are a helpful assistant for COBOL analysis. Reply only in {language_name}."
+    # The routing prompt carried enough context that the planner's own reply
+    # declined to invent live data. Composing from a bare "helpful assistant"
+    # prompt threw that away and answered "What is the weather in Rome today?"
+    # with a temperature, so the self-knowledge is restored here -- in one
+    # sentence, because a longer version measurably costs answer quality
+    # elsewhere.
+    system = (
+        f"You are a helpful assistant for COBOL analysis. Reply only in {language_name}."
+        " You have no internet access and no live data."
+    )
     if previous_language and previous_language != required_language:
         system += f" The user has just asked for replies in {language_name}."
     if route == "unclear":

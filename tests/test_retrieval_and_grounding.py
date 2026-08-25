@@ -44,6 +44,7 @@ from cobol_rag.query import (
     _parse_routing_decision,
     _retrieve_for_plan,
     _render_verified_candidate_to_contract,
+    _repair_conversational_reply,
     _route_query,
     _resolve_weak_technical_route,
     _routing_conflicts_with_verified_scope,
@@ -71,6 +72,7 @@ from cobol_rag.query_plan import (
     validate_evidence_answer,
 )
 from cobol_rag.final_scripts_answers import absent_capability_answer, answer_source_lines
+from cobol_rag.index import compose_prose
 from cobol_rag.retrieve import (
     EvidenceGuard, RetrievalOutcome, RetrievalResult, _deduplicate_results, _detect_intent,
     _expand_context, _lexical_from_collection, clear_retrieval_cache,
@@ -537,6 +539,46 @@ class PromptGroundingTest(unittest.TestCase):
         )
         self.assertEqual(detect_message_language("Why are you replying in Italian?"), "en")
 
+    def test_a_language_switch_is_recognised_without_enumerating_verbs(self) -> None:
+        # Observed production failure: "no facciamo in englese" left the session
+        # locked in Italian because the request patterns enumerated verbs
+        # (rispondi/scrivi/parla/continua) and knew neither "facciamo" nor
+        # "parliamo". Naming a language is the request, whatever verb carries it,
+        # and a near match survives the misspelling people actually type.
+        italian = SessionState(response_language="it")
+        for message in (
+            "no facciamo in englese",
+            "no facciamo in inglese",
+            "parliamo in inglese",
+            "switch to english",
+            "meglio in inglese",
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(
+                    resolve_response_language(message, italian), ("en", "explicit_request"),
+                )
+        self.assertEqual(
+            resolve_response_language("torniamo all'italiano", SessionState(response_language="en")),
+            ("it", "explicit_request"),
+        )
+
+    def test_a_language_name_inside_an_identifier_is_not_a_language_request(self) -> None:
+        # The decoys that keep the rule above from swallowing COBOL questions:
+        # a language name welded into an identifier is evidence, not a preference.
+        italian = SessionState(response_language="it")
+        for message in (
+            "What does ENGLISH-FLAG do?",
+            "Where is WS-ITALIAN-NAME written?",
+            "Show me lines 10-20 of PDCBVC.",
+        ):
+            with self.subTest(message=message):
+                language, source = resolve_response_language(message, italian)
+                # These resolve by the language the question is written in. What
+                # must never happen is the identifier being read as a preference:
+                # WS-ITALIAN-NAME does not order Italian replies.
+                self.assertNotEqual(source, "explicit_request")
+                self.assertEqual(language, "en")
+
     def test_identifier_only_message_preserves_the_session_language(self) -> None:
         language, source = resolve_response_language(
             "PD1VOCI-RETURN?", SessionState(response_language="it"),
@@ -564,15 +606,16 @@ class PromptGroundingTest(unittest.TestCase):
             "relations": [], "response_language": "en",
             "reply": "Certo, tu? In che cosa posso aiutare? (English: Hello, how can I help you?)",
         })})()
-        recovered = type("Response", (), {"text": "<reply>Hello! How are you?</reply>"})()
         plan = build_query_plan("hi", QueryScope(), state=SessionState(response_language="it"))
-        with patch("cobol_rag.query.build_llm") as build:
-            build.return_value.complete.side_effect = [wrong, recovered]
+        with patch("cobol_rag.query.build_llm") as build, \
+                patch("cobol_rag.query.compose_prose") as compose:
+            build.return_value.complete.return_value = wrong
+            compose.return_value = "<reply>Hello! How are you?</reply>"
             decision = _route_query(
                 "hi", AppConfig(), session_state=SessionState(response_language="it"),
                 preliminary_plan=plan, preliminary_scope=QueryScope(),
             )
-        self.assertEqual(build.call_count, 2)
+        self.assertEqual(compose.call_count, 1)
         self.assertEqual(decision.route, "conversational")
         self.assertEqual(decision.response_language, "en")
         self.assertEqual(decision.reply, "Hello! How are you?")
@@ -1700,6 +1743,114 @@ class PromptGroundingTest(unittest.TestCase):
             )
         self.assertEqual(decision.route, "conversational")
         self.assertEqual(decision.reply, "Hello! How can I help?")
+
+    def test_conversational_prose_is_composed_apart_from_the_classification(self) -> None:
+        # Observed production failure: asked in Italian whether it speaks Italian,
+        # the assistant replied "Bene, tu?". The same model answers the question
+        # correctly on its own — the prose was degraded by being the last field of
+        # a routing object while the model chose a COBOL capability. Composition
+        # therefore runs as its own call, and its result is what the user sees.
+        routing = type("Response", (), {"text": json.dumps({
+            "route": "conversational", "category": "conversational",
+            "domain": "conversation", "intent": "general", "tasks": [], "relations": [],
+            "response_language": "it", "confidence": 0.9, "reply": "Bene, tu?",
+        })})()
+        with patch("cobol_rag.query.build_llm") as build, \
+                patch("cobol_rag.query.compose_prose") as compose:
+            build.return_value.complete.return_value = routing
+            compose.return_value = "Si, parlo italiano. Chiedimi pure quello che vuoi."
+            decision = _route_query(
+                "tu parli bene l'Italiano??", AppConfig(),
+                preliminary_plan=QueryPlan(intent="general", response_language="it"),
+                preliminary_scope=QueryScope(intent="general"),
+            )
+        self.assertEqual(decision.route, "conversational")
+        self.assertEqual(decision.reply, "Si, parlo italiano. Chiedimi pure quello che vuoi.")
+
+    def test_prose_is_generated_through_the_chat_template_not_completion(self) -> None:
+        # The root cause of "Bene, tu?": Ollama's completion endpoint sends the
+        # prompt with no instruct template, so an instruct model continues the
+        # text instead of answering it. Measured on granite, the same Italian
+        # question returns "Bene, tu?" through completion at every temperature
+        # and every prompt shape, and answers correctly through chat. Structured
+        # extraction survives completion because a JSON schema re-anchors the
+        # model; prose does not, so prose must use chat.
+        with patch("cobol_rag.index.build_llm") as build:
+            build.return_value.chat.return_value = Mock(
+                message=Mock(content="  Certo.  "),
+            )
+            out = compose_prose(AppConfig(), system="be brief", user="ciao")
+        self.assertEqual(out, "Certo.")
+        build.return_value.complete.assert_not_called()
+        messages = build.return_value.chat.call_args.args[0]
+        self.assertEqual([m.role.value for m in messages], ["system", "user"])
+        self.assertEqual([m.content for m in messages], ["be brief", "ciao"])
+
+    def test_an_unclassifiable_message_is_not_composed_into_free_prose(self) -> None:
+        # Composing an "unclear" message breaks the scope boundary: asked for the
+        # capital of France the model answers it, under every boundary
+        # instruction measured. Only small talk is composed ahead of time.
+        unclear = type("Response", (), {"text": json.dumps({
+            "route": "unclear", "category": "unclear", "domain": "conversation",
+            "intent": "general", "tasks": [], "relations": [],
+            "response_language": "en", "confidence": 0.2,
+            "reply": "I can only help with COBOL analysis.",
+        })})()
+        with patch("cobol_rag.query.build_llm") as build, \
+                patch("cobol_rag.query.compose_prose") as compose:
+            build.return_value.complete.return_value = unclear
+            _route_query(
+                "what's the capital of France?", AppConfig(),
+                preliminary_plan=QueryPlan(intent="general"),
+                preliminary_scope=QueryScope(intent="general"),
+            )
+        compose.assert_not_called()
+
+    def test_the_composer_prompt_only_carries_the_clause_it_needs(self) -> None:
+        # Every extra sentence measurably cost answer quality on this model, and
+        # an imperative clause came back echoed inside the reply. The switch
+        # clause therefore appears only when the session language actually
+        # changes.
+        with patch("cobol_rag.query.compose_prose") as compose:
+            compose.return_value = "Understood."
+            _repair_conversational_reply(
+                "no facciamo in englese", route="conversational",
+                required_language="en", previous_language="it", config=AppConfig(),
+            )
+        switched = compose.call_args.kwargs["system"]
+        self.assertIn("English", switched)
+        self.assertIn("asked for replies in English", switched)
+
+        with patch("cobol_rag.query.compose_prose") as compose:
+            compose.return_value = "Hello!"
+            _repair_conversational_reply(
+                "hi", route="conversational",
+                required_language="en", previous_language="en", config=AppConfig(),
+            )
+        steady = compose.call_args.kwargs["system"]
+        self.assertNotIn("asked for replies", steady)
+
+    def test_a_composer_that_answers_with_json_cannot_reach_the_user(self) -> None:
+        # A model primed by the routing schema can answer the composer with a
+        # routing object. Prose is never a bare JSON blob, so the classifier's own
+        # reply is kept rather than showing the user a raw object.
+        blob = json.dumps({
+            "route": "conversational", "category": "conversational",
+            "domain": "conversation", "intent": "general", "tasks": [], "relations": [],
+            "response_language": "en", "confidence": 0.9, "reply": "Hello! How can I help?",
+        })
+        echoed = type("Response", (), {"text": blob})()
+        with patch("cobol_rag.query.build_llm") as build, \
+                patch("cobol_rag.query.compose_prose") as compose:
+            build.return_value.complete.return_value = echoed
+            compose.return_value = blob
+            decision = _route_query(
+                "hi", AppConfig(),
+                preliminary_plan=QueryPlan(intent="general"),
+                preliminary_scope=QueryScope(intent="general"),
+            )
+        self.assertEqual(decision.reply, "Hello! How can I help?")
+        self.assertNotIn("{", decision.reply)
 
     def test_pagination_literal_constraint_builds_a_technical_task(self) -> None:
         scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="general")

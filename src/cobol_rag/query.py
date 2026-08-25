@@ -33,7 +33,7 @@ from cobol_rag.final_scripts_answers import (
     find_final_scripts_root,
     find_program_artifact_root,
 )
-from cobol_rag.index import build_llm, open_index
+from cobol_rag.index import build_llm, compose_prose, open_index
 from cobol_rag.observability import write_answer_trace
 from cobol_rag.query_plan import (
     _CAPABILITY_ENTITY_TYPES,
@@ -3107,7 +3107,35 @@ def _finalize_routing_language(
     preliminary_plan: QueryPlan | None,
     session_state: SessionState | None,
 ) -> QueryRoutingDecision:
-    """Repair prose after classification instead of discarding a valid route."""
+    """Compose conversational prose separately from the classification that chose it.
+
+    Classification and composition need opposite things from the model. The
+    planner is asked for a routing object and gets it through the completion
+    endpoint in JSON mode, where the schema keeps it anchored. Prose has no
+    schema, and through that same endpoint an instruct model continues the text
+    instead of answering it -- the origin of "Bene, tu?" in reply to an Italian
+    question. So the reply is written by a second call that goes through the
+    chat template instead; see compose_prose.
+    """
+    # Only small talk is composed ahead of time. Composing an "unclear" message
+    # measurably breaks the scope boundary -- asked for the capital of France the
+    # model answers it, under every boundary instruction tried -- so an
+    # unclassifiable message keeps its deterministic reply.
+    if decision.route == "conversational" and preliminary_plan is not None:
+        try:
+            composed = _repair_conversational_reply(
+                question,
+                route=decision.route,
+                required_language=preliminary_plan.response_language,
+                previous_language=(session_state.response_language if session_state else None),
+                config=config,
+            )
+        except Exception:
+            # Composition is an improvement, not a precondition. A failure here
+            # leaves the planner's own reply to be language-checked as before.
+            composed = ""
+        if composed:
+            decision = replace(decision, reply=composed)
     try:
         return _enforce_routing_language(decision, preliminary_plan)
     except QueryError:
@@ -3136,28 +3164,23 @@ def _repair_conversational_reply(
     language_name = {"en": "English", "it": "Italian"}.get(
         required_language, required_language,
     )
-    prompt = f"""Write the final reply for a COBOL assistant's conversational front door.
-The message has already been classified as {route}; do not classify it again.
-Reply naturally and directly to the current message using only {language_name}.
-Do not echo the message. Do not include a translation, bilingual text, routing labels, JSON, citations, or COBOL evidence.
-Previous session response language: {previous_language or 'unknown'}.
-Current required response language: {required_language}.
-If the user asks why a previous reply used the wrong language, explain that the earlier session language was still selected, briefly apologize, and confirm that replies now continue in {language_name}. Do not ask for more context.
-If the route is unclear, preserve the assistant's COBOL-analysis boundary without answering unrelated facts.
-
-Current message:
-<message>
-{question}
-</message>
-
-Return only the reply text.
-"""
-    response = build_llm(
-        config,
-        max_output_tokens=100,
-        temperature=0.1,
-    ).complete(prompt)
-    reply = str(response.text).strip()
+    # Measured against this model: every added sentence costs answer quality.
+    # A long instruction preamble sent granite back to its canned "Bene, tu?"
+    # for the very question it answers correctly under this short one, and made
+    # it recite the preamble at "hi". Clauses below are therefore appended only
+    # in the situation that needs them, and phrased as statements rather than
+    # orders, because an imperative gets echoed into the reply verbatim.
+    system = f"You are a helpful assistant for COBOL analysis. Reply only in {language_name}."
+    if previous_language and previous_language != required_language:
+        system += f" The user has just asked for replies in {language_name}."
+    if route == "unclear":
+        system += (
+            " You answer only questions about COBOL programs. This message is not one, "
+            "so reply that it is outside what you can help with and do not answer it."
+        )
+    reply = compose_prose(
+        config, system=system, user=question, max_output_tokens=100, temperature=0.1,
+    )
     fenced = re.fullmatch(r"```(?:text)?\s*(.*?)\s*```", reply, flags=re.DOTALL | re.IGNORECASE)
     if fenced:
         reply = fenced.group(1).strip()
@@ -3170,6 +3193,12 @@ Return only the reply text.
         reply = wrapped.group(1).strip()
     if not reply:
         raise QueryError("The conversational language repair returned an empty reply.")
+    if reply.startswith("{") and reply.endswith("}"):
+        # The prompt forbids JSON, but a model primed by the routing schema can
+        # still answer with a routing object. Prose is never a bare JSON blob, so
+        # treat this as a failed composition and let the caller keep the
+        # classifier's own reply rather than showing the user a raw object.
+        raise QueryError("The conversational composer returned a routing object, not prose.")
     return reply
 
 

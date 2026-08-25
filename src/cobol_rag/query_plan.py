@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import json
 import re
 from dataclasses import asdict, dataclass, field, replace
@@ -503,6 +504,36 @@ def _explicit_response_language(message: str) -> str | None:
         match = re.search(pattern, normalized)
         if match:
             return language_names[match.group(1)]
+
+    # Naming a language is itself the request, whatever verb surrounds it. The
+    # patterns above enumerate verbs, so "facciamo" and "parliamo" were invisible
+    # and a session could not be steered out of a language by ordinary phrasing.
+    # A near match also survives the misspelling people actually type. Only
+    # standalone word tokens are considered, so a COBOL identifier such as
+    # ENGLISH-FLAG is never read as a language preference.
+    return _named_response_language(normalized)
+
+
+# 0.85 measured against both requests and COBOL decoys: 0.90 loses "englese",
+# 0.80 admits more than it needs to.
+_LANGUAGE_NAME_CUTOFF = 0.85
+_STANDALONE_WORD = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z]{5,12}(?![A-Za-z0-9_-])")
+_RESPONSE_LANGUAGE_NAMES = {
+    "english": "en", "inglese": "en", "anglais": "en",
+    "italian": "it", "italiano": "it", "italien": "it",
+}
+
+
+def _named_response_language(normalized: str) -> str | None:
+    for token in _STANDALONE_WORD.findall(normalized):
+        exact = _RESPONSE_LANGUAGE_NAMES.get(token)
+        if exact:
+            return exact
+        near = difflib.get_close_matches(
+            token, _RESPONSE_LANGUAGE_NAMES, n=1, cutoff=_LANGUAGE_NAME_CUTOFF,
+        )
+        if near:
+            return _RESPONSE_LANGUAGE_NAMES[near[0]]
     return None
 
 ALLOWED_PLAN_DOMAINS = {

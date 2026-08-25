@@ -6,6 +6,7 @@ import chromadb
 from chromadb.api import ClientAPI
 from chromadb.api.models.Collection import Collection
 from llama_index.core import Settings, VectorStoreIndex
+from llama_index.core.llms import ChatMessage
 from llama_index.core.schema import Document, TextNode
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
@@ -50,6 +51,35 @@ def build_llm(
             "num_predict": max_output_tokens or config.llm.max_output_tokens
         },
     )
+
+
+def compose_prose(
+    config: AppConfig,
+    *,
+    system: str,
+    user: str,
+    max_output_tokens: int | None = None,
+    temperature: float | None = None,
+) -> str:
+    """Generate natural-language prose through the model's own chat template.
+
+    Ollama's completion endpoint feeds a prompt to the model raw, with no
+    instruct template around it, so an instruct model continues the text rather
+    than answering it. Asked in Italian whether it speaks Italian, granite
+    completes with "Bene, tu?" -- at every temperature, and identically under a
+    long instruction preamble, a chat-shaped prompt, and the bare question. The
+    same question through the chat endpoint answers correctly and reproducibly.
+
+    Structured extraction is unharmed by completion mode because a JSON schema
+    re-anchors the model, which is why evidence routing works while small talk
+    does not. Prose therefore goes through chat.
+    """
+    llm = build_llm(config, max_output_tokens=max_output_tokens, temperature=temperature)
+    response = llm.chat([
+        ChatMessage(role="system", content=system),
+        ChatMessage(role="user", content=user),
+    ])
+    return str(response.message.content or "").strip()
 
 
 def build_embedder(config: AppConfig) -> OllamaEmbedding:

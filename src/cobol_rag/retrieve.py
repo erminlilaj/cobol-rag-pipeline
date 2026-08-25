@@ -786,7 +786,13 @@ def _detect_intent(query: str) -> str:
         return "comments"
     if any(term in q for term in ("db2", "sql include", "sqlinclude")):
         return "datasets_tables"
-    if any(term in q for term in ("dataset", "datasets", "table", "tables", "file", "files", "mapset", "mapsets", "queue", "queues", "transaction id")):
+    # A BMS mapset is a screen resource, and the only evidence of it is the CICS
+    # SEND/RECEIVE that names it -- not JCL datasets or DB2 tables. It sat in the
+    # datasets_tables branch below from before map and mapset were resolvable
+    # entities, which sent "which mapset contains PDCBVC1?" to file-I/O evidence.
+    if any(term in q for term in ("mapset", "mapsets")):
+        return "cics_operations"
+    if any(term in q for term in ("dataset", "datasets", "table", "tables", "file", "files", "queue", "queues", "transaction id")):
         return "datasets_tables"
     if any(term in q for term in ("resource", "resources", "dependency", "dependencies", "cics")):
         return "dependencies"

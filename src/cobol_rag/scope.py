@@ -626,6 +626,12 @@ def _contains_identifier(text: str, identifier: str) -> bool:
     )
 
 
+# MAP('X') / MAPSET('Y') inside an EXEC CICS statement. The platform repo
+# carries the same two patterns in its corpus-registry writer; keep them in step.
+_MAP_NAME = re.compile(r"\bMAP\s*\(\s*['\"]([A-Z0-9$#@-]{1,8})['\"]\s*\)", re.IGNORECASE)
+_MAPSET_NAME = re.compile(r"\bMAPSET\s*\(\s*['\"]([A-Z0-9$#@-]{1,8})['\"]\s*\)", re.IGNORECASE)
+
+
 @lru_cache(maxsize=8)
 def _catalogue(root_text: str) -> tuple[tuple[str, ...], tuple[EntityReference, ...]]:
     if not root_text:
@@ -682,7 +688,11 @@ def _catalogue(root_text: str) -> tuple[tuple[str, ...], tuple[EntityReference, 
                     _add_entity(entities, program, "call", target, f"{program}|{target}|{call_type}")
             continue
 
-        if filename not in {"architecture.copybooks.json", "controlflow.cfg.json"} and programs:
+        if filename not in {
+            "architecture.copybooks.json",
+            "architecture.cics_operations.json",
+            "controlflow.cfg.json",
+        } and programs:
             continue
         payload = _read_json(path)
         if not isinstance(payload, dict):
@@ -704,6 +714,27 @@ def _catalogue(root_text: str) -> tuple[tuple[str, ...], tuple[EntityReference, 
                 value = name.strip().upper()
                 if value:
                     _add_entity(entities, program, "copybook", value, f"{program}|COPYBOOK|{value}")
+        if filename == "architecture.cics_operations.json" and program:
+            # BMS map and mapset names appear only inside CICS statements, so
+            # without this branch a question naming PDCBVC1 resolves to no
+            # entity and is refused as absent from the corpus. Kept in step with
+            # _write_corpus_registry in the platform repo, which is the path
+            # that runs wherever a corpus registry exists.
+            content = payload.get("content") if isinstance(payload.get("content"), dict) else {}
+            operations = content.get("operations") or []
+            for operation in operations if isinstance(operations, list) else []:
+                if not isinstance(operation, dict):
+                    continue
+                statement = str(operation.get("statement", ""))
+                for entity_type, pattern in (("map", _MAP_NAME), ("mapset", _MAPSET_NAME)):
+                    for match in pattern.finditer(statement):
+                        value = match.group(1).strip().upper()
+                        if value:
+                            _add_entity(
+                                entities, program, entity_type, value,
+                                f"{program}|{entity_type.upper()}|{value}",
+                            )
+
         if filename == "controlflow.cfg.json" and program:
             nodes = payload.get("nodes") or []
             for node in nodes:

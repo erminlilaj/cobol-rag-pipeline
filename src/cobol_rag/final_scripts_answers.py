@@ -1196,6 +1196,20 @@ def _format_flow_edge(edge: dict[str, Any]) -> str:
     return f"- {prefix}{edge.get('type', '?')} to {edge.get('to', '?')} — {evidence}"
 
 
+# MAP('X') / MAPSET('Y') as written in an EXEC CICS statement. The analysis
+# repo does not yet publish the resource as a structured field, so it is read
+# back out of the recorded statement; when structured resource_type/resource
+# fields land, this should read them instead of re-parsing.
+_CICS_MAP_NAME = re.compile(
+    r"\bMAP(?:SET)?\s*\(\s*['\"]([A-Z0-9$#@-]{1,8})['\"]\s*\)", re.IGNORECASE,
+)
+
+
+def _cics_statement_resources(statement: str) -> set[str]:
+    """Names of the BMS resources an EXEC CICS statement refers to."""
+    return {match.group(1).strip().upper() for match in _CICS_MAP_NAME.finditer(statement)}
+
+
 def _answer_cics_operations(
     root: Path,
     program: str,
@@ -1216,6 +1230,29 @@ def _answer_cics_operations(
     if plan and plan.excluded_operations:
         excluded = set(plan.excluded_operations)
         operations = [item for item in operations if str(item.get("command", "")).upper() not in excluded]
+
+    # A question that names a map is about that map. Filtering by command alone
+    # returned every SEND in the program, which is the right evidence and the
+    # wrong answer -- and grows worse with each additional screen a program has.
+    requested_resources = {
+        entity.value.upper()
+        for entity in (plan.entities if plan else ())
+        if entity.entity_type in {"map", "mapset"} and entity.value
+    }
+    if requested_resources:
+        matched = [
+            item for item in operations
+            if requested_resources & _cics_statement_resources(str(item.get("statement", "")))
+        ]
+        if matched:
+            operations = matched
+        else:
+            named = ", ".join(sorted(requested_resources))
+            return (
+                f"No source-backed CICS operation in {program} names {named}. "
+                f"Source: `{payload_path.name}`."
+            )
+
     if not operations:
         requested = ", ".join(plan.operations) if plan and plan.operations else "CICS operations"
         return f"No source-backed {requested} operation matched in {program}. Source: `{payload_path.name}`."

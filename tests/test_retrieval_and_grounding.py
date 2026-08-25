@@ -73,6 +73,8 @@ from cobol_rag.query_plan import (
 )
 from cobol_rag.final_scripts_answers import (
     _answer_artifact_inventory,
+    _answer_cics_operations,
+    _cics_statement_resources,
     absent_capability_answer,
     answer_source_line_spans,
     answer_source_lines,
@@ -2413,6 +2415,82 @@ class PerItemRequestsKeepTheirFormatterTest(unittest.TestCase):
         self.assertFalse(_direct_handler_supports(
             self._plan(("program_summary",), "program_summary"),
         ))
+
+
+class MapEntityTest(unittest.TestCase):
+    """A BMS map name is an identifier a user can ask about, like a variable."""
+
+    _OPERATIONS = {
+        "program": "PDCBVC",
+        "content": {"operations": [
+            {"command": "SEND", "paragraph": "SEND-PDCBVC1", "source_file": "PDCBVC.CBL",
+             "line_start": 811, "line_end": 812,
+             "statement": "EXEC CICS SEND MAP('PDCBVC1') MAPSET('PDCBVCM') ERASE END-EXEC."},
+            {"command": "RECEIVE", "paragraph": "RECEIVE-PDCBVC1", "source_file": "PDCBVC.CBL",
+             "line_start": 829, "line_end": 829,
+             "statement": "EXEC CICS RECEIVE MAP('PDCBVC1') MAPSET('PDCBVCM') END-EXEC."},
+            {"command": "SEND", "paragraph": "SEND-OTHER", "source_file": "PDCBVC.CBL",
+             "line_start": 900, "line_end": 900,
+             "statement": "EXEC CICS SEND MAP('OTHERMAP') MAPSET('OTHERSET') END-EXEC."},
+            {"command": "LINK", "paragraph": "LINK-PD1FS00", "source_file": "PDCBVC.CBL",
+             "line_start": 500, "line_end": 501,
+             "statement": "EXEC CICS LINK PROGRAM('PD1FS00') COMMAREA(WPD1FS00) END-EXEC."},
+        ]},
+    }
+
+    def _root(self, directory: str) -> Path:
+        root = Path(directory)
+        (root / "architecture.cics_operations.json").write_text(
+            json.dumps(self._OPERATIONS), encoding="utf-8",
+        )
+        return root
+
+    def test_map_and_mapset_names_are_read_out_of_a_cics_statement(self) -> None:
+        self.assertEqual(
+            _cics_statement_resources("EXEC CICS SEND MAP('PDCBVC1') MAPSET('PDCBVCM') ERASE END-EXEC."),
+            {"PDCBVC1", "PDCBVCM"},
+        )
+        # MAPSET must not be read as MAP with a stray suffix, and a statement
+        # naming no BMS resource contributes nothing.
+        self.assertEqual(
+            _cics_statement_resources("EXEC CICS LINK PROGRAM('PD1FS00') END-EXEC."), set(),
+        )
+
+    def test_a_named_map_narrows_the_operations_to_that_map(self) -> None:
+        # Observed production failure: "Which paragraph sends the PDCBVC1 map?"
+        # was answered "PDCBVC1 is not present in the analyzed corpus" while the
+        # SEND naming it sat in the evidence. Resolving the name is only half of
+        # it -- returning every SEND in the program would still not be the answer.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            plan = QueryPlan(
+                intent="cics_operations", program="PDCBVC", programs=("PDCBVC",),
+                entities=(EntityReference("PDCBVC", "map", "PDCBVC1", "PDCBVC|MAP|PDCBVC1"),),
+            )
+            answer = _answer_cics_operations(root, "PDCBVC", plan)
+            self.assertIn("SEND-PDCBVC1", answer)
+            self.assertIn("RECEIVE-PDCBVC1", answer)
+            self.assertNotIn("SEND-OTHER", answer)
+            self.assertNotIn("LINK-PD1FS00", answer)
+
+    def test_a_map_with_no_operation_is_reported_rather_than_answered_broadly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._root(directory)
+            plan = QueryPlan(
+                intent="cics_operations", program="PDCBVC", programs=("PDCBVC",),
+                entities=(EntityReference("PDCBVC", "map", "NOSUCHMAP", "PDCBVC|MAP|NOSUCHMAP"),),
+            )
+            answer = _answer_cics_operations(root, "PDCBVC", plan)
+            self.assertIn("NOSUCHMAP", answer)
+            self.assertNotIn("SEND-PDCBVC1", answer)
+
+    def test_a_mapset_question_routes_to_cics_evidence_not_file_io(self) -> None:
+        # "mapset" sat in the datasets_tables keyword branch, so a question about
+        # a BMS screen resource was answered from JCL/DB2 evidence.
+        for question in ("Which mapset contains PDCBVC1?", "Show me the mapsets used by PDCBVC"):
+            with self.subTest(question=question):
+                intent, _ = detect_intent_with_basis(question)
+                self.assertEqual(intent, "cics_operations")
 
 
 class IntentAuthorityTest(unittest.TestCase):

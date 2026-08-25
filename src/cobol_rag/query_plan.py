@@ -596,7 +596,9 @@ _CAPABILITY_TASKS = {
 
 # Entity types that are exact identifiers copied from the user's question, and so
 # must survive into any answer claiming to be about them.
-NAMED_IDENTIFIER_ENTITY_TYPES = frozenset({"call", "variable", "unknown_identifier"})
+NAMED_IDENTIFIER_ENTITY_TYPES = frozenset(
+    {"call", "variable", "unknown_identifier", "map", "mapset"}
+)
 
 _CAPABILITY_ENTITY_TYPES = {
     "paragraph_evidence": {"paragraph"},
@@ -607,7 +609,9 @@ _CAPABILITY_ENTITY_TYPES = {
     "control_flow": {"paragraph"},
     "call_evidence": {"call"},
     "call_context": {"call"},
-    "cics_evidence": {"paragraph"},
+    # A map or mapset name is answerable only from CICS evidence: it is the one
+    # identifier class that exists solely inside EXEC CICS statements.
+    "cics_evidence": {"paragraph", "map", "mapset"},
     "copybook_evidence": {"copybook"},
     "screen_lineage": {"variable", "unknown_identifier"},
 }
@@ -746,6 +750,10 @@ def build_query_plan(
             resolved_intent = "external_programs"
         elif entity_types <= {"copybook", "unknown_identifier"}:
             resolved_intent = "copybooks"
+        elif entity_types <= {"map", "mapset", "unknown_identifier"}:
+            # A named map is a screen, and the only evidence of it is the CICS
+            # SEND/RECEIVE that names it.
+            resolved_intent = "cics_operations"
 
     operations = tuple(
         operation

@@ -232,7 +232,10 @@ def eligible_capabilities(
     """Restrict ranking to capabilities the resolved scope can actually support."""
     resolved = {value for value in entity_types if value}
     candidates = set(available if available is not None else CAPABILITY_DESCRIPTORS)
-    identifier_types = {"variable", "unknown_identifier", "call", "paragraph", "copybook"}
+    identifier_types = {
+        "variable", "unknown_identifier", "call", "paragraph", "copybook",
+        "map", "mapset",
+    }
     if not (resolved & identifier_types):
         candidates -= ENTITY_REQUIRED_CAPABILITIES
     if resolved & {"variable", "unknown_identifier"}:

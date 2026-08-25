@@ -10,6 +10,7 @@ from typing import Any
 
 from cobol_rag.config import AppConfig, load_config
 from cobol_rag.query import QueryError, answer_query
+from cobol_rag.query_plan import validate_plan_answer
 from cobol_rag.scope import SessionState
 
 
@@ -62,9 +63,20 @@ def evaluate_cases(cases: list[dict[str, Any]], config: AppConfig) -> dict[str, 
             if values
         },
     }
+    category_metrics: dict[str, dict[str, Any]] = {}
+    for category in sorted({result.category for result in results}):
+        category_results = [result for result in results if result.category == category]
+        category_passed = sum(result.passed for result in category_results)
+        category_metrics[category] = {
+            "cases": len(category_results),
+            "passed": category_passed,
+            "failed": len(category_results) - category_passed,
+            "pass_rate": category_passed / len(category_results) if category_results else 0.0,
+        }
     return {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "metrics": metrics,
+        "categories": category_metrics,
         "results": [asdict(result) for result in results],
     }
 
@@ -190,6 +202,11 @@ def _checks_for_answer(
         str(source.metadata.get("source_file") or source.metadata.get("evidence_path") or "")
         for source in answer.sources
     ]
+    source_programs = {
+        str(source.metadata.get("program", "")).upper()
+        for source in answer.sources
+        if str(source.metadata.get("program", "")).strip()
+    }
     checks: dict[str, bool] = {"execution": True}
     expected_execution_mode = expected.get("expected_execution_mode")
     if expected_execution_mode is not None:
@@ -203,6 +220,9 @@ def _checks_for_answer(
     expected_program = expected.get("expected_program")
     if expected_program is not None:
         checks["program"] = answer.scope.program == expected_program
+    resolved_program = str(answer.scope.program or "").upper()
+    if resolved_program and source_programs:
+        checks["program_isolation"] = source_programs == {resolved_program}
     expected_entity = expected.get("expected_entity")
     if expected_entity is not None:
         checks["entity"] = answer.scope.entity_value == expected_entity
@@ -245,6 +265,15 @@ def _checks_for_answer(
             )
         )
         checks["abstention"] = abstained is bool(expected["should_abstain"])
+    if (
+        answer.plan
+        and answer.route == "technical"
+        and answer.guard_status != "insufficient"
+        and not answer.execution_mode.endswith(("_rejected", "_partial"))
+    ):
+        checks["response_contract"] = validate_plan_answer(
+            answer.plan, answer.answer,
+        ).passed
 
     actual = {
         "question": answer.question,
@@ -257,6 +286,7 @@ def _checks_for_answer(
         "execution_mode": answer.execution_mode,
         "plan": answer.plan.as_dict() if answer.plan else {},
         "source_files": source_files,
+        "source_programs": sorted(source_programs),
         "trace_id": answer.trace_id,
         "answer": answer.answer,
     }

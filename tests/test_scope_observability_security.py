@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from cobol_rag.query import (
     _answer_debug_payload,
     _build_prompt,
     _validate_generated_claims,
+    answer_query,
 )
 from cobol_rag.query_plan import QueryPlan
 from cobol_rag.retrieve import (
@@ -25,6 +27,7 @@ from cobol_rag.retrieve import (
     _validate_evidence,
 )
 from cobol_rag.scope import (
+    EntityReference,
     QueryScope,
     SessionState,
     _looks_like_followup,
@@ -165,6 +168,47 @@ class ScopeResolutionTest(unittest.TestCase):
         self.assertEqual(scope.entity_value, "PD1VOCI-RETURN")
         self.assertEqual(scope.entity_source, "session")
 
+    def test_plural_followup_reuses_the_last_result_set(self) -> None:
+        first = EntityReference(
+            "PDCBVC", "variable", "PD1VOCI-RETURN",
+            "PDCBVC|VARIABLE|PD1VOCI-RETURN",
+        )
+        second = EntityReference(
+            "PDCBVC", "variable", "PD1FS00-RETURN",
+            "PDCBVC|VARIABLE|PD1FS00-RETURN",
+        )
+        state = SessionState(
+            current_program="PDCBVC",
+            current_entities=[first, second],
+            last_result_entities=[first, second],
+        )
+        scope = resolve_query_scope(
+            "Which of those two variables controls execution?",
+            intent="variable_dataflow", state=state, final_scripts_root=self.root,
+        )
+        self.assertEqual(scope.entity_values, ("PD1VOCI-RETURN", "PD1FS00-RETURN"))
+
+    def test_singular_followup_after_multi_entity_result_requires_clarification(self) -> None:
+        first = EntityReference(
+            "PDCBVC", "variable", "PD1VOCI-RETURN",
+            "PDCBVC|VARIABLE|PD1VOCI-RETURN",
+        )
+        second = EntityReference(
+            "PDCBVC", "variable", "PD1FS00-RETURN",
+            "PDCBVC|VARIABLE|PD1FS00-RETURN",
+        )
+        state = SessionState(
+            current_program="PDCBVC",
+            current_entities=[first, second],
+            last_result_entities=[first, second],
+        )
+        scope = resolve_query_scope(
+            "Where is that same variable defined?",
+            intent="variable_dataflow", state=state, final_scripts_root=self.root,
+        )
+        self.assertTrue(scope.ambiguous)
+        self.assertIn("more than one entity", scope.reason)
+
 
     def test_short_program_question_does_not_reuse_stale_entity(self) -> None:
         state = SessionState(
@@ -182,6 +226,48 @@ class ScopeResolutionTest(unittest.TestCase):
         )
         self.assertIsNone(scope.entity_value)
         self.assertEqual(scope.entity_source, "unresolved")
+
+    def test_program_name_is_not_mistaken_for_its_entry_paragraph(self) -> None:
+        scope = resolve_query_scope(
+            "Describe PDCBVC in one sentence only.",
+            intent="general",
+            final_scripts_root=self.root,
+        )
+        self.assertEqual(scope.program, "PDCBVC")
+        self.assertEqual(scope.entities, ())
+
+    def test_explicit_entry_paragraph_request_still_resolves_the_paragraph(self) -> None:
+        scope = resolve_query_scope(
+            "Show paragraph PDCBVC.",
+            intent="control_flow",
+            final_scripts_root=self.root,
+        )
+        self.assertEqual(scope.entity_value, "PDCBVC")
+        self.assertEqual(scope.entity_type, "paragraph")
+
+    def test_uppercase_output_format_is_not_an_unknown_cobol_identifier(self) -> None:
+        scope = resolve_query_scope(
+            "Return calls from PDCBVC as a JSON array.",
+            intent="external_programs",
+            final_scripts_root=self.root,
+        )
+        self.assertFalse(scope.ambiguous)
+        self.assertNotIn("JSON", scope.entity_values)
+
+    def test_cobol_using_keyword_is_not_an_unknown_identifier(self) -> None:
+        call_dir = self.root / "architecture.call"
+        call_dir.mkdir()
+        (call_dir / "architecture.call.CALLBYIDENTIFIER.PXRSEMAF.json").write_text(
+            json.dumps({"program": "PDCBVC", "content": {"target": "PXRSEMAF"}}),
+            encoding="utf-8",
+        )
+        scope = resolve_query_scope(
+            "For the PXRSEMAF COBOL CALL, show the USING parameter.",
+            intent="external_programs",
+            final_scripts_root=self.root,
+        )
+        self.assertFalse(scope.ambiguous)
+        self.assertEqual(scope.entity_values, ("PXRSEMAF",))
 
     def test_multiple_named_entities_are_preserved(self) -> None:
         scope = resolve_query_scope(
@@ -227,6 +313,37 @@ class ScopeResolutionTest(unittest.TestCase):
         self.assertEqual(scope.programs, ("PROGA", "PROGB"))
         self.assertEqual(scope.program, "PROGA")
 
+    def test_corpus_registry_routes_without_scanning_every_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "corpus.registry.json").write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "programs": [
+                        {
+                            "program": "PROGA",
+                            "entities": [
+                                {"type": "variable", "value": "A-FIELD", "entity_key": "PROGA|VARIABLE|A-FIELD"},
+                            ],
+                        },
+                        {
+                            "program": "PROGB",
+                            "entities": [
+                                {"type": "variable", "value": "B-FIELD", "entity_key": "PROGB|VARIABLE|B-FIELD"},
+                            ],
+                        },
+                    ],
+                }),
+                encoding="utf-8",
+            )
+            scope = resolve_query_scope(
+                "Where is B-FIELD used in PROGB?",
+                intent="variable_dataflow",
+                final_scripts_root=root,
+            )
+        self.assertEqual(scope.program, "PROGB")
+        self.assertEqual(scope.entity_value, "B-FIELD")
+
     def test_unanalyzed_program_name_abstains_instead_of_using_the_selected_program(self) -> None:
         # Observed production failure: asking about PDXXXXX answered with PDCBVC
         # evidence because an unmatched hyphen-less name was silently discarded.
@@ -247,6 +364,23 @@ class ScopeResolutionTest(unittest.TestCase):
         self.assertTrue(scope.ambiguous)
         self.assertIn("PDXXXXX", scope.reason)
         self.assertIn("not present in the analyzed corpus", scope.reason)
+
+    def test_full_query_pipeline_rejects_unknown_program_before_semantic_routing(self) -> None:
+        # The resolver already knows PDXXXXX is absent. The API must honor that
+        # even when the preliminary intent is still broad/general.
+        with (
+            patch.dict(os.environ, {"COBOL_RAG_FINAL_SCRIPTS_DIR": str(self.root)}),
+            patch("cobol_rag.query._route_query") as route,
+        ):
+            result = answer_query(
+                "Tell me about the variables inside PDXXXXX.",
+                AppConfig(),
+                target_program="PDCBVC",
+            )
+        route.assert_not_called()
+        self.assertEqual(result.route, "unclear")
+        self.assertIn("PDXXXXX", result.answer)
+        self.assertIn("not present in the analyzed corpus", result.answer)
 
     def test_comparison_against_an_unanalyzed_program_abstains(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

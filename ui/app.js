@@ -14,6 +14,13 @@ const treeFilter = document.getElementById('tree-filter');
 
 let selectedInboxPaths = new Set();
 let inboxTreeData = null;
+const chatSessionStorageKey = 'cobol-rag-session-id';
+let chatSessionId = window.localStorage.getItem(chatSessionStorageKey);
+if (!chatSessionId) {
+    chatSessionId = window.crypto?.randomUUID?.()
+        || `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    window.localStorage.setItem(chatSessionStorageKey, chatSessionId);
+}
 
 function scrollChatToBottom() {
     chatHistory.scrollTo({
@@ -83,6 +90,7 @@ function renderDebugDetails(debug, traceId = '') {
     const subtasks = Array.isArray(debug.subtasks) ? debug.subtasks : [];
     const evidence = Array.isArray(retrieval.evidence) ? retrieval.evidence : [];
     const reasons = Array.isArray(validation.reasons) ? validation.reasons : [];
+    const disposition = debug.evidence_disposition || {};
     const status = debug.status || 'available';
     const rejected = status === 'rejected' || validation.passed === false;
 
@@ -100,6 +108,8 @@ function renderDebugDetails(debug, traceId = '') {
                 <div><dt>Stage</dt><dd>${escapeHTML(validation.stage || 'none')}</dd></div>
                 <div><dt>Passed</dt><dd>${validation.passed === false ? 'No' : 'Yes'}</dd></div>
                 <div><dt>Guard</dt><dd>${escapeHTML(debug.guard_status || 'not applicable')}</dd></div>
+                <div><dt>Execution</dt><dd>${escapeHTML((debug.execution_strategy || 'unknown').replaceAll('_', ' '))}</dd></div>
+                <div><dt>Evidence state</dt><dd>${escapeHTML((disposition.state || 'unknown').replaceAll('_', ' '))}</dd></div>
             </dl>
             ${reasons.length
                 ? `<ul class="debug-reasons">${reasons.map(reason => `<li>${escapeHTML(reason)}</li>`).join('')}</ul>`
@@ -181,7 +191,10 @@ function setStatus(state, text) {
 }
 
 async function apiFetch(url, options) {
-    const response = await fetch(url, options);
+    const requestOptions = options || {};
+    const headers = new Headers(requestOptions.headers || {});
+    headers.set('X-Session-ID', chatSessionId);
+    const response = await fetch(url, { ...requestOptions, headers });
     const contentType = response.headers.get('content-type') || '';
     const payload = contentType.includes('application/json') ? await response.json() : await response.text();
     if (!response.ok) {
@@ -361,8 +374,12 @@ function appendMessage(role, content, sources = [], metadata = null) {
         metaDiv.className = 'answer-meta';
         const category = metadata.plan?.category || metadata.route || '';
         const planner = metadata.plan?.planner_source || '';
+        const strategy = metadata.debug?.execution_strategy || '';
+        const evidenceState = metadata.debug?.evidence_disposition?.state || '';
         metaDiv.innerHTML = [
             `<span>${escapeHTML(metadata.execution_mode.replaceAll('_', ' '))}</span>`,
+            strategy ? `<span>${escapeHTML(strategy.replaceAll('_', ' '))}</span>` : '',
+            evidenceState ? `<span>${escapeHTML(evidenceState.replaceAll('_', ' '))}</span>` : '',
             category ? `<span>${escapeHTML(category.replaceAll('_', ' '))}</span>` : '',
             planner ? `<span>${escapeHTML(planner.replaceAll('_', ' '))}</span>` : '',
         ].filter(Boolean).join('');

@@ -27,18 +27,23 @@ from cobol_rag.query import (
     _claim_should_be_rerouted,
     _entity_contract_failed,
     _rerouted_subtask,
+    _refine_variable_tasks,
     _supplement_missing_capability,
+    _assess_technical_answerability,
     EvidenceSubtaskResult,
     _decision_respects_candidates,
     _routing_candidates,
     _chunk_types_for_plan,
     _complete_with_transient_retry,
     _conversational_route_is_blocked,
+    _compose_subtask_results,
     _deterministic_routing,
     _direct_handler_supports,
     _ensure_citations,
+    _effective_subtask_contract_plan,
     _parse_routing_decision,
     _retrieve_for_plan,
+    _render_verified_candidate_to_contract,
     _route_query,
     _resolve_weak_technical_route,
     _routing_conflicts_with_verified_scope,
@@ -53,17 +58,22 @@ from cobol_rag.query_plan import (
     _CAPABILITY_TASKS,
     EvidenceSubtask,
     QueryPlan,
+    ResponseContract,
     build_query_plan,
     detect_message_language,
     derive_evidence_subtasks,
+    execution_strategy_for_plan,
     merge_semantic_plan,
+    parse_response_contract,
     plan_for_subtask,
     resolve_response_language,
     validate_plan_answer,
+    validate_evidence_answer,
 )
 from cobol_rag.final_scripts_answers import absent_capability_answer
 from cobol_rag.retrieve import (
     EvidenceGuard, RetrievalOutcome, RetrievalResult, _deduplicate_results, _detect_intent,
+    _expand_context, _lexical_from_collection, clear_retrieval_cache,
 )
 from cobol_rag.scope import EntityReference, QueryScope, SessionState
 
@@ -133,6 +143,208 @@ class RetrievalPolicyTest(unittest.TestCase):
 
 
 class PromptGroundingTest(unittest.TestCase):
+    def test_response_contract_parses_shape_limits_and_exact_counts(self) -> None:
+        sentence = parse_response_contract("Describe PDCBVC in one sentence only and at most 20 words.")
+        self.assertEqual(sentence.format, "sentence")
+        self.assertEqual(sentence.max_sentences, 1)
+        self.assertEqual(sentence.max_words, 20)
+        self.assertTrue(sentence.only_requested_content)
+
+        bullets = parse_response_contract("Give exactly three bullet points.")
+        self.assertEqual(bullets.format, "bullets")
+        self.assertEqual(bullets.exact_item_count, 3)
+
+        first_three = parse_response_contract("Return exactly the first 3 literal assignments.")
+        self.assertEqual(first_three.exact_item_count, 3)
+
+        json_array = parse_response_contract("Return a JSON array only.")
+        self.assertEqual(json_array.format, "json_array")
+
+        two_lines = parse_response_contract("Explain PDCBVC in two lines.")
+        self.assertEqual(two_lines.max_lines, 2)
+        self.assertEqual(two_lines.exact_lines, 2)
+
+        bounded_lines = parse_response_contract("Explain PDCBVC in at most three lines.")
+        self.assertEqual(bounded_lines.max_lines, 3)
+        self.assertIsNone(bounded_lines.exact_lines)
+
+        named_variables = parse_response_contract("Name 10 variables inside PDCBVC.")
+        self.assertEqual(named_variables.exact_item_count, 10)
+
+        variable_count = parse_response_contract("How many variables are in PDCBVC?")
+        self.assertEqual(variable_count.format, "count")
+
+        compound_count = parse_response_contract(
+            "Give me a summary of PDCBVC and tell me how many variables it has."
+        )
+        self.assertEqual(compound_count.format, "default")
+
+    def test_lexical_collection_reads_only_the_selected_program_and_caches_it(self) -> None:
+        collection = Mock()
+        collection.get.return_value = {
+            "documents": ["PDCBVC variable WCTRIG"],
+            "metadatas": [{"program": "PDCBVC", "chunk_type": "dataflow.variable"}],
+        }
+        resources = Mock(chroma_collection=collection)
+        clear_retrieval_cache()
+        with patch("cobol_rag.retrieve.open_index", return_value=resources):
+            first = _lexical_from_collection(
+                "WCTRIG", AppConfig(), 5, None, {"program": "PDCBVC"},
+            )
+            second = _lexical_from_collection(
+                "WCTRIG", AppConfig(), 5, None, {"program": "PDCBVC"},
+            )
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        collection.get.assert_called_once_with(
+            include=["documents", "metadatas"], where={"program": "PDCBVC"},
+        )
+
+    def test_parent_expansion_walks_entity_to_domain_and_program_nodes(self) -> None:
+        collection = Mock()
+        collection.get.return_value = {
+            "documents": ["Variable domain summary", "Program summary"],
+            "metadatas": [
+                {
+                    "program": "PDCBVC", "node_id": "domain:PDCBVC:variable_dataflow",
+                    "hierarchy_level": "domain", "intent_domain": "variable_dataflow",
+                    "chunk_type": "dataflow.used_variables", "source_id": "domain",
+                },
+                {
+                    "program": "PDCBVC", "node_id": "program:PDCBVC",
+                    "hierarchy_level": "program", "intent_domain": "program_summary",
+                    "chunk_type": "program.summary", "source_id": "program",
+                },
+            ],
+        }
+        primary = RetrievalResult(
+            1.0,
+            "WCTRIG evidence",
+            {
+                "program": "PDCBVC", "source_id": "entity",
+                "node_id": "entity:PDCBVC|VARIABLE|WCTRIG",
+                "parent_id": "domain:PDCBVC:variable_dataflow",
+                "domain_parent_id": "domain:PDCBVC:variable_dataflow",
+                "program_parent_id": "program:PDCBVC",
+            },
+        )
+        clear_retrieval_cache()
+        resources = Mock(chroma_collection=collection)
+        with patch("cobol_rag.retrieve.open_index", return_value=resources):
+            expanded = _expand_context(
+                [primary], AppConfig(), program="PDCBVC", entity_key=None,
+                entity_value="WCTRIG", intent="variable_dataflow",
+            )
+        self.assertEqual({item.metadata["source_id"] for item in expanded}, {"domain", "program"})
+        self.assertTrue(all(item.metadata["context_role"] == "parent_context" for item in expanded))
+
+    def test_response_contract_validation_is_mechanical(self) -> None:
+        one_sentence = QueryPlan(response_contract=ResponseContract(format="sentence", max_sentences=1))
+        self.assertTrue(validate_plan_answer(one_sentence, "One supported sentence.").passed)
+        invalid = validate_plan_answer(one_sentence, "First sentence. Second sentence.")
+        self.assertIn("max_sentences_exceeded:2/1", invalid.reasons)
+
+        three_bullets = QueryPlan(
+            response_contract=ResponseContract(format="bullets", exact_item_count=3),
+        )
+        self.assertTrue(validate_plan_answer(three_bullets, "- one\n- two\n- three").passed)
+        self.assertIn(
+            "exact_item_count_mismatch:2/3",
+            validate_plan_answer(three_bullets, "- one\n- two").reasons,
+        )
+
+    def test_high_confidence_plan_rejects_llm_capability_expansion(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="general")
+        plan = build_query_plan(
+            "Explain PDCBVC in three lines.", scope, intent="general",
+        )
+        merged = merge_semantic_plan(plan, {
+            "route": "technical",
+            "intent": "program_summary",
+            "tasks": ["program_summary", "complete_program_flow"],
+            "source_domains": ["program.summary", "controlflow.cfg"],
+            "subtasks": [
+                {"capability": "program_summary", "tasks": ["program_summary"]},
+                {"capability": "control_flow", "tasks": ["complete_program_flow"]},
+            ],
+            "confidence": 0.99,
+        })
+
+        self.assertEqual(merged.tasks, ("program_summary",))
+        self.assertEqual([item.capability for item in merged.subtasks], ["program_summary"])
+        self.assertIn("task_not_authorized:complete_program_flow", merged.policy_rejections)
+        self.assertEqual(execution_strategy_for_plan(merged), "single_claim")
+
+    def test_subtask_keeps_response_contract_but_evidence_validation_ignores_shape(self) -> None:
+        plan = QueryPlan(
+            program="PDCBVC",
+            programs=("PDCBVC",),
+            intent="program_summary",
+            tasks=("program_summary",),
+            response_contract=ResponseContract(max_lines=2),
+        )
+        subtask = EvidenceSubtask(
+            claim_id="claim_1",
+            description="Summarize PDCBVC",
+            capability="program_summary",
+            tasks=("program_summary",),
+        )
+        subplan = plan_for_subtask(plan, subtask)
+        four_lines = "One.\nTwo.\nThree.\nFour."
+
+        self.assertEqual(subplan.response_contract.max_lines, 2)
+        self.assertFalse(validate_plan_answer(subplan, four_lines).passed)
+        self.assertTrue(validate_evidence_answer(subplan, four_lines).passed)
+
+    def test_verified_candidate_is_rendered_to_final_response_contract(self) -> None:
+        source = RetrievalResult(
+            1.0,
+            "PDCBVC is a COBOL CICS program. It has analyzed calls and control flow.",
+            {
+                "source_id": "summary-1",
+                "source_file": "program.summary.json",
+                "chunk_type": "program.summary",
+                "program": "PDCBVC",
+            },
+        )
+        llm = Mock()
+        llm.complete.return_value = Mock(text=(
+            "PDCBVC is a COBOL CICS program. [Source 1]\n"
+            "Its analyzed evidence includes calls and control flow. [Source 1]"
+        ))
+        resources = Mock()
+        resources.runtime.llm = llm
+        plan = QueryPlan(
+            program="PDCBVC",
+            programs=("PDCBVC",),
+            intent="program_summary",
+            tasks=("program_summary",),
+            response_contract=ResponseContract(max_lines=2),
+        )
+        with patch("cobol_rag.query.open_index", return_value=resources):
+            rendered = _render_verified_candidate_to_contract(
+                question="Explain PDCBVC in two lines.",
+                candidate="One.\nTwo.\nThree.",
+                sources=[source],
+                plan=plan,
+                config=AppConfig(),
+            )
+
+        self.assertTrue(rendered.passed)
+        self.assertEqual(len(rendered.answer.splitlines()), 2)
+        self.assertEqual(llm.complete.call_count, 1)
+
+    def test_presentation_return_is_not_a_cobol_return_operation(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="external_programs")
+        plan = build_query_plan(
+            "List PDCBVC external calls; return only target and call type.",
+            scope,
+            intent="external_programs",
+        )
+        self.assertNotIn("RETURN", plan.operations)
+        self.assertEqual(set(plan.output_fields), {"target", "call_type"})
+        self.assertTrue(plan.only_requested_fields)
+
     def test_compound_variable_and_call_request_becomes_independent_subtasks(self) -> None:
         variables = (
             "PXCSEMAF-REQ", "PXCSEMAF-NAME", "PXCSEMAF-AGENT",
@@ -171,6 +383,48 @@ class PromptGroundingTest(unittest.TestCase):
         self.assertEqual(literal_plan.intent, "static_values")
         self.assertEqual(literal_plan.entity_values, variables)
         self.assertNotIn("PXRSEMAF", literal_plan.entity_values)
+
+    def test_final_contract_uses_successful_rerouted_capability_tasks(self) -> None:
+        entity = EntityReference(
+            "PDCBVC", "variable", "STATUS-FIELD", "PDCBVC|VARIABLE|STATUS-FIELD",
+        )
+        original = EvidenceSubtask(
+            claim_id="claim_1",
+            description="Show the condition driven by STATUS-FIELD",
+            capability="condition_outcome",
+            tasks=("control_outcome",),
+            entity_values=("STATUS-FIELD",),
+        )
+        rerouted = replace(
+            original,
+            capability="variable_access",
+            tasks=("variable_reads", "variable_writes"),
+        )
+        parent = QueryPlan(
+            program="PDCBVC",
+            programs=("PDCBVC",),
+            intent="variable_dataflow",
+            tasks=("control_outcome",),
+            entities=(entity,),
+            subtasks=(original,),
+        )
+        result = EvidenceSubtaskResult(
+            subtask=rerouted,
+            plan=plan_for_subtask(parent, rerouted),
+            passed=True,
+            answer=(
+                "STATUS-FIELD direct evidence:\n"
+                "Modified at: line 10.\n"
+                "Tested/read at: line 20."
+            ),
+        )
+
+        effective = _effective_subtask_contract_plan(parent, (result,))
+
+        self.assertNotIn("control_outcome", effective.tasks)
+        self.assertEqual(effective.tasks, ("variable_reads", "variable_writes"))
+        self.assertFalse(validate_plan_answer(parent, result.answer).passed)
+        self.assertTrue(validate_plan_answer(effective, result.answer).passed)
 
     def test_literal_subtask_subsumes_same_entity_write_subtask(self) -> None:
         entity = EntityReference(
@@ -475,6 +729,16 @@ class PromptGroundingTest(unittest.TestCase):
         self.assertEqual(plan.tasks, ("complete_program_flow",))
         self.assertNotIn("after", plan.relations)
 
+    def test_start_to_finish_wording_is_complete_flow_not_a_named_start_path(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="control_flow")
+        plan = build_query_plan(
+            "Walk me through what PDCBVC does from start to finish.",
+            scope,
+            intent="control_flow",
+        )
+        self.assertEqual(plan.tasks, ("complete_program_flow",))
+        self.assertNotIn("starts_at", plan.relations)
+
     def test_production_language_triggers_variable_writes_without_lifecycle_keywords(self) -> None:
         # A variable can be "computed"/"calculated"/"produced" rather than "written" or
         # "set". The deterministic phase-detection must not depend on the LLM router
@@ -513,6 +777,20 @@ class PromptGroundingTest(unittest.TestCase):
         self.assertEqual(plan.tasks, ("call_context",))
         self.assertIn("after", plan.relations)
 
+    def test_call_result_phrase_triggers_post_call_context(self) -> None:
+        entity = EntityReference("PDCBVC", "call", "PXRSEMAF", "PDCBVC|PXRSEMAF|CALL")
+        scope = QueryScope(
+            program="PDCBVC", programs=("PDCBVC",), entities=(entity,),
+            intent="external_programs",
+        )
+        plan = build_query_plan(
+            "What result of the PXRSEMAF call is checked by PDCBVC?",
+            scope,
+            intent="external_programs",
+        )
+        self.assertEqual(plan.tasks, ("call_context",))
+        self.assertIn("after", plan.relations)
+
     def test_call_preparation_language_without_before_triggers_call_context(self) -> None:
         entity = EntityReference("PDCBVC", "call", "PD1FS00", "PDCBVC|PD1FS00|CALL")
         scope = QueryScope(
@@ -542,6 +820,121 @@ class PromptGroundingTest(unittest.TestCase):
         self.assertEqual(plan.subtasks[0].entity_values, ())
         self.assertTrue(_direct_handler_supports(plan))
         self.assertIn("dataflow.used_variables", _chunk_types_for_plan(plan) or [])
+
+    def test_variable_catalogue_preserves_count_limit_and_control_filter(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="variable_inventory")
+        limited = build_query_plan(
+            "Name 10 variables inside PDCBVC.", scope, intent="variable_inventory",
+        )
+        self.assertEqual(limited.response_contract.exact_item_count, 10)
+
+        counted = build_query_plan(
+            "How many variables are inside PDCBVC?", scope, intent="variable_inventory",
+        )
+        self.assertEqual(counted.response_contract.format, "count")
+
+        filtered = build_query_plan(
+            "Which variables control the flow in PDCBVC?", scope, intent="variable_inventory",
+        )
+        self.assertIn("control_usage", filtered.output_fields)
+        self.assertEqual(filtered.result_scope, "all")
+
+        sampled = build_query_plan(
+            "Give me a sample of the fields used in PDCBVC.",
+            scope,
+            intent="variable_inventory",
+        )
+        self.assertEqual(sampled.response_contract.exact_item_count, 10)
+
+    def test_compound_program_summary_and_variable_count_preserves_both_claims(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="variable_inventory")
+        plan = build_query_plan(
+            "Give me a summary of PDCBVC and tell me how many variables it has.",
+            scope,
+            intent="variable_inventory",
+        )
+        self.assertEqual(plan.intent, "program_summary")
+        self.assertEqual(plan.category, "multi_source_synthesis")
+        self.assertEqual(set(plan.tasks), {"program_summary", "variable_inventory"})
+        self.assertIn("item_count", plan.output_fields)
+        self.assertEqual(
+            {subtask.capability for subtask in plan.subtasks},
+            {"program_summary", "variable_inventory"},
+        )
+        self.assertEqual(execution_strategy_for_plan(plan), "agentic")
+
+        merged = merge_semantic_plan(plan, {
+            "route": "technical",
+            "intent": "program_summary",
+            "tasks": ["program_summary", "variable_inventory"],
+            "subtasks": [
+                {
+                    "capability": "program_summary",
+                    "tasks": ["program_summary"],
+                    "output_fields": [],
+                },
+                {
+                    "capability": "variable_inventory",
+                    "tasks": ["variable_inventory"],
+                    "output_fields": ["variables"],
+                },
+            ],
+        })
+        variable_claim = next(
+            subtask for subtask in merged.subtasks
+            if subtask.capability == "variable_inventory"
+        )
+        self.assertIn("item_count", variable_claim.output_fields)
+
+    def test_subtask_composer_hides_internal_claim_language(self) -> None:
+        summary_task = EvidenceSubtask(
+            claim_id="claim_1",
+            description="Summarize the program for PDCBVC",
+            capability="program_summary",
+            tasks=("program_summary",),
+        )
+        variables_task = EvidenceSubtask(
+            claim_id="claim_2",
+            description="Inspect the variable catalogue for PDCBVC",
+            capability="variable_inventory",
+            tasks=("variable_inventory",),
+        )
+        results = (
+            EvidenceSubtaskResult(
+                subtask=summary_task,
+                plan=QueryPlan(tasks=("program_summary",)),
+                passed=True,
+                answer="PDCBVC is an analyzed COBOL CICS program.",
+            ),
+            EvidenceSubtaskResult(
+                subtask=variables_task,
+                plan=QueryPlan(tasks=("variable_inventory",)),
+                passed=True,
+                answer="168",
+            ),
+        )
+        answer, _ = _compose_subtask_results(results)
+        self.assertIn("Program summary", answer)
+        self.assertIn("Variable count\n168 analyzed variables.", answer)
+        self.assertNotIn("Claim 1", answer)
+        self.assertNotIn("Verify", answer)
+
+    def test_variable_continuation_advances_past_the_previous_page(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="general")
+        state = SessionState(
+            current_program="PDCBVC",
+            current_intent="variable_inventory",
+            current_plan={
+                "intent": "variable_inventory",
+                "result_offset": 0,
+                "response_contract": {"exact_item_count": 25},
+            },
+        )
+        plan = build_query_plan(
+            "There is more, show me the rest.", scope, intent="general", state=state,
+        )
+        self.assertEqual(plan.intent, "variable_inventory")
+        self.assertEqual(plan.result_offset, 25)
 
     def test_variable_catalogue_intent_survives_semantic_merge(self) -> None:
         scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="variable_inventory")
@@ -600,6 +993,23 @@ class PromptGroundingTest(unittest.TestCase):
         quality_claims = [item for item in merged.subtasks if item.capability == "quality_evidence"]
         self.assertEqual(len(quality_claims), 1)
         self.assertEqual(set(quality_claims[0].tasks), {"commented_code", "unreachable_code"})
+
+    def test_access_and_lineage_for_one_variable_collapse_into_one_execution(self) -> None:
+        entity = EntityReference("PDCBVC", "variable", "NPAGT", "PDCBVC|VARIABLE|NPAGT")
+        scope = QueryScope(
+            program="PDCBVC", programs=("PDCBVC",), entities=(entity,),
+            intent="variable_dataflow",
+        )
+        plan = build_query_plan(
+            "Tell me everything about NPAGT in PDCBVC.", scope,
+            intent="variable_dataflow",
+        )
+        self.assertIn("variable_lineage", plan.tasks)
+        matching = [
+            item for item in plan.subtasks
+            if item.capability in {"variable_access", "variable_lineage"}
+        ]
+        self.assertEqual(len(matching), 1)
 
     def test_distinct_capabilities_are_not_collapsed_by_the_merge_guardrail(self) -> None:
         # Genuinely separate whole-program requests must stay independent claims.
@@ -1003,6 +1413,110 @@ class PromptGroundingTest(unittest.TestCase):
         )
         self.assertTrue(validation.passed, validation.reasons)
 
+    def test_describe_named_program_builds_a_typed_summary_plan(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="general")
+        plan = build_query_plan(
+            "Describe PDCBVC in one sentence only.", scope, intent="general",
+        )
+        self.assertEqual(plan.intent, "program_summary")
+        self.assertEqual(plan.tasks, ("program_summary",))
+        self.assertEqual(plan.response_contract.max_sentences, 1)
+
+    def test_what_is_named_program_builds_summary_instead_of_dataset_plan(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="datasets_tables")
+        plan = build_query_plan("What is PDCBVC?", scope, intent="datasets_tables")
+        self.assertEqual(plan.intent, "program_summary")
+        self.assertEqual(plan.tasks, ("program_summary",))
+        self.assertEqual(plan.operations, ("describe",))
+
+    def test_named_program_file_existence_is_not_jcl_file_io(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="datasets_tables")
+        plan = build_query_plan(
+            "You have a file called PDCBVC?", scope, intent="datasets_tables",
+        )
+        self.assertEqual(plan.intent, "program_summary")
+        self.assertEqual(plan.tasks, ("program_summary",))
+        self.assertIn("exists", plan.operations)
+        self.assertNotIn("jcl.file_io", plan.source_domains)
+
+    def test_two_lines_is_response_shape_not_source_location(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="general")
+        plan = build_query_plan("Explain PDCBVC in two lines.", scope, intent="general")
+        self.assertEqual(plan.intent, "program_summary")
+        self.assertEqual(plan.response_contract.max_lines, 2)
+        self.assertNotIn("source_line", plan.output_fields)
+
+    def test_conflicting_semantic_tasks_cannot_poison_typed_summary_plan(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="general")
+        plan = build_query_plan(
+            "Describe PDCBVC in one sentence only.", scope, intent="general",
+        )
+        merged = merge_semantic_plan(plan, {
+            "route": "technical",
+            "intent": "variable_dataflow",
+            "domain": "dataflow",
+            "tasks": ["variable_definition", "variable_reads", "variable_writes"],
+            "subtasks": [{
+                "capability": "variable_access",
+                "tasks": ["variable_definition", "variable_reads", "variable_writes"],
+            }],
+            "confidence": 0.6,
+        })
+        self.assertEqual(merged.intent, "program_summary")
+        self.assertEqual(merged.tasks, ("program_summary",))
+        self.assertEqual(tuple(task.capability for task in merged.subtasks), ("program_summary",))
+
+    def test_literal_assignment_wording_builds_static_value_plan(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="general")
+        plan = build_query_plan(
+            "Return exactly the first 3 literal assignments in PDCBVC.",
+            scope,
+            intent="general",
+        )
+        self.assertEqual(plan.intent, "static_values")
+        self.assertEqual(plan.tasks, ("literal_assignments",))
+        self.assertEqual(plan.response_contract.exact_item_count, 3)
+
+    def test_leading_return_is_presentation_not_cics_operation(self) -> None:
+        scope = QueryScope(
+            program="PDCBVC", programs=("PDCBVC",), intent="external_programs",
+        )
+        plan = build_query_plan(
+            "Return every external program called by PDCBVC as a JSON array with only target and call type.",
+            scope,
+            intent="external_programs",
+        )
+        self.assertNotIn("RETURN", plan.operations)
+        self.assertTrue(plan.only_requested_fields)
+        self.assertEqual(plan.output_fields, ("target", "call_type"))
+        self.assertEqual(plan.response_contract.format, "json_array")
+
+    def test_semantic_subtask_must_match_typed_variable_tasks(self) -> None:
+        scope = QueryScope(
+            program="PDCBVC",
+            programs=("PDCBVC",),
+            entities=(EntityReference(
+                program="PDCBVC", entity_type="variable", value="WDATE2-GG",
+                entity_key="PDCBVC|VARIABLE|WDATE2-GG",
+            ),),
+            intent="variable_dataflow",
+        )
+        plan = build_query_plan(
+            "What is WDATE2-GG? Include its declaration and parent group.",
+            scope,
+            intent="variable_dataflow",
+        )
+        merged = merge_semantic_plan(plan, {
+            "route": "technical",
+            "intent": "variable_dataflow",
+            "tasks": ["variable_definition"],
+            "subtasks": [
+                {"capability": "variable_access", "tasks": ["variable_definition"]},
+                {"capability": "db2_evidence", "tasks": ["db2_tables"]},
+            ],
+        })
+        self.assertNotIn("db2_evidence", tuple(task.capability for task in merged.subtasks))
+
     def test_entity_answers_still_require_the_requested_source_line(self) -> None:
         plan = QueryPlan(
             program="PDCBVC", programs=("PDCBVC",), intent="variable_dataflow",
@@ -1185,6 +1699,14 @@ class PromptGroundingTest(unittest.TestCase):
         scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="general")
         plan = build_query_plan(
             "Explain the pagination logic in PDCBVC using direct evidence.", scope, intent="general",
+        )
+        self.assertEqual(plan.intent, "control_flow")
+        self.assertEqual(plan.tasks, ("pagination_logic",))
+
+    def test_natural_paging_phrase_builds_the_same_pagination_task(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="general")
+        plan = build_query_plan(
+            "Explain how PDCBVC moves through the result pages.", scope, intent="general",
         )
         self.assertEqual(plan.intent, "control_flow")
         self.assertEqual(plan.tasks, ("pagination_logic",))
@@ -1814,6 +2336,62 @@ class SectionContractAcceptsRendererVocabularyTest(unittest.TestCase):
         self.assertIn("exhaustive_result_truncated", validate_plan_answer(plan, answer).reasons)
 
 
+class TechnicalAnswerabilityGateTest(unittest.TestCase):
+    def test_semantically_incoherent_relation_is_rejected(self) -> None:
+        llm = Mock()
+        llm.complete.return_value = Mock(text=json.dumps({
+            "answerable": False,
+            "reason": "color/time relation has no COBOL evidence meaning",
+            "capability": "",
+        }))
+        with patch("cobol_rag.query.build_llm", return_value=llm):
+            answerable, reason = _assess_technical_answerability(
+                "Which paragraph is the blue value of PDCBVC before yesterday?",
+                AppConfig(), QueryScope(program="PDCBVC"),
+            )
+        self.assertFalse(answerable)
+        self.assertIn("no COBOL evidence meaning", reason)
+
+    def test_coherent_broad_cics_request_is_accepted(self) -> None:
+        llm = Mock()
+        llm.complete.return_value = Mock(text=json.dumps({
+            "answerable": True,
+            "reason": "maps to CICS operations",
+            "capability": "cics_evidence",
+        }))
+        with patch("cobol_rag.query.build_llm", return_value=llm):
+            answerable, _ = _assess_technical_answerability(
+                "Find the CICS commands executed by PDCBVC.",
+                AppConfig(), QueryScope(program="PDCBVC"),
+            )
+        self.assertTrue(answerable)
+
+    def test_typed_retrieval_includes_normalized_evidence_view(self) -> None:
+        plan = QueryPlan(
+            route="technical", intent="variable_dataflow", domain="dataflow",
+            tasks=("variable_reads",),
+            source_domains=("dataflow.variable",),
+        )
+        self.assertIn("evidence.normalized", _chunk_types_for_plan(plan))
+
+    def test_natural_external_call_inventory_wording_has_a_typed_task(self) -> None:
+        plan = build_query_plan(
+            "Which programs does PDCBVC call?",
+            QueryScope(program="PDCBVC", programs=("PDCBVC",)),
+        )
+        self.assertEqual(plan.intent, "external_programs")
+        self.assertEqual(plan.tasks, ("external_calls",))
+
+    def test_exact_line_qualifier_does_not_hide_program_summary_intent(self) -> None:
+        plan = build_query_plan(
+            "Explain PDCBVC in exactly three lines.",
+            QueryScope(program="PDCBVC", programs=("PDCBVC",)),
+        )
+        self.assertEqual(plan.intent, "program_summary")
+        self.assertEqual(plan.tasks, ("program_summary",))
+        self.assertEqual(plan.response_contract.exact_lines, 3)
+
+
 class OffEntityClaimReroutingTest(unittest.TestCase):
     """A claim whose evidence is off-entity is retried against another capability."""
 
@@ -1955,11 +2533,10 @@ class OffEntityClaimReroutingTest(unittest.TestCase):
 
         retrieve_for_plan.assert_called_once()
 
-    def test_a_confidently_ranked_capability_no_claim_uses_is_added(self) -> None:
-        # Each claim is validated only against its own capability, so a plan that
-        # collects the wrong evidence can pass every contract while never
-        # answering the question. Asking for CICS commands returned verified
-        # control flow that listed no CICS command.
+    def test_a_confidently_ranked_capability_recompiles_a_weak_plan(self) -> None:
+        # A weak semantic plan and an independent confident capability vote must
+        # not become two unrelated claims. The compiler corrects the plan to the
+        # evidence capability that can answer the request.
         plan = QueryPlan(
             program="PDCBVC", programs=("PDCBVC",), route="technical",
             intent="control_flow", domain="control_flow",
@@ -1979,11 +2556,53 @@ class OffEntityClaimReroutingTest(unittest.TestCase):
             )
 
         self.assertEqual(
-            [s.capability for s in supplemented.subtasks], ["control_flow", "cics_evidence"],
+            [s.capability for s in supplemented.subtasks], ["cics_evidence"],
         )
-        # Added, never substituted: a confident but wrong ranking costs one extra
-        # claim rather than displacing a correct one.
-        self.assertEqual(supplemented.subtasks[0].capability, "control_flow")
+        self.assertEqual(supplemented.intent, "cics_operations")
+        self.assertIn("semantic_claims_recompiled", supplemented.policy_rejections[0])
+
+    def test_capability_compiler_removes_relations_the_selected_handler_cannot_execute(self) -> None:
+        call = EntityReference("PDCBVC", "call", "PXRSEMAF", "PDCBVC|PXRSEMAF|CALL")
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), route="technical",
+            intent="external_programs", domain="integration", authority_confidence=0.7,
+            tasks=("call_context",), entities=(call,),
+            relations=("before", "after", "writes", "contains", "starts_at"),
+            subtasks=(EvidenceSubtask(
+                claim_id="claim_1", description="confused semantic claim",
+                capability="variable_access", tasks=("variable_writes",),
+                entity_values=("PXRSEMAF",),
+            ),),
+        )
+        with patch(
+            "cobol_rag.query._rank_question_capabilities",
+            return_value=(CapabilityMatch("call_context", 0.82, 0.12),),
+        ):
+            result = _supplement_missing_capability(
+                "Which fields are filled in ahead of the PXRSEMAF call?",
+                Mock(), QueryScope(program="PDCBVC", entities=(call,)), plan,
+            )
+        self.assertEqual(result.relations, ("before",))
+        self.assertTrue(_direct_handler_supports(result))
+
+    def test_semantic_confidence_cannot_promote_itself_to_typed_authority(self) -> None:
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), route="technical",
+            intent="control_flow", domain="control_flow",
+            confidence=0.99, authority_confidence=0.45,
+            subtasks=(EvidenceSubtask(
+                claim_id="claim_1", description="semantic control-flow guess",
+                capability="control_flow", tasks=("complete_program_flow",),
+            ),),
+        )
+        with patch(
+            "cobol_rag.query._rank_question_capabilities",
+            return_value=(CapabilityMatch("cics_evidence", 0.77, 0.09),),
+        ):
+            result = _supplement_missing_capability(
+                "Find all CICS commands.", Mock(), QueryScope(program="PDCBVC"), plan,
+            )
+        self.assertEqual(result.subtasks[0].capability, "cics_evidence")
 
     def test_agreement_between_planner_and_ranking_changes_nothing(self) -> None:
         plan = QueryPlan(
@@ -2002,6 +2621,71 @@ class OffEntityClaimReroutingTest(unittest.TestCase):
             self.assertEqual(
                 _supplement_missing_capability("q", Mock(), None, plan).subtasks, plan.subtasks,
             )
+
+    def test_program_wide_similarity_does_not_pollute_named_variable_claim(self) -> None:
+        variable = EntityReference(
+            program="PDCBVC", entity_type="variable", value="WDATE2-GG",
+            entity_key="PDCBVC|VARIABLE|WDATE2-GG",
+        )
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), route="technical",
+            intent="variable_dataflow", domain="dataflow",
+            tasks=("variable_definition",), entities=(variable,),
+            subtasks=(EvidenceSubtask(
+                claim_id="claim_1", description="Verify variable access",
+                capability="variable_access", tasks=("variable_definition",),
+                entity_values=("WDATE2-GG",),
+            ),),
+        )
+        with patch(
+            "cobol_rag.query._rank_question_capabilities",
+            return_value=(CapabilityMatch("db2_evidence", 0.77, 0.09),),
+        ):
+            result = _supplement_missing_capability(
+                "Include its declaration and parent group.", Mock(),
+                QueryScope(program="PDCBVC", entities=(variable,)), plan,
+            )
+        self.assertEqual(result.subtasks, plan.subtasks)
+
+    def test_variable_refinement_preserves_explicit_declaration_task(self) -> None:
+        variable = EntityReference(
+            program="PDCBVC", entity_type="variable", value="WDATE2-GG",
+            entity_key="PDCBVC|VARIABLE|WDATE2-GG",
+        )
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), route="technical",
+            intent="variable_dataflow", domain="dataflow",
+            tasks=("variable_definition",), entities=(variable,),
+        )
+        with (
+            patch("cobol_rag.query.router_for", return_value=Mock(rank_aspects=lambda q: ())),
+            patch("cobol_rag.query.confident_aspects", return_value=()),
+            patch("cobol_rag.query._resolve_dataflow_direction", return_value="reads"),
+        ):
+            result = _refine_variable_tasks(
+                "What is WDATE2-GG? Include its declaration and parent group.", Mock(), plan,
+            )
+        self.assertIn("variable_definition", result.tasks)
+        self.assertIn("variable_reads", result.tasks)
+
+    def test_variable_refinement_respects_an_explicit_read_only_followup(self) -> None:
+        variable = EntityReference(
+            program="PDCBVC", entity_type="variable", value="NPAGT",
+            entity_key="PDCBVC|VARIABLE|NPAGT",
+        )
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), route="technical",
+            intent="variable_dataflow", domain="dataflow",
+            tasks=("variable_reads",), entities=(variable,),
+        )
+        with (
+            patch("cobol_rag.query.router_for", return_value=Mock(rank_aspects=lambda q: ())),
+            patch("cobol_rag.query.confident_aspects", return_value=("variable_writes",)),
+            patch("cobol_rag.query._resolve_dataflow_direction", return_value="both"),
+        ):
+            result = _refine_variable_tasks("And where is it tested?", Mock(), plan)
+        self.assertIn("variable_reads", result.tasks)
+        self.assertNotIn("variable_writes", result.tasks)
 
     def test_an_unconfident_ranking_adds_nothing(self) -> None:
         plan = QueryPlan(

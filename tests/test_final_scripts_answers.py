@@ -13,9 +13,15 @@ from cobol_rag.final_scripts_answers import (
     program_from_question,
 )
 from cobol_rag.config import AppConfig
-from cobol_rag.query import QueryRoutingDecision, answer_query, _deterministic_routing
+from cobol_rag.query import (
+    QueryRoutingDecision,
+    _deterministic_routing,
+    _final_script_sources,
+    answer_query,
+)
 from cobol_rag.query_plan import (
     QueryPlan,
+    ResponseContract,
     build_query_plan,
     merge_semantic_plan,
     validate_plan_answer,
@@ -141,6 +147,18 @@ class FinalScriptsAnswersTest(unittest.TestCase):
                     "modified_in": [],
                     "used_in": ["PREP-RIGA"],
                     "controls_flow": False,
+                    "relationships": {
+                        "parents": ["WDATE2"],
+                        "children": [],
+                        "redefines": [],
+                        "redefined_by": [],
+                        "declarations": [{
+                            "line_start": 118,
+                            "statement": "05 WDATE2-GG PIC 9(02).",
+                            "source_file": "PDCBVC.CBL",
+                            "level": 5,
+                        }],
+                    },
                     "evidence": {
                         "write_sites": [],
                         "read_sites": [
@@ -514,6 +532,94 @@ class FinalScriptsAnswersTest(unittest.TestCase):
         self.assertNotIn("Showing the first", answer)
         self.assertTrue(validate_plan_answer(plan, answer).passed)
 
+    def test_variable_catalogue_honors_exact_count_count_only_and_offset(self) -> None:
+        self._write_json(
+            "dataflow.used_variables.json",
+            {
+                "type": "dataflow.used_variables",
+                "program": "PDCBVC",
+                "variables": [
+                    {
+                        "variable": f"FIELD-{index:03d}",
+                        "origin": "WORKING-STORAGE",
+                        "controls_flow": index % 3 == 0,
+                    }
+                    for index in range(40)
+                ],
+            },
+        )
+        exact_plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent="variable_inventory",
+            tasks=("variable_inventory",),
+            response_contract=ResponseContract(exact_item_count=10),
+        )
+        exact = answer_from_final_scripts("Name 10 variables in PDCBVC.", plan=exact_plan)
+        assert exact is not None
+        self.assertEqual(sum(line.startswith("- FIELD-") for line in exact.splitlines()), 10)
+        self.assertNotIn("FIELD-010", exact)
+
+        count_plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent="variable_inventory",
+            tasks=("variable_inventory",),
+            response_contract=ResponseContract(format="count"),
+        )
+        self.assertEqual(
+            answer_from_final_scripts("How many variables are in PDCBVC?", plan=count_plan),
+            "40",
+        )
+
+        compound_count_plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent="variable_inventory",
+            tasks=("variable_inventory",), output_fields=("item_count",),
+        )
+        self.assertEqual(
+            answer_from_final_scripts(
+                "Summarize PDCBVC and tell me how many variables it has.",
+                plan=compound_count_plan,
+            ),
+            "40",
+        )
+
+        continuation_plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent="variable_inventory",
+            tasks=("variable_inventory",), result_offset=25,
+            response_contract=ResponseContract(exact_item_count=15),
+        )
+        continuation = answer_from_final_scripts(
+            "There is more, show me the rest.", plan=continuation_plan,
+        )
+        assert continuation is not None
+        self.assertIn("FIELD-025", continuation)
+        self.assertIn("FIELD-039", continuation)
+        self.assertNotIn("FIELD-000", continuation)
+
+    def test_variable_catalogue_filters_to_control_variables(self) -> None:
+        self._write_json(
+            "dataflow.used_variables.json",
+            {
+                "type": "dataflow.used_variables",
+                "program": "PDCBVC",
+                "variables": [
+                    {"variable": "CONTROL-A", "controls_flow": True},
+                    {"variable": "DATA-A", "controls_flow": False},
+                    {"variable": "CONTROL-B", "controls_flow": True},
+                ],
+            },
+        )
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent="variable_inventory",
+            tasks=("variable_inventory",), output_fields=("control_usage",),
+            result_scope="all",
+        )
+        answer = answer_from_final_scripts(
+            "Which variables control the flow in PDCBVC?", plan=plan,
+        )
+        assert answer is not None
+        self.assertIn("CONTROL-A", answer)
+        self.assertIn("CONTROL-B", answer)
+        self.assertNotIn("DATA-A", answer)
+        self.assertTrue(validate_plan_answer(plan, answer).passed)
+
     def test_program_detection_uses_programs_present_in_artifacts(self) -> None:
         question = "List the business rules implemented by PDCBVC using direct evidence."
         self.assertEqual(program_from_question(question, self.root), "PDCBVC")
@@ -687,6 +793,59 @@ class FinalScriptsAnswersTest(unittest.TestCase):
         self.assertIn("controlflow.cfg.json", answer)
         self.assertIn("architecture.cics_operations.json", answer)
 
+    def test_pagination_question_joins_page_count_and_navigation_evidence(self) -> None:
+        self._write_json(
+            "dataflow.variable/dataflow.variable.NPAGT.json",
+            {
+                "program": "PDCBVC",
+                "content": {
+                    "variable": "NPAGT",
+                    "evidence": {
+                        "write_sites": [
+                            {"paragraph": "CALCOLA-NPAG", "line_start": 397, "statement": "DIVIDE NUMREC BY 15 GIVING NPAGT REMAINDER RESTO"},
+                            {"paragraph": "CALCOLA-NPAG", "line_start": 399, "statement": "ADD 1 TO NPAGT"},
+                        ]
+                    },
+                },
+            },
+        )
+        self._write_json(
+            "dataflow.variable/dataflow.variable.WCTPAG.json",
+            {
+                "program": "PDCBVC",
+                "content": {
+                    "variable": "WCTPAG",
+                    "evidence": {
+                        "write_sites": [
+                            {"paragraph": "BROWSE-FASE2", "line_start": 297, "statement": "MOVE TWCOB-PAG TO WCTPAG"},
+                            {"paragraph": "BROWSE-FASE2-PF7", "line_start": 333, "statement": "SUBTRACT 2 FROM WCTPAG"},
+                            {"paragraph": "BROWSE-FASE2-PF8", "line_start": 339, "statement": "MOVE ZERO TO WCTPAG"},
+                            {"paragraph": "BROWSE-FASE2-VISUAL", "line_start": 382, "statement": "MOVE WCTPAG TO TWCOB-PAG"},
+                        ],
+                        "read_sites": [
+                            {"paragraph": "BROWSE-FASE2-ENTER", "line_start": 325, "statement": "IF WCTPAG < NPAGT"},
+                            {"paragraph": "BROWSE-FASE2-PF7", "line_start": 331, "statement": "IF WCTPAG > 1"},
+                            {"paragraph": "BROWSE-FASE2-PF8", "line_start": 337, "statement": "IF WCTPAG = ZERO"},
+                        ],
+                    },
+                },
+            },
+        )
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent="control_flow",
+            tasks=("pagination_logic",),
+        )
+        answer = answer_from_final_scripts(
+            "Explain how PDCBVC moves through the result pages.", plan=plan,
+        )
+        assert answer is not None
+        self.assertIn("Page count", answer)
+        self.assertIn("line 397", answer)
+        self.assertIn("WCTPAG", answer)
+        self.assertIn("NPAGT", answer)
+        self.assertIn("PF7", answer)
+        self.assertIn("PF8", answer)
+
     def test_cics_commands_have_paragraphs_and_physical_lines(self) -> None:
         answer = answer_from_final_scripts(
             "Which CICS commands does PDCBVC execute, and where is each command used?"
@@ -833,6 +992,145 @@ class FinalScriptsAnswersTest(unittest.TestCase):
         self.assertNotIn("C:\\", answer)
         self.assertNotIn("discovered from MAPA", answer)
         self.assertNotIn(".CBL", answer)
+
+    def test_variable_definition_uses_typed_declaration_evidence(self) -> None:
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent="variable_dataflow",
+            tasks=("variable_definition",), operations=("describe",),
+            entities=(EntityReference(
+                "PDCBVC", "variable", "WDATE2-GG", "PDCBVC|VARIABLE|WDATE2-GG",
+            ),),
+        )
+        answer = answer_from_final_scripts("What is WDATE2-GG in PDCBVC?", plan=plan)
+        assert answer is not None
+        self.assertIn("PDCBVC.CBL line 118, level 5", answer)
+        self.assertIn("05 WDATE2-GG PIC 9(02)", answer)
+        self.assertIn("Parent group(s): WDATE2", answer)
+        self.assertNotIn("Declaration details such as level number and PIC are not present", answer)
+
+    def test_program_summary_honours_one_sentence_contract(self) -> None:
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent="program_summary",
+            tasks=("program_summary",),
+            response_contract=ResponseContract(format="sentence", max_sentences=1),
+        )
+        answer = answer_from_final_scripts(
+            "Describe PDCBVC in one sentence only.", plan=plan,
+        )
+        assert answer is not None
+        self.assertTrue(validate_plan_answer(plan, answer).passed)
+        self.assertNotIn("\n", answer)
+
+    def test_program_summary_honours_word_budget(self) -> None:
+        plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent="program_summary",
+            tasks=("program_summary",),
+            response_contract=ResponseContract(
+                format="sentence", max_sentences=1, max_words=12,
+            ),
+        )
+        answer = answer_from_final_scripts(
+            "Describe PDCBVC in one sentence using at most 12 words.", plan=plan,
+        )
+        assert answer is not None
+        self.assertTrue(validate_plan_answer(plan, answer).passed)
+
+    def test_program_summary_honours_two_line_contract(self) -> None:
+        plan = build_query_plan(
+            "Explain PDCBVC in two lines.",
+            QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="general"),
+            intent="general",
+        )
+        answer = answer_from_final_scripts("Explain PDCBVC in two lines.", plan=plan)
+        assert answer is not None
+        self.assertEqual(len([line for line in answer.splitlines() if line.strip()]), 2)
+        self.assertTrue(validate_plan_answer(plan, answer).passed)
+        self.assertIn("CICS online program", answer)
+
+    def test_program_summary_honours_exact_three_line_contract(self) -> None:
+        plan = build_query_plan(
+            "Explain PDCBVC in three lines.",
+            QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="general"),
+            intent="general",
+        )
+        answer = answer_from_final_scripts("Explain PDCBVC in three lines.", plan=plan)
+        assert answer is not None
+        self.assertEqual(len([line for line in answer.splitlines() if line.strip()]), 3)
+        self.assertTrue(validate_plan_answer(plan, answer).passed)
+
+    def test_compact_program_summary_keeps_multi_artifact_provenance(self) -> None:
+        plan = build_query_plan(
+            "Explain PDCBVC in two lines.",
+            QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="general"),
+            intent="general",
+        )
+        answer = answer_from_final_scripts("Explain PDCBVC in two lines.", plan=plan)
+        assert answer is not None
+        sources = _final_script_sources(answer, "PDCBVC", plan)
+        source_files = {source.metadata["source_file"] for source in sources}
+
+        self.assertIn("program.summary.json", source_files)
+        self.assertIn("architecture.call_parameters.json", source_files)
+        self.assertIn("architecture.cics_operations.json", source_files)
+
+    def test_named_program_existence_returns_yes_from_corpus_evidence(self) -> None:
+        plan = build_query_plan(
+            "You have a file called PDCBVC?",
+            QueryScope(
+                program="PDCBVC", programs=("PDCBVC",), intent="datasets_tables",
+            ),
+            intent="datasets_tables",
+        )
+        answer = answer_from_final_scripts("You have a file called PDCBVC?", plan=plan)
+        assert answer is not None
+        self.assertTrue(answer.startswith("Yes."))
+        self.assertIn("PDCBVC", answer)
+        self.assertNotIn("JCL", answer)
+
+    def test_literal_assignments_honour_exact_first_three_contract(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC"), intent="static_values")
+        plan = build_query_plan(
+            "Return exactly the first 3 literal assignments in PDCBVC.",
+            scope,
+            intent="static_values",
+        )
+        answer = answer_from_final_scripts(
+            "Return exactly the first 3 literal assignments in PDCBVC.", plan=plan,
+        )
+        assert answer is not None
+        self.assertEqual(sum(line.startswith("- line ") for line in answer.splitlines()), 3)
+        self.assertTrue(validate_plan_answer(plan, answer).passed)
+
+    def test_inventory_handlers_honour_count_and_json_contracts(self) -> None:
+        count_contract = ResponseContract(format="count", only_requested_content=True)
+        copybook_plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent="copybooks",
+            tasks=("copybook_inventory",), response_contract=count_contract,
+        )
+        self.assertEqual(
+            answer_from_final_scripts("How many copybooks? Return only the count.", plan=copybook_plan),
+            "2",
+        )
+
+        cics_plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent="cics_operations",
+            tasks=("cics_operations",),
+            response_contract=ResponseContract(format="json_array", only_requested_content=True),
+        )
+        cics_answer = answer_from_final_scripts("Return CICS operations as a JSON array only.", plan=cics_plan)
+        assert cics_answer is not None
+        self.assertEqual(len(json.loads(cics_answer)), 2)
+        self.assertTrue(validate_plan_answer(cics_plan, cics_answer).passed)
+
+        rule_plan = QueryPlan(
+            program="PDCBVC", programs=("PDCBVC",), intent="business_rules",
+            tasks=("business_rules",),
+            response_contract=ResponseContract(format="count", only_requested_content=True),
+        )
+        self.assertEqual(
+            answer_from_final_scripts("How many business rules? Count only.", plan=rule_plan),
+            "2",
+        )
 
     def test_program_summary_reports_disagreeing_paragraph_counts_from_both_analyzers(self) -> None:
         # MAPA and the control-flow graph disagree on PDCBVC (14 versus 65).

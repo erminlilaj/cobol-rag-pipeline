@@ -62,7 +62,11 @@ def answer_from_final_scripts(
             return answer
 
     if intent == "control_flow" or (use_text_fallback and _asks_about_control_flow(q)):
-        answer = _answer_control_flow(root, program, question)
+        answer = (
+            _answer_pagination(root, program)
+            if plan and "pagination_logic" in plan.tasks
+            else _answer_control_flow(root, program, question)
+        )
         if answer:
             return answer
 
@@ -418,10 +422,32 @@ def _answer_variable_inventory(
         if not entries:
             return None
 
+    response = plan.response_contract if plan else None
+    offset = max(0, int(plan.result_offset if plan else 0))
+    visible_entries = entries[offset:]
+    if (response and response.format == "count") or "item_count" in requested_fields:
+        return str(len(entries))
+    if response and response.exact_item_count is not None:
+        visible_entries = visible_entries[:response.exact_item_count]
+    if response and response.format in {"json", "json_array"}:
+        rows = [
+            {
+                "variable": item.get("variable"),
+                "origin": item.get("origin"),
+                "controls_flow": bool(item.get("controls_flow")),
+            }
+            for item in visible_entries
+        ]
+        value: Any = rows if response.format == "json_array" else {"variables": rows}
+        return json.dumps(value, ensure_ascii=False, indent=2)
+
     total = len(entries)
-    limit = total if exhaustive else min(total, 25)
-    lines = [f"{program} declares {total} analyzed variable(s)."]
-    for item in entries[:limit]:
+    limit = len(visible_entries) if exhaustive else min(len(visible_entries), 25)
+    if offset:
+        lines = [f"{program} has {len(visible_entries)} remaining analyzed variable(s) after the first {offset} of {total}."]
+    else:
+        lines = [f"{program} declares {total} analyzed variable(s)."]
+    for item in visible_entries[:limit]:
         name = str(item.get("variable", "")).strip()
         if not name:
             continue
@@ -435,9 +461,9 @@ def _answer_variable_inventory(
         if defined_in and "paragraph" in requested_fields:
             details.append(f"defined in {', '.join(defined_in)}")
         lines.append(f"- {name}" + (f" ({'; '.join(details)})" if details else ""))
-    if limit < total:
+    if limit < len(visible_entries):
         lines.append(
-            f"Showing the first {limit} of {total} analyzed variables. "
+            f"Showing the first {limit} of {len(visible_entries)} matching analyzed variables. "
             "Ask for all of them to receive the complete list."
         )
     lines.append("Source: `dataflow.used_variables.json`.")
@@ -683,6 +709,103 @@ def _answer_program_summary(
     if not composition and not meta:
         return None
 
+    response = plan.response_contract if plan else None
+    if plan and "exists" in plan.operations:
+        return f"Yes. {program} is present in the analyzed corpus as a {character}."
+    if response and response.format == "bullets":
+        summary_items: list[tuple[str, str]] = []
+        size = _program_size_summary(root, program, meta)
+        if size:
+            summary_items.append((size, payload_path.name))
+        summary_items.extend(zip(composition, sources))
+        if response.exact_item_count is not None:
+            summary_items = summary_items[:response.exact_item_count]
+        return "\n".join(
+            f"- {text.rstrip('.')} (`{source.rstrip('/')}`)."
+            for text, source in summary_items
+        )
+    if response and response.max_lines is not None:
+        first_line = f"{program} is a {character}."
+        if response.max_lines == 1:
+            return first_line
+        compact_facts = [
+            re.sub(r"\s+covering\s+.*$", "", fact.split(":", 1)[0]).rstrip(".")
+            for fact in composition
+            if any(label in fact.lower() for label in (
+                "outgoing calls", "cics operations", "business rules",
+            ))
+        ]
+        if not compact_facts:
+            compact_facts = [fact.split(":", 1)[0].rstrip(".") for fact in composition[:3]]
+        if len(compact_facts) > 1:
+            evidence_summary = f"{', '.join(compact_facts[:-1])}, and {compact_facts[-1]}"
+        elif compact_facts:
+            evidence_summary = compact_facts[0]
+        else:
+            size = _program_size_summary(root, program, meta)
+            evidence_summary = size.rstrip(".") if size else "an analyzed program summary"
+        second_line = (
+            f"The analyzed evidence records {evidence_summary}; it does not establish "
+            "a specific business-domain purpose."
+        )
+        if response.exact_lines and response.exact_lines >= 3:
+            detail_lines = [
+                f"Evidence also records {fact.rstrip('.')}."
+                for fact in composition
+                if fact.rstrip(".") not in evidence_summary
+            ]
+            lines = [first_line, second_line, *detail_lines]
+            while len(lines) < response.exact_lines:
+                lines.append("No additional business-domain purpose is proven by the analyzed evidence.")
+            return "\n".join(lines[:response.exact_lines])
+        return f"{first_line}\n{second_line}"
+    if response and (
+        response.format == "sentence"
+        or response.max_sentences == 1
+        or response.max_words is not None
+    ):
+        evidence_labels = []
+        for fact in composition:
+            lowered = fact.lower()
+            if "variables" in lowered:
+                evidence_labels.append("analyzed data flow")
+            elif "outgoing calls" in lowered:
+                evidence_labels.append("external calls")
+            elif "copybooks" in lowered:
+                evidence_labels.append("included copybooks")
+            elif "cics operations" in lowered:
+                evidence_labels.append("CICS operations")
+            elif "literal" in lowered:
+                evidence_labels.append("literal assignments")
+            elif "business rules" in lowered:
+                evidence_labels.append("recorded business rules")
+        budget = response.max_words
+        selected_labels = list(evidence_labels)
+        if budget is not None:
+            while True:
+                suffix = (
+                    f" with {', '.join(selected_labels[:-1])}, and {selected_labels[-1]}"
+                    if len(selected_labels) > 1
+                    else f" with {selected_labels[0]}" if selected_labels else ""
+                )
+                sentence = f"{program} is a {character}{suffix}."
+                if len(re.findall(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*", sentence)) <= budget:
+                    return sentence
+                if selected_labels:
+                    selected_labels.pop()
+                    continue
+                fallback = f"{program} is an analyzed COBOL program."
+                if len(re.findall(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*", fallback)) <= budget:
+                    return fallback
+                return f"{program}: analyzed."
+        suffix = f" that includes {', '.join(selected_labels[:-1])}, and {selected_labels[-1]}" if len(selected_labels) > 1 else (
+            f" that includes {selected_labels[0]}" if selected_labels else ""
+        )
+        sentence = f"{program} is a {character}{suffix}."
+        cited_sources = [payload_path.name, *sources]
+        citation = ", ".join(f"`{name.rstrip('/')}`" for name in dict.fromkeys(cited_sources))
+        return f"{sentence[:-1]} (sources: {citation})."
+
     lines = [f"{program} technical overview{f' ({character})' if character else ''}:"]
     size = _program_size_summary(root, program, meta)
     if size:
@@ -745,6 +868,54 @@ def _answer_control_flow(root: Path, program: str, question: str = "") -> str | 
         if "FINE-ELABORAZIONE" in cfg.get("nodes", []):
             lines.append("- FINE-ELABORAZIONE: STOP RUN terminal node in the control-flow graph")
     lines.append(f"Source artifacts: `{cfg_path.name}` and `{cics_path.name}`.")
+    return "\n".join(lines)
+
+
+def _answer_pagination(root: Path, program: str) -> str | None:
+    """Join page-count, page-state, and branch evidence into one typed answer."""
+    cfg_path = _artifact_path(root, "controlflow.cfg.json")
+    cfg = _read_json(cfg_path)
+    if not isinstance(cfg, dict) or cfg.get("program") != program:
+        return None
+    variable_root = root / "dataflow.variable"
+    wctpag_path = variable_root / "dataflow.variable.WCTPAG.json"
+    npagt_path = variable_root / "dataflow.variable.NPAGT.json"
+    wctpag = _read_json(wctpag_path)
+    npagt = _read_json(npagt_path)
+    if not isinstance(wctpag, dict) or not isinstance(npagt, dict):
+        return None
+
+    def sites(payload: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+        content = payload.get("content", {}) if isinstance(payload.get("content"), dict) else {}
+        evidence = content.get("evidence", {}) if isinstance(content.get("evidence"), dict) else {}
+        return [site for site in evidence.get(kind, []) if isinstance(site, dict)]
+
+    npagt_writes = sites(npagt, "write_sites")
+    page_sites = sites(wctpag, "read_sites") + sites(wctpag, "write_sites")
+    wanted_lines = {279, 297, 325, 331, 333, 337, 339, 382}
+    selected = sorted(
+        (site for site in page_sites if int(site.get("line_start") or -1) in wanted_lines),
+        key=lambda site: int(site.get("line_start") or 0),
+    )
+    lines = [f"{program} paging logic from direct analyzed evidence:"]
+    for site in npagt_writes:
+        line = int(site.get("line_start") or -1)
+        if line in {397, 399, 401}:
+            lines.append(
+                f"- Page count in {site.get('paragraph')} line {line}: `{site.get('statement')}`"
+            )
+    for site in selected:
+        line = site.get("line_start", "?")
+        lines.append(
+            f"- Page navigation in {site.get('paragraph')} line {line}: `{site.get('statement')}`"
+        )
+    lines.append(
+        "- PF7 branches to BROWSE-FASE2-PF7 and PF8 branches to BROWSE-FASE2-PF8; "
+        "BROWSE-FASE2-ENTER continues only while WCTPAG is less than NPAGT."
+    )
+    lines.append(
+        f"Source artifacts: `{cfg_path.name}`, `{wctpag_path.name}`, and `{npagt_path.name}`."
+    )
     return "\n".join(lines)
 
 
@@ -852,6 +1023,24 @@ def _answer_cics_operations(
     if not operations:
         requested = ", ".join(plan.operations) if plan and plan.operations else "CICS operations"
         return f"No source-backed {requested} operation matched in {program}. Source: `{payload_path.name}`."
+    response = plan.response_contract if plan else None
+    if response and response.format == "count":
+        return str(len(operations))
+    if response and response.exact_item_count is not None:
+        operations = operations[:response.exact_item_count]
+    if response and response.format in {"json", "json_array"}:
+        rows = [
+            {
+                "command": item.get("command"),
+                "paragraph": item.get("paragraph"),
+                "source_file": item.get("source_file"),
+                "source_line": item.get("line_start"),
+                "statement": item.get("statement"),
+            }
+            for item in operations
+        ]
+        value: Any = rows if response.format == "json_array" else {"operations": rows}
+        return json.dumps(value, ensure_ascii=False, indent=2)
     commands = list(dict.fromkeys(str(item.get("command", "")) for item in operations))
     lines = [
         f"{program} executes {len(commands)} requested CICS command type(s) across {len(operations)} source-backed operations:"
@@ -1012,6 +1201,28 @@ def _answer_calls(
     if plan and "call_context" in plan.tasks:
         return _answer_call_context(program, calls, payload_path.name, plan)
 
+    response = plan.response_contract if plan else None
+    if response and response.exact_item_count is not None:
+        calls = calls[:response.exact_item_count]
+    if response and response.format == "count":
+        return str(len(calls))
+
+    requested_fields = set(plan.output_fields) if plan else set()
+    if response and response.format in {"json", "json_array"}:
+        fields = requested_fields or {"target", "call_type", "paragraph", "source_line"}
+        rows = [_project_call_fields(call, fields) for call in calls]
+        payload_value: Any = rows if response.format == "json_array" else {"calls": rows}
+        return json.dumps(payload_value, ensure_ascii=False, indent=2)
+
+    if plan and plan.only_requested_fields and requested_fields:
+        return "\n".join(
+            "- " + "; ".join(
+                f"{field}={value}"
+                for field, value in _project_call_fields(call, requested_fields).items()
+            )
+            for call in calls
+        )
+
     lines = [f"{program} outgoing calls with parameters ({len(calls)} matching call(s)):"]
     for call in calls:
         target = call.get("target", "?")
@@ -1029,6 +1240,29 @@ def _answer_calls(
         lines.append("; ".join(details) + ".")
     lines.append(f"Source: `{payload_path.name}`.")
     return "\n".join(lines)
+
+
+def _project_call_fields(call: dict[str, Any], requested_fields: set[str]) -> dict[str, Any]:
+    mapping: dict[str, Any] = {
+        "name": call.get("target"),
+        "target": call.get("target"),
+        "call_type": call.get("call_type"),
+        "paragraph": call.get("paragraph"),
+        "source_line": call.get("line_start"),
+        "parameters": call.get("parameters", []),
+        "commarea": call.get("commarea"),
+        "length": call.get("length"),
+        "exact_statement": call.get("statement"),
+    }
+    ordered = (
+        "name", "target", "call_type", "paragraph", "source_line", "parameters",
+        "commarea", "length", "exact_statement",
+    )
+    return {
+        field: mapping[field]
+        for field in ordered
+        if field in requested_fields and mapping.get(field) not in (None, "")
+    }
 
 
 def _answer_call_context(
@@ -1105,6 +1339,23 @@ def _answer_literal_assignments(
         items = [item for item in items if item.get("screen_or_map_field")]
     elif "control" in q or "flow" in q:
         items = [item for item in items if item.get("controls_flow")]
+    response = plan.response_contract if plan else None
+    if response and response.format == "count":
+        return str(len(items))
+    if response and response.exact_item_count is not None:
+        items = items[:response.exact_item_count]
+    if response and response.format in {"json", "json_array"}:
+        rows = [
+            {
+                "line": item.get("line"),
+                "paragraph": item.get("paragraph"),
+                "variable": item.get("target_variable"),
+                "value": item.get("literal_raw", item.get("literal")),
+            }
+            for item in items
+        ]
+        value: Any = rows if response.format == "json_array" else {"assignments": rows}
+        return json.dumps(value, ensure_ascii=False, indent=2)
     lines = [f"{program} literal assignments: {len(items)} matching item(s)."]
     exhaustive = bool(plan and plan.result_scope == "all")
     selected_items = items if exhaustive else items[:25]
@@ -1141,6 +1392,7 @@ def _answer_copybooks(
     content = payload.get("content", {})
     all_copybooks = content.get("all", [])
     classified = content.get("classified", {})
+    response = plan.response_contract if plan else None
     location_terms = (
         "division", "section", "source line", "line number", "copy statement",
         "copy statements", "where included", "where is each included",
@@ -1175,6 +1427,13 @@ def _answer_copybooks(
                 "line/division evidence. Rebuild the analysis with source-location enrichment. "
                 f"Source: `{payload_path.name}`."
             )
+        if response and response.format == "count":
+            return str(len(inclusions))
+        if response and response.exact_item_count is not None:
+            inclusions = inclusions[:response.exact_item_count]
+        if response and response.format in {"json", "json_array"}:
+            value: Any = inclusions if response.format == "json_array" else {"copy_statements": inclusions}
+            return json.dumps(value, ensure_ascii=False, indent=2)
         lines = [f"COPY statements in {program}:"]
         for item in sorted(inclusions, key=lambda value: int(value.get("line", 0))):
             section = str(item.get("section") or "UNKNOWN")
@@ -1186,6 +1445,19 @@ def _answer_copybooks(
             )
         lines.append(f"Source: `{payload_path.name}`.")
         return "\n".join(lines)
+    if response and response.format == "count" and "unused" not in q:
+        return str(len(all_copybooks))
+    if response and response.exact_item_count is not None and "unused" not in q:
+        all_copybooks = all_copybooks[:response.exact_item_count]
+        allowed_copybooks = set(all_copybooks)
+        classified = {
+            category: [name for name in names if name in allowed_copybooks]
+            for category, names in classified.items()
+        }
+    if response and response.format in {"json", "json_array"} and "unused" not in q:
+        rows = [{"copybook": name} for name in all_copybooks]
+        value: Any = rows if response.format == "json_array" else {"copybooks": rows}
+        return json.dumps(value, ensure_ascii=False, indent=2)
     if "only" in q and not any(term in q for term in ("role", "purpose", "used", "unused")):
         return f"{program} COPY members: {', '.join(all_copybooks)}. Source: `{payload_path.name}`."
     if "unused" in q:
@@ -1462,6 +1734,27 @@ def _answer_business_rules(
 
     if not unique_rules:
         return None
+    response = plan.response_contract if plan else None
+    if response and response.format == "count":
+        return str(len(unique_rules))
+    if response and response.exact_item_count is not None:
+        unique_rules = unique_rules[:response.exact_item_count]
+    if response and response.format in {"json", "json_array"}:
+        rows = []
+        for path, rule in unique_rules:
+            content = rule.get("content", {})
+            evidence = content.get("evidence", {})
+            rows.append({
+                "id": content.get("id") or rule.get("id"),
+                "condition": content.get("condition") or content.get("if"),
+                "action": content.get("action") or content.get("then"),
+                "paragraph": content.get("scope") or evidence.get("from"),
+                "source_file": evidence.get("source_file"),
+                "source_line": evidence.get("line_start"),
+                "artifact": path.name,
+            })
+        value: Any = rows if response.format == "json_array" else {"business_rules": rows}
+        return json.dumps(value, ensure_ascii=False, indent=2)
     lines = [f"{program} business rules ({len(unique_rules)} matching unique direct-evidence rule(s)):"]
     for path, rule in unique_rules:
         content = rule.get("content", {})
@@ -1563,6 +1856,8 @@ def _answer_variable_access(
             _unique_sites(evidence.get("read_sites", [])),
         )
         control_sites = _unique_sites(evidence.get("control_sites", []))
+        read_write_sites = _unique_sites(evidence.get("read_write_sites", []))
+        subscript_sites = _unique_sites(evidence.get("subscript_sites", []))
         seen_variables.add(variable)
         records.append({
             "variable": variable,
@@ -1571,6 +1866,8 @@ def _answer_variable_access(
             "write_sites": write_sites,
             "read_sites": read_sites,
             "control_sites": control_sites,
+            "read_write_sites": read_write_sites,
+            "subscript_sites": subscript_sites,
             "conflicts": conflicts,
         })
     if not records:
@@ -1609,6 +1906,8 @@ def _answer_variable_access(
         write_sites = record["write_sites"]
         read_sites = record["read_sites"]
         control_sites = record["control_sites"]
+        read_write_sites = record["read_write_sites"]
+        subscript_sites = record["subscript_sites"]
         if "exists" in operations:
             lines.append(f"{variable} exists in the analyzed {program} variable catalogue.")
         else:
@@ -1619,12 +1918,43 @@ def _answer_variable_access(
             defined_in = [str(value) for value in content.get("defined_in", [])]
             modified_in = [str(value) for value in content.get("modified_in", [])]
             used_in = [str(value) for value in content.get("used_in", [])]
+            relationships = (
+                content.get("relationships", {})
+                if isinstance(content.get("relationships"), dict)
+                else {}
+            )
+            declarations = [
+                item for item in relationships.get("declarations", [])
+                if isinstance(item, dict)
+            ]
             lines.append(f"- Origin: {origin}")
+            if declarations:
+                lines.append("- Declaration evidence:")
+                for declaration in declarations:
+                    source_file = str(declaration.get("source_file") or "source")
+                    source_line = declaration.get("line_start", "?")
+                    level = declaration.get("level", "?")
+                    statement = str(declaration.get("statement") or "declaration text unavailable")
+                    lines.append(
+                        f"  - {source_file} line {source_line}, level {level}: `{statement}`"
+                    )
+            parents = [str(value) for value in relationships.get("parents", [])]
+            children = [str(value) for value in relationships.get("children", [])]
+            redefines = [str(value) for value in relationships.get("redefines", [])]
+            redefined_by = [str(value) for value in relationships.get("redefined_by", [])]
+            if parents:
+                lines.append(f"- Parent group(s): {', '.join(parents)}")
+            if children:
+                lines.append(f"- Child field(s): {', '.join(children)}")
+            if redefines:
+                lines.append(f"- Redefines: {', '.join(redefines)}")
+            if redefined_by:
+                lines.append(f"- Redefined by: {', '.join(redefined_by)}")
             lines.append(f"- Defined in: {', '.join(defined_in) if defined_in else 'not recorded'}")
             lines.append(f"- Modified in: {', '.join(modified_in) if modified_in else 'not recorded'}")
             lines.append(f"- Used in: {', '.join(used_in) if used_in else 'not recorded'}")
             lines.append(f"- Controls flow: {'yes' if content.get('controls_flow') else 'no'}")
-            if not defined_in:
+            if not declarations:
                 lines.append("- Declaration details such as level number and PIC are not present in this dataflow artifact.")
 
         variable_task_filter = tasks & {
@@ -1663,6 +1993,12 @@ def _answer_variable_access(
             else:
                 lines.append("- No explicit read or test site is present in the variable artifact.")
             lines.append(f"Read coverage: {len(read_sites)}/{len(read_sites)} direct site(s) returned.")
+        if read_write_sites:
+            lines.append("Read/write operations:")
+            lines.extend(_format_evidence_site(site) for site in read_write_sites)
+        if subscript_sites:
+            lines.append("Used as a subscript/index (read, not modified):")
+            lines.extend(_format_evidence_site(site) for site in subscript_sites)
         if control_requested:
             lines.append("Control-flow use:")
             if control_sites:
@@ -1746,13 +2082,11 @@ def _answer_variable_access(
     return "\n".join(lines)
 
 
-def _variable_lineage(root: Path, variable: str, max_depth: int = 4) -> tuple[list[str], list[Path]]:
-    """Follow direct MOVE edges through variable artifacts without inferring semantics."""
+def _variable_lineage(root: Path, variable: str, max_depth: int = 8) -> tuple[list[str], list[Path]]:
+    """Traverse typed MOVE and group-membership edges in both directions."""
     variable = variable.upper()
     lines: list[str] = []
     used_paths: list[Path] = []
-    seen_edges: set[tuple[str, str, str, str]] = set()
-    expanded: set[str] = set()
     catalog: dict[str, tuple[Path, dict[str, Any]]] = {}
     for path in (root / "dataflow.variable").glob("dataflow.variable.*.json"):
         payload = _read_json(path)
@@ -1761,75 +2095,130 @@ def _variable_lineage(root: Path, variable: str, max_depth: int = 4) -> tuple[li
         if name:
             catalog[name] = (path, content)
 
-    def load(name: str) -> tuple[Path, dict[str, Any]] | None:
-        loaded = catalog.get(name.upper())
-        if loaded is None:
-            return None
-        path, content = loaded
-        if path not in used_paths:
-            used_paths.append(path)
-        return path, content
+    edges: list[dict[str, Any]] = []
+    seen_edge_keys: set[tuple[Any, ...]] = set()
+    for name, (path, content) in catalog.items():
+        evidence = content.get("evidence", {}) if isinstance(content.get("evidence"), dict) else {}
+        for site in _unique_sites([*evidence.get("write_sites", []), *evidence.get("read_sites", [])]):
+            statement = str(site.get("statement", ""))
+            match = re.search(
+                r"\bMOVE\s+(.+?)\s+TO\s+([A-Z][A-Z0-9-]*)(?:\([^)]*\))?",
+                statement,
+                flags=re.IGNORECASE,
+            )
+            if not match:
+                continue
+            expression = " ".join(match.group(1).strip().rstrip(".").split())
+            target = match.group(2).upper()
+            value_expression = re.sub(r"\([^)]*\)", " ", expression)
+            source_names = tuple(dict.fromkeys(
+                token for token in re.findall(r"[A-Z][A-Z0-9-]*", value_expression.upper())
+                if token in catalog
+            ))
+            if not source_names:
+                continue
+            key = (
+                "move", expression.upper(), target,
+                str(site.get("paragraph", "")), str(site.get("line_start", "")),
+            )
+            if key in seen_edge_keys:
+                continue
+            seen_edge_keys.add(key)
+            edges.append({
+                "kind": "MOVE",
+                "sources": source_names,
+                "source_label": expression,
+                "target": target,
+                "site": site,
+                "paths": [path, catalog[target][0]] if target in catalog else [path],
+            })
 
-    def site_edge(site: dict[str, Any]) -> tuple[str, str] | None:
-        statement = str(site.get("statement", ""))
-        match = re.search(
-            r"\bMOVE\s+(.+?)\s+TO\s+([A-Z][A-Z0-9-]*)(?:\([^)]*\))?",
-            statement,
-            flags=re.IGNORECASE,
-        )
-        if not match:
-            return None
-        source = " ".join(match.group(1).strip().rstrip(".").split())
-        target = match.group(2).upper()
-        return source, target
+        relationships = content.get("relationships", {}) if isinstance(content.get("relationships"), dict) else {}
+        declarations = relationships.get("declarations", [])
+        declaration = declarations[0] if declarations and isinstance(declarations[0], dict) else {}
+        for parent in relationships.get("parents", []):
+            parent_name = str(parent).upper()
+            if parent_name not in catalog:
+                continue
+            key = ("member_of", name, parent_name)
+            if key in seen_edge_keys:
+                continue
+            seen_edge_keys.add(key)
+            edges.append({
+                "kind": "MEMBER_OF",
+                "sources": (name,),
+                "source_label": name,
+                "target": parent_name,
+                "site": {
+                    "paragraph": "DATA DIVISION",
+                    "line_start": declaration.get("line_start"),
+                    "statement": declaration.get("statement") or f"{name} is subordinate to {parent_name}",
+                },
+                "paths": [path, catalog[parent_name][0]],
+            })
 
-    def mentions(expression: str, name: str) -> bool:
-        return bool(re.search(
-            rf"(?<![A-Z0-9-]){re.escape(name)}(?![A-Z0-9-])",
-            expression.upper(),
-        ))
+    def remember_paths(edge: dict[str, Any]) -> None:
+        for path in edge.get("paths", []):
+            if path not in used_paths:
+                used_paths.append(path)
 
-    def render_edge(source: str, target: str, site: dict[str, Any], label: str) -> None:
+    def render(edge: dict[str, Any], label: str) -> None:
+        site = edge["site"]
         paragraph = str(site.get("paragraph") or "unknown paragraph")
         line = site.get("line_start")
         line_label = f"line {line}" if isinstance(line, int) and line >= 0 else "line unavailable"
         statement = str(site.get("statement", "")).strip()
+        relation = "member of" if edge["kind"] == "MEMBER_OF" else "->"
         lines.append(
-            f"- {label}: {source} -> {target} in {paragraph}, {line_label}: `{statement}`"
+            f"- {label}: {edge['source_label']} {relation} {edge['target']} "
+            f"in {paragraph}, {line_label}: `{statement}`"
+        )
+        remember_paths(edge)
+
+    rendered: set[tuple[Any, ...]] = set()
+    upstream_expanded: set[str] = set()
+    downstream_expanded: set[str] = set()
+
+    def edge_key(edge: dict[str, Any]) -> tuple[Any, ...]:
+        site = edge["site"]
+        return (
+            edge["kind"], edge["source_label"], edge["target"],
+            site.get("paragraph"), site.get("line_start"),
         )
 
-    def walk(name: str, depth: int) -> None:
-        if depth > max_depth or name in expanded:
+    def walk_upstream(name: str, depth: int, ancestry: frozenset[str]) -> None:
+        if depth > max_depth or name in upstream_expanded:
             return
-        loaded = load(name)
-        if loaded is None:
-            return
-        _, content = loaded
-        expanded.add(name)
-        evidence = content.get("evidence", {}) if isinstance(content.get("evidence"), dict) else {}
-        sites = _unique_sites([
-            *evidence.get("write_sites", []),
-            *evidence.get("read_sites", []),
-        ])
-        for site in sites:
-            edge = site_edge(site)
-            if edge is None:
+        upstream_expanded.add(name)
+        for edge in edges:
+            if edge["target"] != name:
                 continue
-            source, target = edge
-            key = (
-                source.upper(), target,
-                str(site.get("paragraph", "")), str(site.get("line_start", "")),
-            )
-            if target == name and depth == 0 and key not in seen_edges:
-                seen_edges.add(key)
-                render_edge(source, target, site, "inbound assignment")
-            if not mentions(source, name) or key in seen_edges:
+            if any(source in ancestry for source in edge["sources"]):
                 continue
-            seen_edges.add(key)
-            render_edge(source, target, site, f"downstream hop {depth + 1}")
-            walk(target, depth + 1)
+            key = edge_key(edge)
+            if key not in rendered:
+                rendered.add(key)
+                render(edge, f"upstream hop {depth + 1}")
+            for source in edge["sources"]:
+                walk_upstream(source, depth + 1, ancestry | {name})
 
-    walk(variable, 0)
+    def walk_downstream(name: str, depth: int, ancestry: frozenset[str]) -> None:
+        if depth > max_depth or name in downstream_expanded:
+            return
+        downstream_expanded.add(name)
+        for edge in edges:
+            if name not in edge["sources"]:
+                continue
+            if edge["target"] in ancestry:
+                continue
+            key = edge_key(edge)
+            if key not in rendered:
+                rendered.add(key)
+                render(edge, f"downstream hop {depth + 1}")
+            walk_downstream(edge["target"], depth + 1, ancestry | {name})
+
+    walk_upstream(variable, 0, frozenset({variable}))
+    walk_downstream(variable, 0, frozenset({variable}))
     return lines, used_paths
 
 

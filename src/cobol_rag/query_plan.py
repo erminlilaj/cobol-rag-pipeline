@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from cobol_rag.scope import EntityReference, QueryScope, SessionState
@@ -26,6 +27,20 @@ class EvidenceSubtask:
 
 
 @dataclass(frozen=True)
+class ResponseContract:
+    """Machine-checkable presentation requirements from the user message."""
+
+    format: str = "default"
+    max_sentences: int | None = None
+    max_lines: int | None = None
+    exact_lines: int | None = None
+    max_words: int | None = None
+    exact_item_count: int | None = None
+    only_requested_content: bool = False
+    yes_no_first: bool = False
+
+
+@dataclass(frozen=True)
 class QueryPlan:
     route: str = "technical"
     category: str = "single_source"
@@ -34,6 +49,7 @@ class QueryPlan:
     relations: tuple[str, ...] = ()
     response_language: str = "en"
     response_language_source: str = "default"
+    response_contract: ResponseContract = field(default_factory=ResponseContract)
     intent: str = "general"
     program: str | None = None
     programs: tuple[str, ...] = ()
@@ -51,12 +67,21 @@ class QueryPlan:
     condition_terms: tuple[str, ...] = ()
     negative_condition: bool = False
     result_scope: str = "default"
+    # Zero-based position for continuation requests such as "show me the rest".
+    # Scope (all/default) describes completeness; offset describes which part of
+    # that result set the current turn should render.
+    result_offset: int = 0
     explicit_followup: bool = False
     requires_comparison: bool = False
     requires_clarification: bool = False
     confidence: float = 0.0
+    # Confidence owned by typed parsing before any semantic planner update. This
+    # is the authority boundary; semantic self-confidence must not promote its
+    # own interpretation into an immutable deterministic fact.
+    authority_confidence: float = 0.0
     planner_source: str = "deterministic"
     subtasks: tuple[EvidenceSubtask, ...] = ()
+    policy_rejections: tuple[str, ...] = ()
 
     @property
     def entity_values(self) -> tuple[str, ...]:
@@ -91,6 +116,173 @@ _OPERATION_PATTERNS = {
     "FORMATTIME": (r"(?<![A-Z0-9-])FORMATTIME(?![A-Z0-9-])",),
 }
 
+_NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+
+
+def _contract_number(value: str) -> int | None:
+    value = value.strip().lower()
+    if value.isdigit():
+        return int(value)
+    return _NUMBER_WORDS.get(value)
+
+
+def parse_response_contract(question: str) -> ResponseContract:
+    """Extract output-shape instructions independently from COBOL semantics."""
+    q = question.lower()
+    number = r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+
+    output_format = "default"
+    if re.search(r"\bjson\s+array\b", q):
+        output_format = "json_array"
+    elif re.search(r"\bjson\b", q):
+        output_format = "json"
+    elif re.search(r"\b(?:only\s+(?:the\s+)?(?:number|count)|(?:number|count)\s+only)\b", q):
+        output_format = "count"
+    elif re.search(r"\b(?:bullet(?:\s+points?)?|bullets?)\b", q):
+        output_format = "bullets"
+    elif re.search(rf"\b(?:in\s+)?{number}\s+sentences?\b|\bone[- ]sentence\b", q):
+        output_format = "sentence"
+    elif re.search(
+        r"\b(?:how many|number of|count of)\b.{0,45}"
+        r"\b(?:variables?|fields?|data items?|calls?|programs?|copybooks?|"
+        r"operations?|assignments?|forced values?)\b",
+        q,
+    ) and not re.search(
+        r"\b(?:summary|summarize|summarise|overview|describe|explain|list|show)\b"
+        r".{0,100}\b(?:and|also|plus|then)\b.{0,100}"
+        r"\b(?:how many|number of|count of)\b",
+        q,
+    ):
+        # A count-only contract applies to the complete answer.  In a compound
+        # request such as "summarize the program and tell me how many variables"
+        # the count is one evidence claim, not permission to discard the summary.
+        output_format = "count"
+
+    max_sentences: int | None = None
+    sentence_match = re.search(
+        rf"\b(?:in\s+|at\s+most\s+|no\s+more\s+than\s+|maximum\s+)?({number})\s+sentences?\b"
+        r"|\bone[- ]sentence\b",
+        q,
+    )
+    if sentence_match:
+        max_sentences = _contract_number(sentence_match.group(1) or "one")
+
+    # A request such as "explain it in two lines" describes the shape of the
+    # answer.  It must not be confused with a request for COBOL source lines.
+    max_lines: int | None = None
+    exact_lines: int | None = None
+    line_match = re.search(
+        rf"\b(?:in|within|using|as|at\s+most|no\s+more\s+than|maximum|max)\s+"
+        rf"(?:exactly\s+)?({number})\s+lines?\b"
+        rf"|\b({number})\s+lines?\s+(?:only|maximum|max)\b",
+        q,
+    )
+    if line_match:
+        max_lines = _contract_number(line_match.group(1) or line_match.group(2))
+        # Natural phrasing such as "in three lines" requests an exact shape.
+        # Explicit upper-bound wording remains a maximum instead.
+        if not re.search(
+            rf"\b(?:within|at\s+most|no\s+more\s+than|maximum|max)\s+(?:exactly\s+)?{number}\s+lines?\b"
+            rf"|\b{number}\s+lines?\s+(?:maximum|max)\b",
+            q,
+        ):
+            exact_lines = max_lines
+
+    max_words: int | None = None
+    word_match = re.search(
+        r"(?:\b(?:in|within|under|maximum|max|at\s+most|no\s+more\s+than)\s+|<=\s*|≤\s*)"
+        r"(\d+)\s+words?\b|\b(\d+)\s+words?\s+or\s+(?:fewer|less)\b",
+        q,
+    )
+    if word_match:
+        max_words = int(word_match.group(1) or word_match.group(2))
+
+    exact_item_count: int | None = None
+    item_match = re.search(
+        rf"\b(?:exactly\s+(?:the\s+)?(?:first\s+)?|(?:the\s+)?first\s+)({number})\s+"
+        r"(?:(?:literal|forced|outgoing|external)\s+)?"
+        r"(?:bullet(?:\s+points?)?|bullets?|items?|results?|values?|assignments?|calls?|programs?|copybooks?)\b",
+        q,
+    )
+    if item_match:
+        exact_item_count = _contract_number(item_match.group(1))
+    else:
+        named_count = re.search(
+            rf"\b(?:name|list|show|give(?:\s+me)?)\s+(?:exactly\s+)?({number})\s+"
+            r"(?:variables?|fields?|data items?|calls?|programs?|copybooks?|"
+            r"operations?|assignments?|forced values?)\b",
+            q,
+        )
+        if named_count:
+            exact_item_count = _contract_number(named_count.group(1))
+    if exact_item_count is None and output_format == "bullets":
+        bullet_match = re.search(rf"\b({number})\s+bullet(?:\s+points?)?\b", q)
+        if bullet_match:
+            exact_item_count = _contract_number(bullet_match.group(1))
+
+    only_requested_content = bool(
+        re.search(
+            r"\b(?:only|nothing else|no extra (?:text|content|explanation)|without (?:extra|additional) (?:text|content|explanation))\b",
+            q,
+        )
+    )
+    yes_no_first = bool(
+        re.search(r"\b(?:yes\s*(?:/|or)\s*no|start with yes or no|answer yes or no)\b", q)
+    )
+    return ResponseContract(
+        format=output_format,
+        max_sentences=max_sentences,
+        max_lines=max_lines,
+        exact_lines=exact_lines,
+        max_words=max_words,
+        exact_item_count=exact_item_count,
+        only_requested_content=only_requested_content,
+        yes_no_first=yes_no_first,
+    )
+
+
+def _is_named_program_overview_request(question: str, program: str) -> bool:
+    """True only when the whole request is a short description of one program.
+
+    Anchoring the semantic request prevents phrases such as "explain PDCBVC's
+    control flow" from being collapsed into a generic program summary.
+    """
+    match = re.match(
+        rf"^\s*(?:what\s+is|explain|describe|summarize|summarise|tell\s+me\s+about)\s+"
+        rf"(?:the\s+)?(?:program\s+)?{re.escape(program)}\b",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return False
+    tail = question[match.end():].strip().strip(".?!").strip()
+    if not tail:
+        return True
+    number = r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+    constraint = (
+        rf"(?:briefly|concisely|only|please|"
+        rf"in\s+(?:exactly\s+)?{number}\s+(?:sentences?|lines?)(?:\s+only)?(?:\s+please)?|"
+        rf"(?:using|within|under|at\s+most|no\s+more\s+than|maximum|max)\s+"
+        rf"{number}\s+words?(?:\s+or\s+(?:fewer|less))?)"
+    )
+    return all(
+        re.fullmatch(constraint, part.strip(), flags=re.IGNORECASE) is not None
+        for part in re.split(r"\s+and\s+", tail, flags=re.IGNORECASE)
+    )
+
 _VARIABLE_PRODUCTION_CUE_PATTERN = (
     r"\b(?:writ(?:e|es|ing|ten)|modif(?:y|ies|ied|ying|ication|ications)|"
     r"set|sets|setting|assign(?:s|ed|ing)?|values?|"
@@ -109,7 +301,9 @@ _CALL_AFTER_CUE_PATTERN = (
     r"\bafter\b|\bafterward\b|\bfollowing the call\b|\bfollows? the call\b|"
     r"\bonce\b.{0,40}\b(?:returns?|responds?|completes?|comes? back)\b|"
     r"\breturns? control\b|\bcontrol(?:\s+is)? (?:returned|back)\b|\bcomes? back\b|"
-    r"\bgets? control back\b|\bresults? of the call\b|\bresponse of the call\b|"
+    r"\bgets? control back\b|"
+    r"\bresults?\s+of\s+(?:the\s+)?(?:[a-z0-9-]+\s+)?call\b|"
+    r"\bresponse\s+of\s+(?:the\s+)?(?:[a-z0-9-]+\s+)?call\b|"
     r"\bwhat comes back\b|\bwhat happens next\b|"
     r"\bwhat (?:happens|occurs|does (?:it|the program|the call) do)\b.{0,60}"
     r"\b(?:return|respond|complete)s?\b"
@@ -120,6 +314,35 @@ _CALL_BEFORE_CUE_PATTERN = (
     r"\bin preparation for\b|\bbeforehand\b|\bsetup before\b|"
     r"\bgets? ready (?:for|to)\b"
 )
+
+
+def is_pagination_question(question: str) -> bool:
+    """Recognize the concept of moving through result pages, not one phrase."""
+    q = question.lower()
+    return bool(
+        re.search(r"\b(?:pagination|page navigation|paging)\b", q)
+        or re.search(r"\b(?:page|move|go)\s+(?:through|between)\s+(?:the\s+)?results?\b", q)
+        or re.search(r"\b(?:move|go|step|navigate)s?\s+(?:through|between)\s+(?:the\s+)?result\s+pages?\b", q)
+        or re.search(r"\b(?:next|previous|prior)\s+(?:result\s+)?page\b", q)
+    )
+
+
+def is_complete_program_flow_question(question: str) -> bool:
+    """Recognize an end-to-end program walk rather than a named start node."""
+    q = question.lower()
+    return bool(
+        (
+            re.search(r"\bwalk\s+(?:me\s+)?through\b", q)
+            and re.search(r"\b(?:start|beginning|entry)\b", q)
+            and re.search(r"\b(?:finish|end|termination|exit)\b", q)
+        )
+        or re.search(
+            r"\bfrom\s+(?:its\s+|the\s+)?(?:start|beginning|entry(?: point)?)\s+"
+            r"(?:through|to|until)\s+(?:its\s+|the\s+)?"
+            r"(?:finish|end|termination|exit)\b",
+            q,
+        )
+    )
 
 _DIVISIONS = (
     "IDENTIFICATION DIVISION",
@@ -140,6 +363,7 @@ _SECTIONS = (
 _OUTPUT_FIELD_PATTERNS = {
     "name": (r"\bnames?\b",),
     "target": (r"\btarget(?: program)?\b",),
+    "call_type": (r"\bcall types?\b", r"\btypes? of calls?\b"),
     "paragraph": (r"\bparagraphs?\b",),
     "commarea": (r"\bcommarea\b",),
     # "lines of code" and "how many lines" are size measurements, not a request for
@@ -161,11 +385,20 @@ _OUTPUT_FIELD_PATTERNS = {
     "origin": (r"\borigin\b", r"\bdefined (?:in|where)\b", r"\bdeclaration\b"),
     "read_sites": (r"\bread(?:s| sites?)?\b", r"\btested\b", r"\binspect(?:s|ed)?\b"),
     "write_sites": (r"\bwrite(?:s| sites?)?\b", r"\bmodified\b", r"\bchanged\b", r"\bset\b"),
-    "control_usage": (r"\bcontrols? (?:flow|execution)\b", r"\bcontrol usage\b"),
+    "control_usage": (
+        r"\bcontrols? (?:the )?(?:flow|execution)\b",
+        r"\bcontrol usage\b",
+    ),
     "line_count": (
         r"\bhow many (?:physical |source |code )?lines?\b",
         r"\bnumber of (?:physical |source |code )?lines?\b",
         r"\b(?:loc|line count)\b",
+    ),
+    "item_count": (
+        r"\bhow many\b.{0,45}\b(?:variables?|fields?|data items?|calls?|programs?|"
+        r"copybooks?|operations?|assignments?|forced values?)\b",
+        r"\b(?:number|count) of\b.{0,45}\b(?:variables?|fields?|data items?|calls?|"
+        r"programs?|copybooks?|operations?|assignments?|forced values?)\b",
     ),
 }
 
@@ -381,13 +614,45 @@ def build_query_plan(
     if explicit_followup and resolved_intent == "general" and state and state.current_intent:
         resolved_intent = state.current_intent
 
-    if any(term in q for term in ("return value", "value returned")):
+    named_program_request = bool(
+        scope.program
+        and not scope.entities
+        and (
+            _is_named_program_overview_request(question, scope.program)
+            or re.search(
+                rf"\b(?:(?:do\s+)?you\s+have|have\s+you\s+got|is\s+there)\b"
+                rf".{{0,45}}\b(?:file|program|source)\b.{{0,25}}"
+                rf"\b(?:called|named)?\s*{re.escape(scope.program)}\b",
+                question,
+                flags=re.IGNORECASE,
+            )
+        )
+    )
+
+    if named_program_request:
+        # Exact program resolution is authoritative.  Broad words such as
+        # "file" must not redirect this request to JCL dataset evidence.
+        resolved_intent = "program_summary"
+    elif any(term in q for term in ("return value", "value returned")):
         resolved_intent = "variable_dataflow"
+    elif (
+        resolved_intent == "general"
+        and scope.program
+        and not scope.entities
+        and re.search(
+            rf"\b(?:describe|summarize|summarise)\s+(?:the\s+)?(?:program\s+)?{re.escape(scope.program)}\b",
+            question,
+            flags=re.IGNORECASE,
+        )
+    ):
+        resolved_intent = "program_summary"
+    elif resolved_intent == "general" and re.search(r"\bliteral assignments?\b", q):
+        resolved_intent = "static_values"
     elif _is_source_metrics_question(q):
         resolved_intent = "source_metrics"
     elif (
         resolved_intent in {"general", "control_flow", "ui_navigation"}
-        and any(term in q for term in ("pagination", "page navigation"))
+        and is_pagination_question(question)
     ):
         resolved_intent = "control_flow"
     elif _is_condition_effect_question(q) and resolved_intent in {
@@ -395,8 +660,18 @@ def build_query_plan(
     }:
         resolved_intent = "business_rules"
     elif (
-        re.search(r"\b(?:call|calls|called)\b", q)
-        and any(entity.entity_type == "call" for entity in scope.entities)
+        re.search(r"\b(?:call|calls|called|calling)\b", q)
+        and (
+            any(entity.entity_type == "call" for entity in scope.entities)
+            or any(term in q for term in (
+                "outgoing call", "external call", "external program", "call type",
+                "called by", "programs called",
+            ))
+            or bool(
+                scope.program
+                and re.search(r"\b(?:which|what|list|show)\b.{0,45}\bprograms?\b", q)
+            )
+        )
     ) or any(term in q for term in ("commarea", "target program")):
         resolved_intent = "external_programs"
     elif (
@@ -438,13 +713,26 @@ def build_query_plan(
         for operation, patterns in _OPERATION_PATTERNS.items()
         if any(re.search(pattern, upper, flags=re.IGNORECASE) for pattern in patterns)
     )
-    if any(term in q for term in ("return value", "value returned")):
+    # Presentation language is not a COBOL operation. In particular, phrases such
+    # as "return only target and call type" used to filter calls to EXEC CICS
+    # RETURN and produce an empty but apparently valid answer.
+    presentation_return = bool(
+        re.match(r"^\s*return\s+(?:every|all|exactly|only|the|a|an|\d+)\b", q)
+        and not re.search(r"\b(?:exec\s+cics|cics)\s+return\b", q)
+    )
+    if presentation_return or any(
+        term in q for term in (
+            "return value", "value returned", "return only", "return a json", "return json",
+        )
+    ):
         operations = tuple(operation for operation in operations if operation != "RETURN")
 
     semantic_operations: list[str] = []
     if re.search(r"\b(?:compare|comparison|difference|differences|versus|vs\.?)\b", q):
         semantic_operations.append("compare")
     if re.search(r"\b(?:does|do|is|are)\b.{0,80}\b(?:exist|exists|present|available)\b", q):
+        semantic_operations.append("exists")
+    if re.search(r"\b(?:(?:do\s+)?you\s+have|have\s+you\s+got|is\s+there)\b", q):
         semantic_operations.append("exists")
     if re.search(r"\b(?:what is|what are|describe|explain|tell me about)\b", q) or re.search(
         r"\bhow\b.{0,80}\b(?:use|uses|used|handle|handles)\b", q
@@ -503,12 +791,17 @@ def build_query_plan(
     only_requested_fields = bool(
         re.search(
             r"(?:return|provide|give|include|show)\s+only\s+(?:their\s+|the\s+)?"
-            r"(?:names?|targets?|paragraphs?|source|lines?|divisions?|sections?|parameters?|commarea)",
+            r"(?:names?|targets?|call types?|paragraphs?|source|lines?|divisions?|sections?|parameters?|commarea)",
             q,
         )
         or re.search(
             r"only\s+include\s+(?:their\s+|the\s+)?"
-            r"(?:names?|targets?|paragraphs?|source|lines?|divisions?|sections?|parameters?|commarea)",
+            r"(?:names?|targets?|call types?|paragraphs?|source|lines?|divisions?|sections?|parameters?|commarea)",
+            q,
+        )
+        or re.search(
+            r"with\s+only\s+(?:their\s+|the\s+)?"
+            r"(?:names?|targets?|call types?|paragraphs?|source|lines?|divisions?|sections?|parameters?|commarea)",
             q,
         )
     )
@@ -518,7 +811,26 @@ def build_query_plan(
         _is_condition_effect_question(q)
         and re.search(r"\b(?:neither|otherwise|not equal|not equals|is not|isn.t|not =)\b", q)
     )
+    response_contract = parse_response_contract(question)
+    if (
+        resolved_intent == "variable_inventory"
+        and response_contract.exact_item_count is None
+        and re.search(r"\b(?:sample|example|examples|a few|some)\b", q)
+    ):
+        # "A sample" is intentionally bounded.  Ten is a presentation default,
+        # not a stored answer: the formatter still selects the values from the
+        # current program's generated catalogue.
+        response_contract = replace(response_contract, exact_item_count=10)
     result_scope = "all" if _requests_exhaustive_results(q) else "default"
+    if (
+        resolved_intent == "variable_inventory"
+        and not re.search(r"\b(?:sample|few|some|example|examples)\b", q)
+        and response_contract.format != "count"
+        and response_contract.exact_item_count is None
+        and re.search(r"\b(?:what|which)\b.{0,55}\b(?:variables?|fields?|data items?)\b", q)
+    ):
+        result_scope = "all"
+    result_offset = 0
     if explicit_followup and state and state.current_plan:
         previous = state.current_plan
         if not operations:
@@ -531,6 +843,16 @@ def build_query_plan(
             previous_scope = str(previous.get("result_scope", "default"))
             if previous_scope in {"default", "all"}:
                 result_scope = previous_scope
+        if re.search(r"\b(?:the rest|remaining|continue)\b", q):
+            result_scope = "all"
+            previous_contract = previous.get("response_contract", {})
+            previous_offset = int(previous.get("result_offset", 0) or 0)
+            previous_count = (
+                previous_contract.get("exact_item_count")
+                if isinstance(previous_contract, dict)
+                else None
+            )
+            result_offset = previous_offset + int(previous_count or 25)
 
     programs = tuple(getattr(scope, "programs", ()) or ((scope.program,) if scope.program else ()))
     requires_comparison = "compare" in operations or len(programs) > 1
@@ -549,12 +871,36 @@ def build_query_plan(
         confidence = min(confidence, 0.7)
     domain = _INTENT_DOMAIN.get(resolved_intent, "general")
     tasks, relations = _fallback_tasks_and_relations(q, resolved_intent)
+    if scope.program and not scope.entities:
+        requested_program_tasks: list[str] = []
+        if re.search(r"\b(?:summary|summarize|summarise|overview)\b", q):
+            requested_program_tasks.append("program_summary")
+        if re.search(
+            r"\b(?:how many|number of|count of)\b.{0,45}"
+            r"\b(?:variables?|fields?|data items?)\b",
+            q,
+        ):
+            requested_program_tasks.append("variable_inventory")
+        tasks = _unique((*tasks, *requested_program_tasks))
+        if {"program_summary", "variable_inventory"} <= set(tasks):
+            # Intent is the primary purpose; tasks are the complete claim set.
+            # Preserve both so the semantic planner cannot answer just the last
+            # clause of a compound program-wide request.
+            resolved_intent = "program_summary"
+            domain = "multi_source"
+            category = "multi_source_synthesis"
+            source_domains = _unique((
+                *_INTENT_SOURCE_DOMAINS["program_summary"],
+                *_INTENT_SOURCE_DOMAINS["variable_inventory"],
+            ))
     if any(entity.entity_type == "call" for entity in scope.entities):
         if re.search(r"\bbefore\b", q):
             relations = _unique((*relations, "before"))
         if re.search(r"\bafter\b", q):
             relations = _unique((*relations, "after"))
     response_language, response_language_source = resolve_response_language(question, state)
+    if response_contract.max_lines is not None:
+        output_fields = tuple(field for field in output_fields if field != "source_line")
 
     base_plan = QueryPlan(
         route="technical",
@@ -564,6 +910,7 @@ def build_query_plan(
         relations=relations,
         response_language=response_language,
         response_language_source=response_language_source,
+        response_contract=response_contract,
         intent=resolved_intent,
         program=scope.program,
         programs=programs,
@@ -580,10 +927,12 @@ def build_query_plan(
         condition_terms=condition_terms,
         negative_condition=negative_condition,
         result_scope=result_scope,
+        result_offset=result_offset,
         explicit_followup=explicit_followup,
         requires_comparison=requires_comparison,
         requires_clarification=unresolved_previous_variable,
         confidence=confidence,
+        authority_confidence=confidence,
         planner_source="deterministic",
     )
     return replace(base_plan, subtasks=derive_evidence_subtasks(base_plan))
@@ -601,17 +950,43 @@ def merge_semantic_plan(plan: QueryPlan, update: dict[str, Any]) -> QueryPlan:
         "single_source", "multi_source_synthesis", "multi_source_comparison",
         "clarification", "conversational", "out_of_scope",
     }
+    policy_rejections: list[str] = list(plan.policy_rejections)
+    strict_authority = bool(
+        plan.route == "technical"
+        and plan.intent != "general"
+        and plan.confidence >= 0.9
+        and not plan.requires_clarification
+    )
     route = str(update.get("route", plan.route)).strip().lower()
     if route not in allowed_routes:
         route = plan.route
+    if strict_authority and route != plan.route:
+        policy_rejections.append(f"route_not_authorized:{route}")
+        route = plan.route
     category = str(update.get("category", plan.category)).strip().lower()
     if category not in allowed_categories:
+        category = plan.category
+    if strict_authority and category != plan.category:
+        policy_rejections.append(f"category_not_authorized:{category}")
         category = plan.category
     proposed_intent = str(update.get("intent", plan.intent)).strip().lower().replace("-", "_").replace(" ", "_")
     if proposed_intent == "datasets":
         proposed_intent = "datasets_tables"
     allowed_intents = set(_INTENT_SOURCE_DOMAINS) | {"ui_navigation", "source_metrics", "general"}
     intent = proposed_intent if proposed_intent in allowed_intents else plan.intent
+    # A high-confidence deterministic intent comes from explicit vocabulary and
+    # verified scope (for example "outgoing calls" or "program summary"). The
+    # LLM may decompose it into more claims, but may not downgrade or replace the
+    # primary capability with a merely nearby one.
+    semantic_intent_conflict = bool(
+        plan.intent != "general"
+        and plan.confidence >= 0.9
+        and intent != plan.intent
+        and not plan.requires_comparison
+    )
+    if semantic_intent_conflict:
+        policy_rejections.append(f"intent_not_authorized:{intent}")
+        intent = plan.intent
     proposed_operations = [
         str(value).strip().lower()
         for value in update.get("operations", [])
@@ -622,11 +997,17 @@ def merge_semantic_plan(plan: QueryPlan, update: dict[str, Any]) -> QueryPlan:
     # explicit negative phrasing; a planner-invented one silently drops calls the
     # user asked to see, which is indistinguishable from missing analysis.
     excluded_operations = plan.excluded_operations
-    explicit_operations = [
-        value for value in plan.operations
-        if value.upper() == value and value not in excluded_operations
-    ]
-    operations = _unique((*explicit_operations, *proposed_operations))
+    if strict_authority:
+        for operation in proposed_operations:
+            if operation not in plan.operations:
+                policy_rejections.append(f"operation_not_authorized:{operation}")
+        operations = plan.operations
+    else:
+        explicit_operations = [
+            value for value in plan.operations
+            if value.upper() == value and value not in excluded_operations
+        ]
+        operations = _unique((*explicit_operations, *proposed_operations))
     allowed_domains = {domain for values in _INTENT_SOURCE_DOMAINS.values() for domain in values}
     source_domains = _unique((*_INTENT_SOURCE_DOMAINS.get(intent, ()), *(
         str(value) for value in update.get("source_domains", []) if str(value) in allowed_domains
@@ -634,10 +1015,27 @@ def merge_semantic_plan(plan: QueryPlan, update: dict[str, Any]) -> QueryPlan:
     domain = str(update.get("domain", _INTENT_DOMAIN.get(intent, plan.domain))).strip().lower()
     if domain not in ALLOWED_PLAN_DOMAINS:
         domain = _INTENT_DOMAIN.get(intent, plan.domain)
+    if strict_authority and domain != plan.domain:
+        policy_rejections.append(f"domain_not_authorized:{domain}")
+        domain = plan.domain
     semantic_tasks = _unique(value for value in update.get("tasks", []) if str(value) in ALLOWED_PLAN_TASKS)
     semantic_relations = _unique(value for value in update.get("relations", []) if str(value) in ALLOWED_PLAN_RELATIONS)
-    tasks = _unique((*plan.tasks, *semantic_tasks))
-    relations = _unique((*plan.relations, *semantic_relations))
+    # When the semantic model proposes an incompatible primary intent, discard its
+    # task decomposition as well as the intent label. Keeping (for example)
+    # variable-read tasks under a verified program-summary intent creates a plan
+    # that is internally inconsistent even though the visible intent looks right.
+    if strict_authority:
+        for task in semantic_tasks:
+            if task not in plan.tasks:
+                policy_rejections.append(f"task_not_authorized:{task}")
+        for relation in semantic_relations:
+            if relation not in plan.relations:
+                policy_rejections.append(f"relation_not_authorized:{relation}")
+        tasks = plan.tasks
+        relations = plan.relations
+    else:
+        tasks = plan.tasks if semantic_intent_conflict else _unique((*plan.tasks, *semantic_tasks))
+        relations = plan.relations if semantic_intent_conflict else _unique((*plan.relations, *semantic_relations))
     has_exact_variable = bool(plan.entity_values_for("variable"))
     if has_exact_variable and plan.intent == "variable_dataflow":
         # The LLM remains the semantic guide, but cannot replace verified variable
@@ -671,13 +1069,25 @@ def merge_semantic_plan(plan: QueryPlan, update: dict[str, Any]) -> QueryPlan:
     # Language is a deterministic conversation contract. The semantic planner writes
     # the reply, but it cannot override an explicit/current-message/session decision.
     response_language = plan.response_language
-    output_fields = _unique((*plan.output_fields, *(
-        str(value) for value in update.get("output_fields", []) if str(value) in _OUTPUT_FIELD_PATTERNS
-    )))
+    semantic_output_fields = _unique(
+        str(value) for value in update.get("output_fields", [])
+        if str(value) in _OUTPUT_FIELD_PATTERNS
+    )
+    if strict_authority:
+        for output_field in semantic_output_fields:
+            if output_field not in plan.output_fields:
+                policy_rejections.append(f"output_field_not_authorized:{output_field}")
+        output_fields = plan.output_fields
+        source_domains = plan.source_domains
+    else:
+        output_fields = _unique((*plan.output_fields, *semantic_output_fields))
     requires_comparison = bool(
         plan.requires_comparison or update.get("requires_comparison")
         or "compare" in operations or len(plan.programs) > 1
     )
+    if strict_authority and requires_comparison != plan.requires_comparison:
+        policy_rejections.append("comparison_not_authorized")
+        requires_comparison = plan.requires_comparison
     if requires_comparison:
         category = "multi_source_comparison"
     try:
@@ -695,10 +1105,19 @@ def merge_semantic_plan(plan: QueryPlan, update: dict[str, Any]) -> QueryPlan:
         source_domains=source_domains or _INTENT_SOURCE_DOMAINS.get(intent, ()),
         output_fields=output_fields, requires_comparison=requires_comparison,
         result_scope=plan.result_scope,
-        requires_clarification=bool(plan.requires_clarification or update.get("requires_clarification")),
-        confidence=confidence, planner_source="hybrid_llm",
+        requires_clarification=(
+            plan.requires_clarification
+            if strict_authority
+            else bool(plan.requires_clarification or update.get("requires_clarification"))
+        ),
+        confidence=(plan.confidence if strict_authority else confidence),
+        planner_source="hybrid_llm",
+        policy_rejections=_unique(policy_rejections),
     )
-    semantic_subtasks = _parse_semantic_subtasks(merged, update.get("subtasks"))
+    semantic_subtasks = (
+        () if semantic_intent_conflict
+        else _parse_semantic_subtasks(merged, update.get("subtasks"))
+    )
     return replace(
         merged,
         subtasks=_ensure_subtask_coverage(merged, semantic_subtasks),
@@ -756,7 +1175,11 @@ def derive_evidence_subtasks(plan: QueryPlan) -> tuple[EvidenceSubtask, ...]:
                 output_fields=_unique((*plan.output_fields, "source_line")),
             )
         )
-    return tuple(subtasks)
+    merged = _remove_subsumed_subtasks(subtasks)
+    return tuple(
+        replace(item, claim_id=f"claim_{index}")
+        for index, item in enumerate(merged, start=1)
+    )
 
 
 def plan_for_subtask(plan: QueryPlan, subtask: EvidenceSubtask) -> QueryPlan:
@@ -778,6 +1201,11 @@ def plan_for_subtask(plan: QueryPlan, subtask: EvidenceSubtask) -> QueryPlan:
         entities=entities,
         source_domains=subtask.source_domains or plan.source_domains,
         output_fields=subtask.output_fields,
+        # Presentation constraints belong to the user's request and remain
+        # immutable across planning. Evidence-stage validation deliberately
+        # ignores them via ``validate_evidence_answer`` below; the final renderer
+        # is the only stage that enforces them.
+        response_contract=plan.response_contract,
         requires_comparison=("compare" in plan.operations or len(plan.programs) > 1),
         requires_clarification=False,
         subtasks=(),
@@ -800,6 +1228,13 @@ def _parse_semantic_subtasks(
         if capability not in ALLOWED_EVIDENCE_CAPABILITIES:
             continue
         supported = set(_CAPABILITY_TASKS[capability])
+        # A subtask must implement at least one task in the merged query plan.
+        # This rejects internally inconsistent LLM decompositions such as a DB2
+        # evidence claim for a variable declaration merely because the user said
+        # "include its declaration". Genuine compound plans keep all requested
+        # tasks in plan.tasks, so their multiple capabilities remain eligible.
+        if plan.tasks and supported.isdisjoint(plan.tasks):
+            continue
         raw_tasks = raw.get("tasks", [])
         if isinstance(raw_tasks, str):
             raw_tasks = [raw_tasks]
@@ -850,7 +1285,10 @@ def _parse_semantic_subtasks(
                 entity_values=entities,
                 relations=relations,
                 source_domains=sources or _source_domains_for_capability(plan, capability),
-                output_fields=fields or plan.output_fields,
+                # Model-proposed fields may add useful detail, but they cannot
+                # erase fields parsed from the user's words (for example the
+                # item_count half of a summary-plus-count request).
+                output_fields=_unique((*plan.output_fields, *fields)),
                 required=bool(raw.get("required", True)),
             )
         )
@@ -912,7 +1350,32 @@ def _remove_subsumed_subtasks(
             and any(set(item.entity_values) <= values for values in literal_entity_sets)
         )
     ]
-    return _merge_whole_program_capability_claims(unique)
+    # Access and lineage for the same exact variable are one evidence join, not
+    # two independent claims.  Keeping them separate makes the answer executor
+    # run the same variable artifact twice and often produces duplicated blocks.
+    merged_variables: list[EvidenceSubtask] = []
+    variable_index: dict[tuple[str, ...], int] = {}
+    for item in unique:
+        if item.capability not in {"variable_access", "variable_lineage"} or not item.entity_values:
+            merged_variables.append(item)
+            continue
+        key = tuple(sorted(item.entity_values))
+        existing_index = variable_index.get(key)
+        if existing_index is None:
+            variable_index[key] = len(merged_variables)
+            merged_variables.append(item)
+            continue
+        existing = merged_variables[existing_index]
+        merged_variables[existing_index] = replace(
+            existing,
+            capability="variable_access",
+            tasks=_unique((*existing.tasks, *item.tasks)),
+            relations=_unique((*existing.relations, *item.relations)),
+            source_domains=_unique((*existing.source_domains, *item.source_domains)),
+            output_fields=_unique((*existing.output_fields, *item.output_fields)),
+            required=existing.required or item.required,
+        )
+    return _merge_whole_program_capability_claims(merged_variables)
 
 
 def _merge_whole_program_capability_claims(
@@ -1036,7 +1499,29 @@ def _subtask_description(
     program: str | None,
 ) -> str:
     target = ", ".join(entities) if entities else (program or "the selected program")
-    return f"Verify {capability.replace('_', ' ')} evidence for {target}"
+    descriptions = {
+        "artifact_inventory": "Inspect analyzed artifacts",
+        "program_summary": "Summarize the program",
+        "source_metrics": "Measure source size",
+        "variable_inventory": "Inspect the variable catalogue",
+        "paragraph_evidence": "Inspect paragraph structure",
+        "variable_access": "Trace variable access",
+        "literal_assignment": "Inspect literal assignments",
+        "variable_lineage": "Trace variable lineage",
+        "condition_outcome": "Trace condition outcomes",
+        "control_flow": "Trace control flow",
+        "call_evidence": "Inspect outgoing calls",
+        "call_context": "Inspect call context",
+        "cics_evidence": "Inspect CICS operations",
+        "copybook_evidence": "Inspect copybooks",
+        "db2_evidence": "Inspect DB2 and SQL evidence",
+        "jcl_evidence": "Inspect JCL dataset evidence",
+        "quality_evidence": "Inspect quality evidence",
+        "pagination_evidence": "Trace pagination",
+        "screen_lineage": "Trace screen-field lineage",
+    }
+    action = descriptions.get(capability, f"Inspect {capability.replace('_', ' ')}")
+    return f"{action} for {target}"
 
 
 # An exhaustive answer has to say how much it returned. Renderers state that
@@ -1052,11 +1537,80 @@ _EXHAUSTIVE_COVERAGE = re.compile(
 )
 
 
+def _answer_word_count(answer: str) -> int:
+    without_code = re.sub(r"`[^`]*`", " ", answer)
+    return len(re.findall(r"\b[\w]+(?:[-'][\w]+)*\b", without_code, flags=re.UNICODE))
+
+
+def _answer_sentence_count(answer: str) -> int:
+    without_code = re.sub(r"`[^`]*`", "", answer).strip()
+    if not without_code:
+        return 0
+    return len([
+        part for part in re.split(r"(?<=[.!?])(?:\s+|$)", without_code)
+        if re.search(r"\w", part)
+    ])
+
+
+def _answer_item_count(answer: str, output_format: str) -> int | None:
+    if output_format in {"json", "json_array"}:
+        try:
+            payload = json.loads(answer)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if isinstance(payload, list):
+            return len(payload)
+        return len(payload) if isinstance(payload, dict) else None
+    bullets = [
+        line for line in answer.splitlines()
+        if re.match(r"^\s*(?:[-*]|\d+[.)])\s+", line)
+    ]
+    return len(bullets) if bullets else None
+
+
 def validate_plan_answer(plan: QueryPlan, answer: str) -> PlanContractValidation:
     if not answer.strip():
         return PlanContractValidation(False, ("empty_answer",))
     lowered = answer.lower()
     reasons: list[str] = []
+    response = plan.response_contract
+
+    if response.format in {"json", "json_array"}:
+        try:
+            parsed_json = json.loads(answer)
+        except (json.JSONDecodeError, TypeError):
+            reasons.append("invalid_requested_json")
+        else:
+            if response.format == "json_array" and not isinstance(parsed_json, list):
+                reasons.append("requested_json_array_not_returned")
+    if response.format == "count" and not re.fullmatch(r"\s*\d+\s*", answer):
+        reasons.append("requested_count_only_not_returned")
+    if response.max_sentences is not None:
+        if _answer_sentence_count(answer) > response.max_sentences:
+            reasons.append(
+                f"max_sentences_exceeded:{_answer_sentence_count(answer)}/{response.max_sentences}"
+            )
+        if response.max_sentences == 1 and len([line for line in answer.splitlines() if line.strip()]) > 1:
+            reasons.append("one_sentence_requires_single_line")
+    if response.max_lines is not None:
+        actual_lines = len([line for line in answer.splitlines() if line.strip()])
+        if actual_lines > response.max_lines:
+            reasons.append(f"max_lines_exceeded:{actual_lines}/{response.max_lines}")
+    if response.exact_lines is not None:
+        actual_lines = len([line for line in answer.splitlines() if line.strip()])
+        if actual_lines != response.exact_lines:
+            reasons.append(f"exact_lines_mismatch:{actual_lines}/{response.exact_lines}")
+    if response.max_words is not None and _answer_word_count(answer) > response.max_words:
+        reasons.append(f"max_words_exceeded:{_answer_word_count(answer)}/{response.max_words}")
+    if response.exact_item_count is not None:
+        actual_items = _answer_item_count(answer, response.format)
+        if actual_items != response.exact_item_count:
+            reasons.append(
+                f"exact_item_count_mismatch:{actual_items if actual_items is not None else 0}/"
+                f"{response.exact_item_count}"
+            )
+    if response.yes_no_first and not re.match(r"\s*(?:yes|no)\b", answer, flags=re.IGNORECASE):
+        reasons.append("missing_yes_no_prefix")
 
     forbidden_markers = {
         "db2_table": ("db2 table ",),
@@ -1121,8 +1675,13 @@ def validate_plan_answer(plan: QueryPlan, answer: str) -> PlanContractValidation
     for task, markers in required_sections.items():
         if task in plan.tasks and not any(marker in lowered for marker in markers):
             reasons.append(f"missing_requested_section:{task}")
-    if "control_usage" in plan.output_fields and "control-flow use:" not in lowered:
-        reasons.append("missing_requested_field:control_usage")
+    if "control_usage" in plan.output_fields:
+        control_usage_markers = (
+            "control-flow use:",
+            "controls flow",
+        )
+        if not any(marker in lowered for marker in control_usage_markers):
+            reasons.append("missing_requested_field:control_usage")
     if "line_count" in plan.output_fields and not re.search(
         r"\b\d+\s+(?:total physical source lines|loc|lines? of code)\b", lowered,
     ):
@@ -1145,6 +1704,32 @@ def validate_plan_answer(plan: QueryPlan, answer: str) -> PlanContractValidation
     return PlanContractValidation(not reasons, tuple(dict.fromkeys(reasons)))
 
 
+def validate_evidence_answer(plan: QueryPlan, answer: str) -> PlanContractValidation:
+    """Validate one evidence claim without applying final presentation limits.
+
+    A three-line contract applies to the composed answer, not independently to
+    every evidence claim. Keeping the contract on every subplan preserves the
+    authority boundary while this narrow validation view prevents false claim
+    failures during evidence collection.
+    """
+    return validate_plan_answer(replace(plan, response_contract=ResponseContract()), answer)
+
+
+def execution_strategy_for_plan(plan: QueryPlan) -> str:
+    """Select the least expensive execution mode that can satisfy the plan."""
+    if plan.route != "technical":
+        return "conversational" if plan.route == "conversational" else "clarification"
+    required = tuple(subtask for subtask in plan.subtasks if subtask.required)
+    # Comparing two entities inside one typed capability is still a direct
+    # structured lookup. Agentic decomposition is reserved for multiple evidence
+    # capabilities or multiple programs, where independent claims must be joined.
+    if len(plan.programs) > 1 or len(required) > 1:
+        return "agentic"
+    if required:
+        return "single_claim"
+    return "standard_rag"
+
+
 
 def _fallback_tasks_and_relations(q: str, intent: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Capture literal task/relation constraints that a semantic planner may not drop."""
@@ -1152,15 +1737,17 @@ def _fallback_tasks_and_relations(q: str, intent: str) -> tuple[tuple[str, ...],
     relations: list[str] = []
 
     if intent == "control_flow":
-        if "pagination" in q or "page navigation" in q:
+        if is_pagination_question(q):
             tasks.append("pagination_logic")
+        elif is_complete_program_flow_question(q):
+            tasks.append("complete_program_flow")
         if "referenc" in q or "mention" in q:
             tasks.append("paragraph_references")
             relations.append("referenced_by")
         if "what statements" in q or ("what does" in q and "paragraph" in q):
             tasks.append("paragraph_body")
             relations.append("contains")
-        if re.search(r"\b(?:from|starting at|starts? at)\b", q):
+        if not tasks and re.search(r"\b(?:from|starting at|starts? at)\b", q):
             tasks.append("path_from_paragraph")
             relations.append("starts_at")
         if not tasks:
@@ -1168,7 +1755,8 @@ def _fallback_tasks_and_relations(q: str, intent: str) -> tuple[tuple[str, ...],
     elif intent == "variable_dataflow":
         lifecycle = bool(re.search(
             r"\b(?:lifecycle|life cycle|trace|lineage|data movement|data flow|"
-            r"intermediate|originated|transferred|feeds?|toward|through)\b", q
+            r"intermediate|originated|transferred|feeds?|toward|through|"
+            r"everything(?: about)?|all about)\b", q
         ))
         if re.search(r"\bcompare|comparison|versus|vs\.?\b", q):
             tasks.append("variable_comparison")
@@ -1246,6 +1834,12 @@ def _fallback_tasks_and_relations(q: str, intent: str) -> tuple[tuple[str, ...],
         tasks.append("condition_outcome" if _is_condition_effect_question(q) else "business_rules")
     elif intent == "source_metrics":
         tasks.append("source_metrics")
+    elif intent == "program_summary":
+        tasks.append("program_summary")
+    elif intent == "artifact_inventory":
+        tasks.append("artifact_inventory")
+    elif intent == "cics_operations":
+        tasks.append("cics_operations")
 
     if "for each" in q and "example_per_item" not in relations:
         relations.append("example_per_item")

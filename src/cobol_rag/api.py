@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import os
+import re
+import threading
+import time
+from collections import OrderedDict
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, List, Optional
@@ -24,7 +28,7 @@ from cobol_rag.observability import (
 from cobol_rag.query import QueryError
 from cobol_rag.remove import apply_remove_plan, build_remove_plan
 from cobol_rag.reset import apply_reset_plan, build_reset_plan
-from cobol_rag.retrieve import retrieve as retrieve_documents
+from cobol_rag.retrieve import clear_retrieval_cache, retrieve as retrieve_documents
 from cobol_rag.sync import apply_sync_plan, build_sync_plan
 
 app = FastAPI(title="COBOL RAG API")
@@ -45,19 +49,43 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = PROJECT_ROOT / "config" / "default.yaml"
 UI_DIR = PROJECT_ROOT / "ui"
 
-# Global chat session cache (simplistic approach for single user)
-_chat_session: Optional[ChatSession] = None
+# Conversation memory must never leak between browsers or users.  The browser
+# supplies an opaque session id; command-line and older clients retain a
+# backwards-compatible "default" session.
+_MAX_CHAT_SESSIONS = 256
+_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_chat_sessions: "OrderedDict[str, tuple[float, ChatSession]]" = OrderedDict()
+_chat_sessions_lock = threading.RLock()
 
-def get_chat_session() -> ChatSession:
-    global _chat_session
-    if _chat_session is None:
+
+def _normalize_session_id(session_id: str | None) -> str:
+    candidate = (session_id or "default").strip()
+    return candidate if _SESSION_ID_PATTERN.fullmatch(candidate) else "default"
+
+
+def _request_session_id(request: Request, body_session_id: str | None = None) -> str:
+    return _normalize_session_id(body_session_id or request.headers.get("X-Session-ID"))
+
+
+def get_chat_session(session_id: str | None = None) -> ChatSession:
+    key = _normalize_session_id(session_id)
+    with _chat_sessions_lock:
+        cached = _chat_sessions.pop(key, None)
+        if cached is not None:
+            session = cached[1]
+            _chat_sessions[key] = (time.monotonic(), session)
+            return session
         settings = load_config(CONFIG_PATH)
-        _chat_session = ChatSession(config=settings)
-    return _chat_session
+        session = ChatSession(config=settings)
+        _chat_sessions[key] = (time.monotonic(), session)
+        while len(_chat_sessions) > _MAX_CHAT_SESSIONS:
+            _chat_sessions.popitem(last=False)
+        return session
 
 class ChatRequest(BaseModel):
     message: str
     program: Optional[str] = None
+    session_id: Optional[str] = None
 
 class SyncRequest(BaseModel):
     paths: Optional[List[str]] = None
@@ -87,8 +115,8 @@ def health() -> Any:
     }
 
 @app.post("/api/chat")
-def chat(req: ChatRequest) -> Any:
-    session = get_chat_session()
+def chat(req: ChatRequest, request: Request) -> Any:
+    session = get_chat_session(_request_session_id(request, req.session_id))
     try:
         answer = session.ask(req.message, target_program=req.program)
         sources = [
@@ -125,14 +153,14 @@ def chat(req: ChatRequest) -> Any:
         raise HTTPException(status_code=400, detail=str(error))
 
 @app.post("/api/chat/cancel")
-def chat_cancel() -> Any:
+def chat_cancel(request: Request) -> Any:
     """Stop waiting on the current question and keep it out of chat memory.
 
     The worker thread cannot be interrupted mid-generation, so the request runs
     to completion; what this changes is that its result is discarded instead of
     becoming the context the next question is resolved against.
     """
-    session = get_chat_session()
+    session = get_chat_session(_request_session_id(request))
     generation = session.cancel()
     return {
         "status": "ok",
@@ -142,8 +170,8 @@ def chat_cancel() -> Any:
 
 
 @app.post("/api/chat/reset")
-def chat_reset() -> Any:
-    session = get_chat_session()
+def chat_reset(request: Request) -> Any:
+    session = get_chat_session(_request_session_id(request))
     session.cancel()
     session.reset()
     return {"status": "ok", "message": "Chat memory cleared."}
@@ -232,6 +260,7 @@ def sync_inbox(req: SyncRequest) -> Any:
         plan = replace(plan, items=filtered_items)
 
     apply_sync_plan(settings, plan)
+    clear_retrieval_cache()
     
     return {
         "collection": plan.collection,
@@ -246,6 +275,7 @@ def reset_collection() -> Any:
     settings = load_config(CONFIG_PATH)
     plan = build_reset_plan(settings, dry_run=False)
     apply_reset_plan(settings, plan)
+    clear_retrieval_cache()
     return {"status": "ok", "message": f"Collection {plan.collection} reset."}
 
 @app.post("/api/inspect")

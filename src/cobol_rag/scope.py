@@ -57,6 +57,13 @@ class SessionState:
     current_entity_value: str | None = None
     current_entity_key: str | None = None
     current_entities: list[EntityReference] = field(default_factory=list)
+    # ``current_entities`` is the last resolved scope.  It may contain several
+    # comparison targets, so it is not safe to interpret its first item as what
+    # a later singular pronoun means.  Focus is set only when one target is
+    # unambiguous; the result set remains available for plural follow-ups.
+    focused_entity: EntityReference | None = None
+    last_result_entities: list[EntityReference] = field(default_factory=list)
+    last_capabilities: list[str] = field(default_factory=list)
     current_intent: str | None = None
     current_domain: str | None = None
     current_tasks: list[str] = field(default_factory=list)
@@ -90,6 +97,8 @@ class SessionState:
         if resolved_entities:
             primary = resolved_entities[0]
             self.current_entities = resolved_entities
+            self.last_result_entities = list(resolved_entities)
+            self.focused_entity = primary if len(resolved_entities) == 1 else None
             self.current_entity_type = primary.entity_type
             self.current_entity_value = primary.value
             self.current_entity_key = primary.entity_key
@@ -103,6 +112,11 @@ class SessionState:
             self.current_plan = dict(plan)
             self.current_domain = str(plan.get("domain") or "") or None
             self.current_tasks = [str(value) for value in plan.get("tasks", [])]
+            self.last_capabilities = [
+                str(item.get("capability"))
+                for item in plan.get("subtasks", [])
+                if isinstance(item, dict) and str(item.get("capability", "")).strip()
+            ]
             language = str(plan.get("response_language") or "").strip().lower()
             if language:
                 self.response_language = language
@@ -114,6 +128,7 @@ class SessionState:
         self.current_intent = None
         self.current_domain = None
         self.current_tasks.clear()
+        self.last_capabilities.clear()
         self.response_language = "en"
         self.last_sources.clear()
         self.pending_clarification = None
@@ -124,6 +139,8 @@ class SessionState:
         self.current_entity_value = None
         self.current_entity_key = None
         self.current_entities.clear()
+        self.focused_entity = None
+        self.last_result_entities.clear()
 
 
 def resolve_query_scope(
@@ -206,6 +223,19 @@ def resolve_query_scope(
     candidates = [
         entity for entity in eligible_entities if _contains_identifier(upper, entity.value)
     ]
+    # A program name can also appear in analyzer output as its entry paragraph.
+    # In ordinary questions ("describe PDCBVC", "calls in PDCBVC") that token is
+    # the program selector, not a paragraph selector.  Treat it as a paragraph only
+    # when the user explicitly says so; otherwise it can poison semantic planning by
+    # turning a program-wide request into an entity request.
+    candidates = [
+        entity
+        for entity in candidates
+        if entity.value not in programs
+        or bool(re.search(
+            rf"\bparagraph\s+{re.escape(entity.value)}\b", upper, flags=re.IGNORECASE,
+        ))
+    ]
     candidates = list({entity.entity_key: entity for entity in candidates}.values())
     candidates.sort(key=lambda item: (upper.find(item.value), -len(item.value)))
 
@@ -281,16 +311,21 @@ def resolve_query_scope(
         "question_unresolved" if has_unknown else "question" if resolved_entities else "unresolved"
     )
     if not resolved_entities and state and _should_reuse_state_entities(question, intent, state):
-        resolved_entities = list(state.current_entities)
-        if not resolved_entities and state.current_entity_value:
-            resolved_entities = [
-                EntityReference(
-                    program=state.current_program or program or "",
-                    entity_type=state.current_entity_type or "unknown",
-                    value=state.current_entity_value,
-                    entity_key=state.current_entity_key or "",
-                )
-            ]
+        resolved_entities = _state_entities_for_followup(question, state)
+        if not resolved_entities and _is_singular_entity_reference(question):
+            return QueryScope(
+                program=program,
+                programs=((program,) if program else ()),
+                intent=intent,
+                confidence=0.35,
+                program_source=program_source,
+                entity_source="session_ambiguous",
+                ambiguous=True,
+                reason=(
+                    "The previous result contains more than one entity, so the singular "
+                    "reference is ambiguous. Name the exact COBOL identifier."
+                ),
+            )
         entity_source = "session"
 
     entity = resolved_entities[0] if resolved_entities else None
@@ -353,11 +388,53 @@ _PRONOUN_REFERENCE = re.compile(rf"\b(?:it|them)\b{_PROGRESSIVE_AFTER_PRONOUN}",
 # parameters". Bare "its" before a participle is the misspelt contraction.
 _POSSESSIVE_REFERENCE = re.compile(r"\b(?:its|their)\s+(?!\w+ing\b)\w+\b", re.IGNORECASE)
 _NAMED_REFERENCE = re.compile(
-    r"\b(this one|that one|the same (?:variable|field|call|paragraph)|"
+    r"\b(this one|that one|(?:the|that) same (?:variable|field|call|paragraph)|"
     r"the variable|the field|the call|that call|this call|that paragraph|those paragraphs|"
     r"previously discussed variable|previous variable)\b",
     re.IGNORECASE,
 )
+
+_SINGULAR_ENTITY_REFERENCE = re.compile(
+    r"\b(?:it|its|this one|that one|(?:the|that) same (?:variable|field|call|paragraph)|"
+    r"the variable|the field|the call|that call|this call|that paragraph|"
+    r"previously discussed variable|previous variable)\b",
+    re.IGNORECASE,
+)
+_PLURAL_ENTITY_REFERENCE = re.compile(
+    r"\b(?:them|their|those|these|those two|the two|both|those paragraphs)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_singular_entity_reference(question: str) -> bool:
+    return bool(_SINGULAR_ENTITY_REFERENCE.search(question)) and not bool(
+        _PLURAL_ENTITY_REFERENCE.search(question)
+    )
+
+
+def _state_entities_for_followup(
+    question: str,
+    state: SessionState,
+) -> list[EntityReference]:
+    """Resolve singular and plural references from structured session state."""
+    if _is_singular_entity_reference(question):
+        if state.focused_entity is not None:
+            return [state.focused_entity]
+        if len(state.last_result_entities) == 1:
+            return list(state.last_result_entities)
+        # Backward compatibility for sessions created before focused memory was
+        # introduced (and for tests/clients that populate the legacy fields).
+        if not state.last_result_entities and state.current_entity_value:
+            return [EntityReference(
+                program=state.current_program or "",
+                entity_type=state.current_entity_type or "unknown",
+                value=state.current_entity_value,
+                entity_key=state.current_entity_key or "",
+            )]
+        return []
+    if _PLURAL_ENTITY_REFERENCE.search(question):
+        return list(state.last_result_entities or state.current_entities)
+    return list(state.current_entities)
 
 
 def _looks_like_followup(question: str) -> bool:
@@ -366,6 +443,7 @@ def _looks_like_followup(question: str) -> bool:
         _PRONOUN_REFERENCE.search(q)
         or _POSSESSIVE_REFERENCE.search(q)
         or _NAMED_REFERENCE.search(q)
+        or _PLURAL_ENTITY_REFERENCE.search(q)
         or re.match(r"^(?:and\s+)?(?:where|what|how|why|when)\s+else\b", q)
         or re.match(r"^(?:and\s+)?(?:what|how)\s+about\b", q)
         or re.match(
@@ -381,9 +459,18 @@ def _should_reuse_state_entities(
     intent: str | None,
     state: SessionState,
 ) -> bool:
-    if not state.current_entity_value or not _looks_like_followup(question):
+    has_remembered_entity = bool(
+        state.focused_entity or state.last_result_entities or state.current_entity_value
+    )
+    if not has_remembered_entity or not _looks_like_followup(question):
         return False
-    entity_type = state.current_entity_type or "unknown"
+    remembered = (
+        state.focused_entity
+        or (state.last_result_entities[0] if state.last_result_entities else None)
+    )
+    entity_type = state.current_entity_type or (
+        remembered.entity_type if remembered is not None else "unknown"
+    )
     if intent in {None, "general"}:
         return True
     compatible_types = {
@@ -403,8 +490,16 @@ _NON_ENTITY_IDENTIFIER_TOKENS = {
     "ABEND", "ASKTIME", "CALL", "CICS", "COBOL", "COMMAREA", "COPY",
     "DATA", "DB2", "DIVISION", "END-EXEC", "EXEC", "FORMATTIME", "INCLUDE",
     "JCL", "LINK", "LINKAGE", "ONLY", "PARAGRAPH", "PARAGRAPHS", "PROCEDURE",
-    "READQ", "RECEIVE", "RETURN", "SECTION", "SEND", "SOURCE", "SQL",
+    "LENGTH", "READQ", "RECEIVE", "RETURN", "SECTION", "SEND", "SOURCE", "SQL",
     "SYNCPOINT", "WORKING-STORAGE", "WRITEQ", "XCTL",
+    # COBOL/SQL syntax named in technical questions is a qualifier, not an
+    # identifier the corpus must contain.  Keeping these in the typed grammar
+    # prevents requests such as "show the USING parameter" from being rejected
+    # as questions about an unknown variable called USING.
+    "AND", "CONTENT", "EQUAL", "FROM", "GIVING", "INTO", "MOVE", "REFERENCE",
+    "RETURNING", "SELECT", "THEN", "THRU", "USING", "WHEN",
+    # Requested output formats and presentation words are not COBOL entities.
+    "ARRAY", "COUNT", "CSV", "JSON", "OBJECT", "XML", "YAML",
 }
 
 
@@ -434,6 +529,29 @@ def _catalogue(root_text: str) -> tuple[tuple[str, ...], tuple[EntityReference, 
     root = Path(root_text)
     if not root.exists():
         return (), ()
+
+    registry = _read_json(root / "corpus.registry.json")
+    if isinstance(registry, dict) and isinstance(registry.get("programs"), list):
+        registry_programs: set[str] = set()
+        registry_entities: dict[tuple[str, str, str], EntityReference] = {}
+        for item in registry["programs"]:
+            if not isinstance(item, dict):
+                continue
+            program = str(item.get("program", "")).strip().upper()
+            if not program:
+                continue
+            registry_programs.add(program)
+            for entity in item.get("entities", []):
+                if not isinstance(entity, dict):
+                    continue
+                entity_type = str(entity.get("type", "unknown")).strip().lower()
+                value = str(entity.get("value", "")).strip().upper()
+                if not value:
+                    continue
+                entity_key = str(entity.get("entity_key", "")).strip() or f"{program}|{entity_type.upper()}|{value}"
+                _add_entity(registry_entities, program, entity_type, value, entity_key)
+        if registry_programs:
+            return tuple(sorted(registry_programs)), tuple(registry_entities.values())
 
     programs: set[str] = set()
     entities: dict[tuple[str, str, str], EntityReference] = {}
@@ -486,7 +604,7 @@ def _catalogue(root_text: str) -> tuple[tuple[str, ...], tuple[EntityReference, 
             nodes = payload.get("nodes") or []
             for node in nodes:
                 value = str(node.get("id") if isinstance(node, dict) else node).strip().upper()
-                if value and value != program:
+                if value:
                     _add_entity(entities, program, "paragraph", value, f"{program}|PARAGRAPH|{value}")
 
     if not programs and root.name:

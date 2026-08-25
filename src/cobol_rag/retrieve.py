@@ -3,13 +3,56 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections import Counter
+import threading
+import time
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from cobol_rag.config import AppConfig
 from cobol_rag.index import open_index
+
+
+_COLLECTION_CACHE_TTL_SECONDS = 30.0
+_COLLECTION_CACHE_MAX_ENTRIES = 32
+_collection_cache: "OrderedDict[tuple[str, str, str], tuple[float, dict[str, Any]]]" = OrderedDict()
+_collection_cache_lock = threading.RLock()
+_lexical_partition_cache: "OrderedDict[tuple[Any, ...], tuple[float, LexicalPartition]]" = OrderedDict()
+
+
+def clear_retrieval_cache() -> None:
+    """Invalidate cached lexical/parent snapshots after collection mutations."""
+    with _collection_cache_lock:
+        _collection_cache.clear()
+        _lexical_partition_cache.clear()
+
+
+def _collection_snapshot(
+    config: AppConfig,
+    metadata_filters: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Read a program partition once, rather than scanning the whole corpus per query."""
+    filters = metadata_filters or {}
+    program = str(filters.get("program", "")).upper()
+    key = (str(config.paths.chroma_dir), config.index.collection, program)
+    now = time.monotonic()
+    with _collection_cache_lock:
+        cached = _collection_cache.pop(key, None)
+        if cached is not None and now - cached[0] <= _COLLECTION_CACHE_TTL_SECONDS:
+            _collection_cache[key] = cached
+            return cached[1]
+
+    resources = open_index(config)
+    kwargs: dict[str, Any] = {"include": ["documents", "metadatas"]}
+    if program:
+        kwargs["where"] = {"program": program}
+    raw = resources.chroma_collection.get(**kwargs)
+    with _collection_cache_lock:
+        _collection_cache[key] = (now, raw)
+        while len(_collection_cache) > _COLLECTION_CACHE_MAX_ENTRIES:
+            _collection_cache.popitem(last=False)
+    return raw
 
 
 @dataclass(frozen=True)
@@ -37,6 +80,76 @@ class RetrievalOutcome:
     correction_applied: bool
     expanded_count: int
     guard: EvidenceGuard
+
+
+@dataclass(frozen=True)
+class LexicalDocument:
+    text: str
+    metadata: dict[str, Any]
+    terms: tuple[str, ...]
+    frequencies: Counter[str]
+
+
+@dataclass(frozen=True)
+class LexicalPartition:
+    documents: tuple[LexicalDocument, ...]
+    document_frequency: Counter[str]
+    average_length: float
+
+
+def _compiled_lexical_partition(
+    raw: dict[str, Any],
+    *,
+    chunk_types: list[str] | None,
+    metadata_filters: dict[str, Any],
+) -> LexicalPartition:
+    """Compile one program partition once instead of tokenizing it per query."""
+    allowed_types = tuple(sorted(set(chunk_types or [])))
+    filter_key = tuple(sorted((str(key), str(value)) for key, value in metadata_filters.items()))
+    cache_key = (id(raw), allowed_types, filter_key)
+    now = time.monotonic()
+    with _collection_cache_lock:
+        cached = _lexical_partition_cache.pop(cache_key, None)
+        if cached is not None and now - cached[0] <= _COLLECTION_CACHE_TTL_SECONDS:
+            _lexical_partition_cache[cache_key] = cached
+            return cached[1]
+
+    allowed = set(allowed_types)
+    documents: list[LexicalDocument] = []
+    document_frequency: Counter[str] = Counter()
+    for text, metadata in zip(raw.get("documents") or [], raw.get("metadatas") or []):
+        if not isinstance(text, str) or not isinstance(metadata, dict):
+            continue
+        if allowed and metadata.get("chunk_type") not in allowed:
+            continue
+        if not _metadata_matches(metadata, metadata_filters):
+            continue
+        terms = tuple(_lexical_terms(text))
+        frequencies = Counter(terms)
+        document_frequency.update(frequencies.keys())
+        documents.append(
+            LexicalDocument(
+                text=text,
+                metadata=metadata,
+                terms=terms,
+                frequencies=frequencies,
+            )
+        )
+    average_length = max(
+        (sum(len(document.terms) for document in documents) / len(documents))
+        if documents else 0.0,
+        1.0,
+    )
+    partition = LexicalPartition(
+        documents=tuple(documents),
+        document_frequency=document_frequency,
+        average_length=average_length,
+    )
+    with _collection_cache_lock:
+        _lexical_partition_cache[cache_key] = (now, partition)
+        while len(_lexical_partition_cache) > _COLLECTION_CACHE_MAX_ENTRIES * 2:
+            _lexical_partition_cache.popitem(last=False)
+    return partition
 
 
 def retrieve(
@@ -307,39 +420,29 @@ def _lexical_from_collection(
     chunk_types: list[str] | None,
     metadata_filters: dict[str, Any] | None = None,
 ) -> list[RetrievalResult]:
-    resources = open_index(config)
-    raw = resources.chroma_collection.get(include=["documents", "metadatas"])
-    documents = raw.get("documents") or []
-    metadatas = raw.get("metadatas") or []
-    allowed_types = set(chunk_types or [])
-
-    corpus: list[tuple[str, dict[str, Any], list[str]]] = []
-    for text, metadata in zip(documents, metadatas):
-        if not isinstance(text, str) or not isinstance(metadata, dict):
-            continue
-        if allowed_types and metadata.get("chunk_type") not in allowed_types:
-            continue
-        if not _metadata_matches(metadata, metadata_filters or {}):
-            continue
-        corpus.append((text, metadata, _lexical_terms(text)))
-    if not corpus:
+    raw = _collection_snapshot(config, metadata_filters)
+    partition = _compiled_lexical_partition(
+        raw,
+        chunk_types=chunk_types,
+        metadata_filters=metadata_filters or {},
+    )
+    if not partition.documents:
         return []
 
     query_terms = list(dict.fromkeys(_lexical_terms(query)))
     if not query_terms:
         return []
     query_identifiers = set(_query_identifiers(query))
-    document_frequency = {
-        term: sum(1 for _text, _metadata, terms in corpus if term in set(terms))
-        for term in query_terms
-    }
-    average_length = max(sum(len(terms) for _text, _metadata, terms in corpus) / len(corpus), 1.0)
-    total = len(corpus)
+    document_frequency = partition.document_frequency
+    average_length = partition.average_length
+    total = len(partition.documents)
     scored: list[RetrievalResult] = []
 
-    for text, metadata, terms in corpus:
-        frequencies = Counter(terms)
-        length = max(len(terms), 1)
+    for document in partition.documents:
+        text = document.text
+        metadata = document.metadata
+        frequencies = document.frequencies
+        length = max(len(document.terms), 1)
         score = 0.0
         for term in query_terms:
             frequency = frequencies.get(term, 0)
@@ -549,6 +652,15 @@ def _intent_rerank(
 
 def _detect_intent(query: str) -> str:
     q = query.lower()
+    # "Do you have a file called X?" asks whether an analyzed program exists;
+    # it is not a JCL dataset/file-I/O question.  Exact program resolution in
+    # the typed planner will confirm which program was named.
+    if re.search(
+        r"\b(?:(?:do\s+)?you\s+have|have\s+you\s+got|is\s+there)\b.{0,45}"
+        r"\b(?:file|program|source)\b.{0,30}\b(?:called|named)\b",
+        q,
+    ):
+        return "program_summary"
     if any(
         term in q
         for term in (
@@ -573,6 +685,18 @@ def _detect_intent(query: str) -> str:
     if any(term in q for term in ("business rule", "business rules", "rules implemented", "direct cobol evidence")):
         return "business_rules"
     if any(term in q for term in ("control flow", "execution flow", "entry point", "path to termination", "execution path")):
+        return "control_flow"
+    if (
+        re.search(r"\bwalk\s+(?:me\s+)?through\b", q)
+        and re.search(r"\b(?:start|beginning|entry)\b.{0,80}\b(?:finish|end|termination|exit)\b", q)
+    ) or re.search(r"\bfrom\s+(?:start|beginning|entry)\s+to\s+(?:finish|end|termination|exit)\b", q):
+        return "control_flow"
+    if (
+        re.search(r"\b(?:pagination|page navigation|paging)\b", q)
+        or re.search(r"\b(?:page|move|go)\s+(?:through|between)\s+(?:the\s+)?results?\b", q)
+        or re.search(r"\b(?:move|go|step|navigate)s?\s+(?:through|between)\s+(?:the\s+)?result\s+pages?\b", q)
+        or re.search(r"\b(?:next|previous|prior)\s+(?:result\s+)?page\b", q)
+    ):
         return "control_flow"
     if (
         any(term in q for term in ("decide whether", "choose between", "start from", "branch to", "path between"))
@@ -600,7 +724,19 @@ def _detect_intent(query: str) -> str:
         )
     ):
         return "variable_dataflow"
-    if any(term in q for term in ("hardcoded", "hard-coded", "static value", "static values", "forced value")):
+    if (
+        re.search(r"\b(?:variables?|data items?|fields?)\b", q)
+        and re.search(
+            r"\b(?:name|list|show|sample|declare[ds]?|which|what|how many|count|"
+            r"tell me about|control(?:s| the)? flow|decide(?:s)? (?:the )?flow)\b",
+            q,
+        )
+    ):
+        return "variable_inventory"
+    if any(term in q for term in (
+        "hardcoded", "hard-coded", "static value", "static values", "forced value",
+        "literal assignment", "literal assignments",
+    )):
         return "static_values"
     if any(term in q for term in ("outside program", "outside programs", "external program", "external programs", "external call", "external calls", "called program", "called programs", "with parameters", "commarea", "link", "xctl")):
         return "external_programs"
@@ -972,17 +1108,26 @@ def _expand_context(
 ) -> list[RetrievalResult]:
     if not primary or not program:
         return []
-    resources = open_index(config)
-    raw = resources.chroma_collection.get(include=["documents", "metadatas"])
+    raw = _collection_snapshot(config, {"program": program.upper()})
     documents = raw.get("documents") or []
     metadatas = raw.get("metadatas") or []
     seen = {_result_key(result) for result in primary}
     parent_candidates: list[RetrievalResult] = []
     sibling_candidates: list[RetrievalResult] = []
     primary_parent_ids = {
-        str(result.metadata.get("parent_id", ""))
+        str(value)
         for result in primary
-        if result.metadata.get("parent_id")
+        for value in (
+            result.metadata.get("parent_id"),
+            result.metadata.get("program_parent_id"),
+            result.metadata.get("domain_parent_id"),
+        )
+        if value
+    }
+    primary_entity_ids = {
+        str(result.metadata.get("entity_parent_id", ""))
+        for result in primary
+        if result.metadata.get("entity_parent_id")
     }
 
     for text, metadata in zip(documents, metadatas):
@@ -990,10 +1135,14 @@ def _expand_context(
             continue
         if metadata.get("program") != program.upper():
             continue
-        if allowed_chunk_types and str(metadata.get("chunk_type", "")) not in allowed_chunk_types:
-            continue
         candidate = RetrievalResult(score=0.0, text=text, metadata=metadata)
         if _result_key(candidate) in seen:
+            continue
+        node_id = str(metadata.get("node_id", ""))
+        if node_id and node_id in primary_parent_ids:
+            parent_candidates.append(_with_context_role(candidate, "parent_context"))
+            continue
+        if allowed_chunk_types and str(metadata.get("chunk_type", "")) not in allowed_chunk_types:
             continue
         same_intent = metadata.get("intent_domain") == intent
         level = str(metadata.get("hierarchy_level", ""))
@@ -1010,11 +1159,25 @@ def _expand_context(
         parent_id = str(metadata.get("parent_id", ""))
         if same_intent and parent_id and parent_id in primary_parent_ids:
             sibling_candidates.append(_with_context_role(candidate, "domain_sibling"))
+            continue
+        entity_parent_id = str(metadata.get("entity_parent_id", ""))
+        if entity_parent_id and entity_parent_id in primary_entity_ids:
+            sibling_candidates.append(_with_context_role(candidate, "entity_sibling"))
 
     relation_rich = bool(relations)
-    parent_limit = 2 if relation_rich else 1
+    # Keep both the immediate domain and the program summary when available.
+    # One parent was insufficient for a real entity -> domain -> program walk.
+    parent_limit = 3 if relation_rich else 2
     sibling_limit = max(6, len(entity_pairs) * 3) if relation_rich else 2
-    parents = _intent_rerank("", parent_candidates, parent_limit, intent_override=intent)
+    # Canonical intent reranking intentionally drops unrelated chunk types, but
+    # a program parent is cross-domain context by definition. Preserve those
+    # explicit hierarchy matches after ordering the intent-specific parent.
+    parents = _intent_rerank(
+        "", parent_candidates, len(parent_candidates), intent_override=intent,
+    )
+    parents = _deduplicate_results(
+        parents + [candidate for candidate in parent_candidates if candidate not in parents]
+    )[:parent_limit]
     siblings = _intent_rerank("", sibling_candidates, sibling_limit, intent_override=intent)
     return _deduplicate_results(parents + siblings)
 

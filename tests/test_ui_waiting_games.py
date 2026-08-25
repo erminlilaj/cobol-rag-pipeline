@@ -82,6 +82,12 @@ class WaitingGamesAssetTest(unittest.TestCase):
         self.assertIn("app.js?v=waiting-games-", self.index)
         self.assertIn('response.headers["Cache-Control"] = "no-store', self.api)
 
+    def test_each_browser_has_isolated_chat_memory(self) -> None:
+        self.assertIn("cobol-rag-session-id", self.script)
+        self.assertIn("X-Session-ID", self.script)
+        self.assertIn("_chat_sessions", self.api)
+        self.assertIn("_request_session_id(request", self.api)
+
 
 if __name__ == "__main__":
     unittest.main()

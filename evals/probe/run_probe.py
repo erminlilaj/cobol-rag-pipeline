@@ -42,6 +42,25 @@ def check_text(answer: str, must_include: list[str], must_not_include: list[str]
     return problems
 
 
+def check_contract(answer: str, plan: dict[str, Any], expected: dict[str, Any]) -> list[str]:
+    """Apply strict probe assertions that loose substring checks cannot express."""
+    problems: list[str] = []
+    if "answer_equals" in expected and answer.strip() != str(expected["answer_equals"]).strip():
+        problems.append(f"answer:{answer.strip()!r}!={str(expected['answer_equals']).strip()!r}")
+    if "exact_bullet_count" in expected:
+        returned = sum(line.lstrip().startswith("- ") for line in answer.splitlines())
+        wanted = int(expected["exact_bullet_count"])
+        if returned != wanted:
+            problems.append(f"bullet_count:{returned}!={wanted}")
+    if expected.get("expected_intent") and plan.get("intent") != expected["expected_intent"]:
+        problems.append(f"intent:{plan.get('intent')}!={expected['expected_intent']}")
+    required_tasks = set(expected.get("required_tasks", []))
+    missing_tasks = sorted(required_tasks - set(plan.get("tasks") or []))
+    if missing_tasks:
+        problems.append(f"missing_tasks:{','.join(missing_tasks)}")
+    return problems
+
+
 def ask(api: str, question: str, program: str | None, timeout: float) -> tuple[dict[str, Any], float]:
     started = time.perf_counter()
     try:
@@ -79,12 +98,14 @@ def run_case(case: dict[str, Any], api: str, program: str | None, timeout: float
             list(turn.get("must_include", [])),
             list(turn.get("must_not_include", [])),
         )
+        expectations = {**case, **turn}
+        turn_problems.extend(check_contract(answer, plan, expectations))
         if result.get("route") == "ERROR":
             turn_problems.append(f"request_failed:{result.get('error', '')[:80]}")
-        expected_route = case.get("expected_route") if len(turns) == 1 else None
+        expected_route = expectations.get("expected_route")
         if expected_route and result.get("route") != expected_route:
             turn_problems.append(f"route:{result.get('route')}!={expected_route}")
-        expected_mode = case.get("expected_mode") if len(turns) == 1 else None
+        expected_mode = expectations.get("expected_mode")
         if expected_mode and result.get("execution_mode") != expected_mode:
             turn_problems.append(f"mode:{result.get('execution_mode')}!={expected_mode}")
         problems.extend(f"t{index}:{item}" for item in turn_problems)

@@ -392,7 +392,7 @@ python -m cobol_rag.evaluation \
   --final-scripts-dir /workspace/.runs/PDCBVC/analysis/output/combined/final_scripts/PDCBVC
 ```
 
-Evaluation reports are written to the configured `paths.eval_dir`. The current 47-case suite measures route, intent, program, entities, comparison and exhaustive-result plans, source recall, execution mode, answer content, follow-up behavior, and abstention.
+Evaluation reports are written to the configured `paths.eval_dir`. The current 74-case development suite measures route, intent, program, entities, comparison and exhaustive-result plans, source recall, execution mode, answer content, follow-up behavior, abstention, typed keyword handling, and compound-contract reconciliation.
 
 The development gold suite must not read files under `evals/holdout`. Holdout suites are versioned and checksum-sealed; run them only after implementation is frozen:
 

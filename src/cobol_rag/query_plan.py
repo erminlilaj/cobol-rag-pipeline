@@ -6,7 +6,13 @@ import re
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
-from cobol_rag.scope import EntityReference, QueryScope, SessionState
+from cobol_rag.scope import (
+    EntityReference,
+    QueryScope,
+    SessionState,
+    named_identifiers_in,
+    refers_to_previous_turn,
+)
 
 
 @dataclass(frozen=True)
@@ -653,7 +659,7 @@ def build_query_plan(
     upper = question.upper()
     resolved_intent = intent or scope.intent or "general"
     detected_intent = resolved_intent
-    explicit_followup = _is_explicit_followup(q)
+    explicit_followup = _is_explicit_followup(q, question)
     if explicit_followup and resolved_intent == "general" and state and state.current_intent:
         resolved_intent = state.current_intent
 
@@ -900,6 +906,19 @@ def build_query_plan(
                 else None
             )
             result_offset = previous_offset + int(previous_count or 25)
+        # "How many variables are in PDCBVC?" -> 168, then "list them". The
+        # follow-up asks for the set that was just counted, so it is exhaustive
+        # by construction: at the default cap it would print 25 rows under a
+        # heading that says 168, which reads as a complete answer and is not one.
+        # The count contract itself must not carry over -- the follow-up changes
+        # the presentation from a number to the members it counted.
+        elif (
+            str((previous.get("response_contract") or {}).get("format", "default")) == "count"
+            and response_contract.format == "default"
+            and response_contract.exact_item_count is None
+            and not re.search(r"\b(?:sample|few|some|examples?|first|only)\b", q)
+        ):
+            result_scope = "all"
 
     programs = tuple(getattr(scope, "programs", ()) or ((scope.program,) if scope.program else ()))
     requires_comparison = "compare" in operations or len(programs) > 1
@@ -1946,7 +1965,13 @@ def _condition_terms(question: str) -> tuple[str, ...]:
     return _unique(term.strip() for term in terms if term.strip())
 
 
-def _is_explicit_followup(q: str) -> bool:
+def _is_explicit_followup(q: str, question: str = "") -> bool:
+    # A bare imperative continues the topic just as much as a question does:
+    # "list them" is the same request as "what are they?". The wh-word patterns
+    # below never saw it, so the session intent was not inherited and the
+    # planner was free to pick an unrelated capability.
+    if refers_to_previous_turn(q) and not named_identifiers_in(question or q):
+        return True
     return bool(
         re.search(
             r"^(?:and\s+)?(?:where|what|how|why|when)\b.*"

@@ -541,6 +541,28 @@ def source_address_entity(program: str | None, address: dict[str, Any]) -> Entit
     )
 
 
+def named_identifiers_in(question: str) -> tuple[str, ...]:
+    """COBOL identifiers written out in a message, in their original casing.
+
+    Exposed so the planner can tell "list them" from "list the copybooks in
+    PDRTWA2": a message that names something is starting a new subject, not
+    continuing the previous one.
+    """
+    return _explicit_identifier_tokens(question)
+
+
+def refers_to_previous_turn(question: str) -> bool:
+    """True when a message continues the last one instead of starting fresh.
+
+    Shared with the planner deliberately. This module treated "list them" as a
+    continuation while the planner's own narrower test did not, so the session
+    topic was never inherited and "how many variables are in PDCBVC?" -> "list
+    them" answered with the copybooks. Two views of what a follow-up is are one
+    more than the system can keep consistent.
+    """
+    return _looks_like_followup(question)
+
+
 def _looks_like_followup(question: str) -> bool:
     q = question.lower().strip()
     return bool(

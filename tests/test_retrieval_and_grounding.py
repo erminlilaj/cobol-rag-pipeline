@@ -55,6 +55,7 @@ from cobol_rag.query import (
     QueryRoutingDecision,
 )
 from cobol_rag.query_plan import (
+    _is_explicit_followup,
     _CAPABILITY_ENTITY_TYPES,
     _CAPABILITY_TASKS,
     EvidenceSubtask,
@@ -91,6 +92,7 @@ from cobol_rag.scope import (
     SessionState,
     resolve_query_scope,
     source_address_entity,
+    refers_to_previous_turn,
     source_address_in,
     source_addresses_in,
 )
@@ -2415,6 +2417,78 @@ class PerItemRequestsKeepTheirFormatterTest(unittest.TestCase):
         self.assertFalse(_direct_handler_supports(
             self._plan(("program_summary",), "program_summary"),
         ))
+
+
+class CollectionFollowupTest(unittest.TestCase):
+    """A follow-up asks for the set that was just counted, in full."""
+
+    @staticmethod
+    def _counted(intent: str = "variable_inventory") -> SessionState:
+        return SessionState(
+            current_program="PDCBVC", current_intent=intent,
+            current_plan={
+                "intent": intent, "result_offset": 0,
+                "response_contract": {"format": "count"},
+            },
+        )
+
+    def _plan(self, question: str, state: SessionState) -> QueryPlan:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="general")
+        return build_query_plan(question, scope, intent="general", state=state)
+
+    def test_a_bare_imperative_continues_the_topic(self) -> None:
+        # Observed production failure: "how many variables are in PDCBVC?" -> 168,
+        # then "list them" -> a list of 12 copybooks. The planner's follow-up test
+        # required a wh-word, so a bare imperative never inherited the topic and
+        # an unrelated capability was free to win.
+        for question in ("list them", "list them all", "show them", "give me all of them"):
+            with self.subTest(question=question):
+                plan = self._plan(question, self._counted())
+                self.assertEqual(plan.intent, "variable_inventory")
+
+    def test_the_follow_up_to_a_count_is_exhaustive(self) -> None:
+        # Inheriting the intent alone is not enough: the variable renderer caps a
+        # non-exhaustive list at 25, so "list them" would print 25 rows under a
+        # heading reading 168 -- a truncation with nothing to show it happened.
+        plan = self._plan("list them", self._counted())
+        self.assertEqual(plan.result_scope, "all")
+        # The count contract itself must not carry over; the follow-up asks for
+        # the members, not the number again.
+        self.assertNotEqual(plan.response_contract.format, "count")
+
+    def test_an_explicitly_bounded_follow_up_stays_bounded(self) -> None:
+        plan = self._plan("show me a few of them", self._counted())
+        self.assertEqual(plan.intent, "variable_inventory")
+        self.assertNotEqual(plan.result_scope, "all")
+
+    def test_naming_something_starts_a_new_subject(self) -> None:
+        # The guard that stops session state following the user to another
+        # program: a message that names an identifier is not a continuation.
+        for question in (
+            "List the variables in PDRTWA2",
+            "Show them for PDXXXXX",
+            "Where is NPAGT written?",
+        ):
+            with self.subTest(question=question):
+                self.assertFalse(_is_explicit_followup(question.lower(), question))
+
+    def test_a_topic_change_does_not_inherit_the_previous_capability(self) -> None:
+        for question, forbidden in (
+            ("Now give me an overall summary of PDCBVC.", "variable_inventory"),
+            ("Which copybooks are unused?", "variable_inventory"),
+            ("List the copybooks.", "variable_inventory"),
+            ("hi", "variable_inventory"),
+        ):
+            with self.subTest(question=question):
+                self.assertNotEqual(self._plan(question, self._counted()).intent, forbidden)
+
+    def test_scope_and_planner_agree_on_what_a_follow_up_is(self) -> None:
+        # The two disagreed, which is why the bug existed: scope.py treated
+        # "list them" as a follow-up and the planner did not.
+        for question in ("list them", "show them", "and where is it tested?"):
+            with self.subTest(question=question):
+                self.assertTrue(refers_to_previous_turn(question.lower()))
+                self.assertTrue(_is_explicit_followup(question.lower(), question))
 
 
 class MapEntityTest(unittest.TestCase):

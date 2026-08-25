@@ -82,7 +82,7 @@ def answer_from_final_scripts(
             return answer
 
     if intent == "external_programs" or (use_text_fallback and _asks_about_calls(q)):
-        answer = _answer_calls(root, program, plan)
+        answer = _answer_calls(root, program, plan, q)
         if answer:
             return answer
 
@@ -1389,6 +1389,7 @@ def _answer_calls(
     root: Path,
     program: str,
     plan: QueryPlan | None = None,
+    q: str = "",
 ) -> str | None:
     payload_path = _artifact_path(root, "architecture.call_parameters.json")
     payload = _read_json(payload_path)
@@ -1456,7 +1457,11 @@ def _answer_calls(
             for call in calls
         )
 
-    lines = [f"{program} outgoing calls with parameters ({len(calls)} matching call(s)):"]
+    lines: list[str] = []
+    superlative = _LENGTH_SUPERLATIVE.search(q)
+    if superlative and "length" in requested_fields:
+        lines.extend(_length_ranking(calls, superlative.group(1).lower()))
+    lines.append(f"{program} outgoing calls with parameters ({len(calls)} matching call(s)):")
     for call in calls:
         target = call.get("target", "?")
         call_type = call.get("call_type", "?")
@@ -1546,6 +1551,49 @@ def _canonical_call_operation(value: Any) -> str:
     return "CALL"
 
 
+# Ordinary English comparatives. Ranking is arithmetic over a recorded field,
+# not a judgement, so the words are all this needs to recognise the request.
+_LENGTH_SUPERLATIVE = re.compile(
+    r"\b(largest|biggest|greatest|longest|maximum|max|highest|"
+    r"smallest|shortest|minimum|min|lowest)\b", re.IGNORECASE,
+)
+
+
+def _length_ranking(calls: list[dict[str, Any]], word: str) -> list[str]:
+    """State which call records the extreme LENGTH, and what could not be ranked.
+
+    Listing every call leaves the comparison to the reader, which is not an
+    answer to "which call uses the largest LENGTH". Only literal lengths can be
+    ordered -- a LENGTH given as a variable has no value in the artifact -- so
+    the ones that cannot be compared are named rather than dropped.
+    """
+    numeric: list[tuple[int, dict[str, Any]]] = []
+    incomparable: list[str] = []
+    for call in calls:
+        length = str(call.get("length") or "").strip()
+        target = str(call.get("target") or "?")
+        if not length:
+            incomparable.append(f"{target} records no LENGTH")
+        elif length.isdigit():
+            numeric.append((int(length), call))
+        else:
+            incomparable.append(f"{target} uses LENGTH={length}, not a literal")
+    if not numeric:
+        return ["No call records a numeric LENGTH, so none can be ranked."]
+    smallest = word in {"smallest", "shortest", "minimum", "min", "lowest"}
+    value, call = (min if smallest else max)(numeric, key=lambda item: item[0])
+    label = "smallest" if smallest else "largest"
+    line = (
+        f"{label.capitalize()} recorded LENGTH: {call.get('target', '?')} at {value} "
+        f"({call.get('paragraph', '?')} line {call.get('line_start', '?')}), "
+        f"ranked over {len(numeric)} call(s) with a literal LENGTH."
+    )
+    out = [line]
+    if incomparable:
+        out.append("Not ranked: " + "; ".join(incomparable) + ".")
+    return out
+
+
 def _answer_literal_assignments(
     root: Path,
     program: str,
@@ -1566,6 +1614,26 @@ def _answer_literal_assignments(
                 item for item in items
                 if str(item.get("target_variable", "")).upper() in requested_variables
             ]
+        # A question that names a paragraph is asking about that paragraph.
+        # "List every hardcoded value assigned in INIZ-PARAM" returned all 65
+        # program-wide, headed by one in TOP -- an answer to a question nobody
+        # asked, and indistinguishable from a correct one.
+        requested_paragraphs = {
+            value.upper() for value in plan.entity_values_for("paragraph")
+        }
+        if requested_paragraphs:
+            scoped = [
+                item for item in items
+                if str(item.get("paragraph", "")).upper() in requested_paragraphs
+            ]
+            if scoped:
+                items = scoped
+            else:
+                named = ", ".join(sorted(requested_paragraphs))
+                return (
+                    f"{program} records no literal assignment in {named}. "
+                    f"Source: `{payload_path.name}`."
+                )
     if "commarea" in q or "parameter" in q:
         items = [item for item in items if item.get("call_commarea_field")]
     elif "screen" in q or "map" in q:

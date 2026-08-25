@@ -76,6 +76,8 @@ from cobol_rag.query_plan import (
 from cobol_rag.final_scripts_answers import (
     _answer_artifact_inventory,
     _answer_cics_operations,
+    _answer_literal_assignments,
+    _length_ranking,
     _cics_statement_resources,
     absent_capability_answer,
     answer_source_line_spans,
@@ -2418,6 +2420,99 @@ class PerItemRequestsKeepTheirFormatterTest(unittest.TestCase):
         self.assertFalse(_direct_handler_supports(
             self._plan(("program_summary",), "program_summary"),
         ))
+
+
+class ScopedAndRankedEvidenceTest(unittest.TestCase):
+    """A question that names a scope, or asks for an extreme, gets that answered."""
+
+    _CALLS = [
+        {"target": "PD1VOCI", "call_type": "CICSLINK", "paragraph": "LINK-PD1VOCI",
+         "line_start": 486, "length": "32000", "commarea": "WPD1VOCI", "parameters": ["WPD1VOCI"]},
+        {"target": "PD1FS00", "call_type": "CICSLINK", "paragraph": "LINK-PD1FS00",
+         "line_start": 500, "length": "PD1FS00-LUNGH", "commarea": "WPD1FS00", "parameters": ["WPD1FS00"]},
+        {"target": "PD0UTI01", "call_type": "CICSLINK", "paragraph": "LINK-PD0UTI01",
+         "line_start": 775, "length": "400", "commarea": "WPDRUTI01", "parameters": ["WPDRUTI01"]},
+        {"target": "PDPRED", "call_type": "CICSXCTL", "paragraph": "XCTL-MAIN",
+         "line_start": 845, "parameters": []},
+    ]
+
+    def test_the_extreme_is_stated_and_what_cannot_be_ranked_is_named(self) -> None:
+        # Observed production failure: "Which call uses the largest LENGTH
+        # value?" was answered with a control-flow walkthrough. Listing the
+        # calls instead would leave the comparison to the reader, and ranking
+        # silently over 2 of 4 would be worse than either.
+        lines = _length_ranking(self._CALLS, "largest")
+        joined = "\n".join(lines)
+        self.assertIn("PD1VOCI", joined)
+        self.assertIn("32000", joined)
+        self.assertIn("PD1FS00-LUNGH", joined)
+        self.assertIn("PDPRED", joined)
+        self.assertIn("Not ranked", joined)
+
+    def test_the_opposite_extreme_is_honoured(self) -> None:
+        joined = "\n".join(_length_ranking(self._CALLS, "smallest"))
+        self.assertIn("PD0UTI01", joined)
+        self.assertIn("400", joined)
+
+    def test_a_field_only_calls_record_routes_to_call_evidence(self) -> None:
+        # COMMAREA and LENGTH are recorded by call evidence and nothing else.
+        for question in (
+            "Which call uses the largest LENGTH value?",
+            "Which calls pass a COMMAREA?",
+        ):
+            with self.subTest(question=question):
+                plan = build_query_plan(
+                    question,
+                    QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="general"),
+                    intent="general",
+                )
+                self.assertEqual(plan.intent, "external_programs")
+
+    def test_the_field_rule_does_not_outrank_a_resolved_entity(self) -> None:
+        # "What is the length of WABEND-CODE?" is about a variable; the rule
+        # fires only when nothing better is known.
+        plan = build_query_plan(
+            "What is the length of WABEND-CODE?",
+            QueryScope(
+                program="PDCBVC", programs=("PDCBVC",), intent="general",
+                entities=(EntityReference(
+                    "PDCBVC", "variable", "WABEND-CODE", "PDCBVC|VARIABLE|WABEND-CODE"),),
+            ),
+            intent="general",
+        )
+        self.assertEqual(plan.intent, "variable_dataflow")
+
+
+    def test_literals_are_scoped_to_a_named_paragraph(self) -> None:
+        # Observed production failure: "List every hardcoded value assigned in
+        # INIZ-PARAM" returned all 65 program-wide, headed by one in TOP.
+        payload = {"program": "PDCBVC", "assignments": [
+            {"line": 226, "paragraph": "TOP", "target_variable": "WABEND-CODE", "literal": "BR00"},
+            {"line": 434, "paragraph": "INIZ-PARAM", "target_variable": "PD1VOCI-TIPO-GEST", "literal": "00"},
+            {"line": 437, "paragraph": "INIZ-PARAM", "target_variable": "PD1VOCI-FUNZIONE", "literal": "11"},
+        ]}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "dataflow.literal_assignments.json").write_text(
+                json.dumps(payload), encoding="utf-8")
+            plan = QueryPlan(
+                intent="static_values", program="PDCBVC", programs=("PDCBVC",),
+                entities=(EntityReference(
+                    "PDCBVC", "paragraph", "INIZ-PARAM", "PDCBVC|PARAGRAPH|INIZ-PARAM"),),
+            )
+            answer = _answer_literal_assignments(root, "PDCBVC", "list every hardcoded value", plan)
+            self.assertIn("PD1VOCI-TIPO-GEST", answer)
+            self.assertNotIn("WABEND-CODE", answer)
+
+            absent = QueryPlan(
+                intent="static_values", program="PDCBVC", programs=("PDCBVC",),
+                entities=(EntityReference(
+                    "PDCBVC", "paragraph", "NO-SUCH-PARA", "PDCBVC|PARAGRAPH|NO-SUCH-PARA"),),
+            )
+            # An empty scope is reported, not widened back to the program.
+            missing = _answer_literal_assignments(root, "PDCBVC", "list every hardcoded value", absent)
+            self.assertIn("NO-SUCH-PARA", missing)
+            self.assertNotIn("WABEND-CODE", missing)
 
 
 class RejectedTurnIsNotAnAntecedentTest(unittest.TestCase):

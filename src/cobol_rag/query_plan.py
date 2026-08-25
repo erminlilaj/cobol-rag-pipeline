@@ -841,6 +841,13 @@ def build_query_plan(
         for field, patterns in _OUTPUT_FIELD_PATTERNS.items()
         if any(re.search(pattern, q) for pattern in patterns)
     )
+    if resolved_intent == "general" and {"commarea", "length"} & set(output_fields):
+        # COMMAREA and LENGTH are recorded by call evidence and nothing else, so
+        # asking for one says which evidence the question is about. This fires
+        # only when nothing better is known: "which call uses the largest
+        # LENGTH?" was otherwise left to the planner, which answered it with a
+        # control-flow walkthrough.
+        resolved_intent = "external_programs"
     only_requested_fields = bool(
         re.search(
             r"(?:return|provide|give|include|show)\s+only\s+(?:their\s+|the\s+)?"

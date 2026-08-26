@@ -706,6 +706,17 @@ def build_query_plan(
         # copied in?" was answered from variable evidence: EXEC CICS ADDRESS TWA
         # at line 805, rather than COPY PDRTWA2. at line 210.
         resolved_intent = "copybooks"
+    elif (
+        resolved_intent == "general"
+        and not scope.entities
+        and _PARAGRAPH_INVENTORY.search(q)
+    ):
+        # Listing a program's paragraphs is the same catalogue as counting them.
+        # Only when nothing more specific was recognised: "List every CICS LINK
+        # or XCTL issued by PDCBVC, with the target program, paragraph, and
+        # line" names paragraphs as an output field of a question about calls,
+        # and is not a paragraph inventory.
+        resolved_intent = "source_metrics"
     elif _is_source_metrics_question(q) and not scope.entities:
         # Counting the program's paragraphs is a program metric; counting the
         # paragraphs that touch a named variable is that variable's evidence.
@@ -911,6 +922,14 @@ def build_query_plan(
             include_types = [str(value) for value in previous.get("include_types", [])]
         if not exclude_types and resolved_intent == str(previous.get("intent", "")):
             exclude_types = [str(value) for value in previous.get("exclude_types", [])]
+        if not output_fields and resolved_intent == str(previous.get("intent", "")):
+            # "How many paragraphs does PDCBVC have?" then "list them". The
+            # follow-up names no subject of its own, so without carrying the
+            # previous one forward the renderer cannot tell which catalogue is
+            # being asked for and the turn falls to generation.
+            output_fields = tuple(
+                str(value) for value in previous.get("output_fields", [])
+            )
         if result_scope == "default":
             previous_scope = str(previous.get("result_scope", "default"))
             if previous_scope in {"default", "all"}:
@@ -1973,6 +1992,10 @@ def _is_condition_effect_question(q: str) -> bool:
     )
 
 
+_PARAGRAPH_INVENTORY = re.compile(
+    r"\b(?:list|name|show|enumerate|which are|what are)\b[^.?]{0,40}\bparagraphs?\b",
+    re.IGNORECASE,
+)
 _COPY_CONSTRUCT_QUESTION = re.compile(r"\bcop(?:y|ied|ies|ying)\b", re.IGNORECASE)
 
 

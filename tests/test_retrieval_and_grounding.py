@@ -2707,6 +2707,72 @@ class MultiProgramCorpusTest(unittest.TestCase):
         )
 
 
+class ParagraphInventoryTest(unittest.TestCase):
+    """A program's paragraphs can be listed, not only counted."""
+
+    def _corpus(self, directory: str, program: str, names: list[str]) -> Path:
+        root = Path(directory)
+        (root / "controlflow.cfg.json").write_text(json.dumps({
+            "program": program, "nodes": names,
+        }), encoding="utf-8")
+        (root / "program.summary.json").write_text(json.dumps({
+            "program": program, "content": f"{program} has 14 paragraphs.",
+            "meta": {"paragraphs": 14},
+        }), encoding="utf-8")
+        return root
+
+    def test_the_paragraphs_are_listed_with_the_artifact_that_names_them(self) -> None:
+        # Observed production failure: there was no way to list a program's
+        # paragraphs at all, so "how many paragraphs" followed by "list them"
+        # fell to generation and invented paragraph bodies.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._corpus(directory, "PDCBVC", ["BROWSE-FASE1", "ABEND00", "MAIN"])
+            answer = _answer_counts(
+                root, "PDCBVC", "list the paragraphs", intent="source_metrics",
+            )
+            for name in ("BROWSE-FASE1", "ABEND00", "MAIN"):
+                self.assertIn(name, answer)
+            self.assertIn("controlflow.cfg.json", answer)
+            # The counters disagree, so the list has to say which one it is.
+            self.assertIn("14", answer)
+
+    def test_a_follow_up_naming_no_subject_inherits_it(self) -> None:
+        # "list them" carries no subject; the plan it inherited does.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._corpus(directory, "PDCBVC", ["BROWSE-FASE1", "ABEND00"])
+            plan = QueryPlan(
+                intent="source_metrics", program="PDCBVC", programs=("PDCBVC",),
+                output_fields=("paragraph",),
+            )
+            answer = _answer_counts(
+                root, "PDCBVC", "list them", intent="source_metrics", plan=plan,
+            )
+            self.assertIn("BROWSE-FASE1", answer)
+
+    def test_a_follow_up_about_something_else_does_not_list_paragraphs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._corpus(directory, "PDCBVC", ["BROWSE-FASE1"])
+            plan = QueryPlan(
+                intent="source_metrics", program="PDCBVC", programs=("PDCBVC",),
+                output_fields=("line_count",),
+            )
+            answer = _answer_counts(
+                root, "PDCBVC", "list them", intent="source_metrics", plan=plan,
+            )
+            self.assertNotIn("BROWSE-FASE1", answer or "")
+
+    def test_naming_paragraphs_as_an_output_field_is_not_an_inventory(self) -> None:
+        # "List every CICS LINK or XCTL issued by PDCBVC, with the target
+        # program, paragraph, COMMAREA, and line" is a question about calls.
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="external_programs")
+        plan = build_query_plan(
+            "List every CICS LINK or XCTL issued by PDCBVC, with the target program, "
+            "paragraph, COMMAREA, and line.",
+            scope, intent="external_programs",
+        )
+        self.assertNotEqual(plan.intent, "source_metrics")
+
+
 class AmbiguousEntityKindTest(unittest.TestCase):
     """One name, two entity kinds: the question decides which is meant."""
 

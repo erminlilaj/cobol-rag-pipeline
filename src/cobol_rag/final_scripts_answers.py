@@ -116,8 +116,12 @@ def answer_from_final_scripts(
         if answer:
             return answer
 
-    if intent in {None, "source_metrics"} and _asks_about_lines_or_counts(q):
-        answer = _answer_counts(root, program, q)
+    # A decided intent is already the answer to "is this a metrics question";
+    # re-deriving it from the wording blocks a follow-up that names no subject
+    # of its own, which is how "list them" after a paragraph count fell through
+    # to generation. The text test is for when nothing was decided.
+    if intent == "source_metrics" or (intent is None and _asks_about_lines_or_counts(q)):
+        answer = _answer_counts(root, program, q, intent, plan)
         if answer:
             return answer
 
@@ -274,7 +278,16 @@ def _asks_about_lines_or_counts(q: str) -> bool:
     return (
         any(term in q for term in ("how many", "number of", "count"))
         or re.search(r"\b(?:loc|line|lines)\b", q) is not None
+        or _asks_to_enumerate_paragraphs(q)
     )
+
+
+_ENUMERATE = re.compile(r"\b(?:list|name|show|enumerate|which are|what are)\b", re.IGNORECASE)
+
+
+def _asks_to_enumerate_paragraphs(q: str) -> bool:
+    """A request for the paragraphs themselves rather than how many there are."""
+    return bool(re.search(r"\bparagraphs?\b", q, re.IGNORECASE) and _ENUMERATE.search(q))
 
 
 def _asks_about_dead_or_commented_code(q: str) -> bool:
@@ -1301,7 +1314,10 @@ def _cics_location(operation: dict[str, Any]) -> str:
     return f"{source_file} {line_label}"
 
 
-def _answer_counts(root: Path, program: str, q: str) -> str | None:
+def _answer_counts(
+    root: Path, program: str, q: str, intent: str | None = None,
+    plan: QueryPlan | None = None,
+) -> str | None:
     comments = _comments_payload(root, program)
     summary = _summary_payload(root, program)
     copybooks = _read_json(_artifact_path(root, "architecture.copybooks.json"))
@@ -1320,6 +1336,42 @@ def _answer_counts(root: Path, program: str, q: str) -> str | None:
     if ("literal" in q or "forced" in q or "hardcoded" in q) and isinstance(literals, dict):
         items = literals.get("assignments", [])
         return f"{program} has {len(items)} literal assignments in `dataflow.literal_assignments.json`."
+
+    # The subject can come from the question or, for a follow-up that names none
+    # of its own, from the plan it inherited: "list them" after a paragraph
+    # count is a request to enumerate paragraphs.
+    about_paragraphs = "paragraph" in q or (
+        plan is not None and "paragraph" in set(plan.output_fields)
+    )
+    if intent == "source_metrics" and about_paragraphs and _ENUMERATE.search(q):
+        # Only when the planner decided this is a metrics question. Reached from
+        # a text guess it would hijack any question that merely mentions
+        # paragraphs as an output field -- "list the LINK and XCTL calls with
+        # their paragraphs" is about calls.
+        # The counters disagree, so the list has to say which one it is. The
+        # control-flow graph is the only artifact that names every paragraph;
+        # the others record totals. Without this there was no way to list a
+        # program's paragraphs at all, so "how many paragraphs" followed by
+        # "list them" fell to generation and invented paragraph bodies.
+        named = _paragraph_names(controlflow)
+        if named:
+            counted = _paragraph_counts(program, summary, controlflow, comments)
+            other = [
+                f"{source} records {value}"
+                for source, value in counted
+                if not source.startswith("`controlflow.cfg.json`")
+            ]
+            lines = [
+                f"{program} has {len(named)} paragraphs in the control-flow graph:"
+            ]
+            lines.extend(f"- {name}" for name in named)
+            lines.append("Source: `controlflow.cfg.json`.")
+            if other:
+                lines.append(
+                    "Other artifacts count differently (" + "; ".join(other)
+                    + "), and only the control-flow graph names them."
+                )
+            return "\n".join(lines)
 
     if "paragraph" in q:
         # Four analyzers count paragraphs and no two agree, on either analyzed
@@ -1362,6 +1414,20 @@ def _answer_counts(root: Path, program: str, q: str) -> str | None:
             return " ".join(parts)
 
     return None
+
+
+def _paragraph_names(controlflow: dict[str, Any] | None) -> list[str]:
+    """Paragraph names from the control-flow graph, which is what its nodes are."""
+    if not isinstance(controlflow, dict):
+        return []
+    nodes = controlflow.get("nodes")
+    if not isinstance(nodes, list):
+        return []
+    names = [
+        str(node.get("id") if isinstance(node, dict) else node).strip()
+        for node in nodes
+    ]
+    return sorted({name for name in names if name})
 
 
 def _paragraph_counts(

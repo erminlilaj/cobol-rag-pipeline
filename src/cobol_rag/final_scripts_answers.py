@@ -1728,6 +1728,11 @@ def _answer_literal_assignments(
     return "\n".join(lines)
 
 
+# The COBOL COPY statement, in the inflections a question uses. One construct,
+# not an enumeration of wordings.
+_COPY_CONSTRUCT = re.compile(r"\bcop(?:y|ied|ies|ying)\b", re.IGNORECASE)
+
+
 def _answer_copybooks(
     root: Path,
     program: str,
@@ -1746,7 +1751,10 @@ def _answer_copybooks(
         "division", "section", "source line", "line number", "copy statement",
         "copy statements", "where included", "where is each included",
     )
-    if any(term in q for term in location_terms):
+    # "Where is PDRTWA2 copied in?" asks for the COPY site. COPY is one COBOL
+    # construct and these are its inflections, not a list of phrasings.
+    asks_where_copied = bool(_COPY_CONSTRUCT.search(q))
+    if any(term in q for term in location_terms) or asks_where_copied:
         inclusions = [item for item in content.get("inclusions", []) if isinstance(item, dict)]
         if plan and plan.divisions:
             allowed_divisions = {value.upper() for value in plan.divisions}

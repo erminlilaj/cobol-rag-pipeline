@@ -1100,6 +1100,10 @@ def answer_query(
             "Check that the configured LLM is available in Ollama and fits in memory."
         ) from error
     raw_answer = str(response.text).strip()
+    if _echoes_generation_context(raw_answer):
+        # Repeating the prompt is not an answer. Blanking it here sends the turn
+        # down the repair path instead of shipping scaffolding to the user.
+        raw_answer = ""
     answer_text = _render_structured_claims(raw_answer, sources) or raw_answer
     validation = _validate_generated_claims(answer_text, sources)
     first_validation = validation
@@ -4250,6 +4254,26 @@ def _unsupported_assertion_reason(claim: str) -> str | None:
     if _QUANTITY_CLAIM_PATTERN.search(without_lines):
         return "unverifiable_quantity_claim"
     return None
+
+
+# Field labels from the evidence blocks in the generation prompt. A model that
+# runs out of anything to say sometimes copies the context back, and the result
+# reads like an answer while being the question's own input: "How does PDCBVC
+# terminate?" was answered with "text: Program PDCBVC executes CICS commands
+# ABEND, ADDRESS, ... [Source 1]". Scaffolding is never an answer.
+_CONTEXT_SCAFFOLD = re.compile(
+    r"(?:^|\n)\s*(?:text:|chunk_type:|source_path:|parse_quality:|evidence_path:)",
+)
+_EVIDENCE_RECORD_TAG = re.compile(r"</?evidence_record>")
+
+
+def _echoes_generation_context(answer: str) -> bool:
+    """True when the answer is repeating the evidence blocks it was given."""
+    if not answer:
+        return False
+    if _EVIDENCE_RECORD_TAG.search(answer):
+        return True
+    return bool(_CONTEXT_SCAFFOLD.search("\n" + answer))
 
 
 def _validate_generated_claims(

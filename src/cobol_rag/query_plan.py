@@ -697,6 +697,15 @@ def build_query_plan(
         resolved_intent = "program_summary"
     elif resolved_intent == "general" and re.search(r"\bliteral assignments?\b", q):
         resolved_intent = "static_values"
+    elif _COPY_CONSTRUCT_QUESTION.search(q) and any(
+        entity.entity_type == "copybook" for entity in scope.entities
+    ):
+        # A name can be both a copybook and a variable -- PDRTWA2 is both here.
+        # When the question asks about COPY and a copybook of that name exists,
+        # it is the copybook being asked about. Without this, "Where is PDRTWA2
+        # copied in?" was answered from variable evidence: EXEC CICS ADDRESS TWA
+        # at line 805, rather than COPY PDRTWA2. at line 210.
+        resolved_intent = "copybooks"
     elif _is_source_metrics_question(q) and not scope.entities:
         # Counting the program's paragraphs is a program metric; counting the
         # paragraphs that touch a named variable is that variable's evidence.
@@ -1962,6 +1971,9 @@ def _is_condition_effect_question(q: str) -> bool:
         or "neither" in q
         or "otherwise" in q
     )
+
+
+_COPY_CONSTRUCT_QUESTION = re.compile(r"\bcop(?:y|ied|ies|ying)\b", re.IGNORECASE)
 
 
 def _is_source_metrics_question(q: str) -> bool:

@@ -40,6 +40,7 @@ from cobol_rag.query import (
     _compose_subtask_results,
     _deterministic_routing,
     _direct_handler_supports,
+    _echoes_generation_context,
     _ensure_citations,
     _effective_subtask_contract_plan,
     _parse_routing_decision,
@@ -2704,6 +2705,80 @@ class MultiProgramCorpusTest(unittest.TestCase):
             _programs_holding(extended, ["PDRTWA2"])["PDRTWA2"],
             {"PDCBVC", "PDB305", "PDX999"},
         )
+
+
+class AmbiguousEntityKindTest(unittest.TestCase):
+    """One name, two entity kinds: the question decides which is meant."""
+
+    def test_a_copy_question_about_a_copybook_reaches_copybook_evidence(self) -> None:
+        # Observed production failure: PDRTWA2 is both a copybook and a variable,
+        # and "Where is PDRTWA2 copied in?" was answered from variable evidence
+        # (EXEC CICS ADDRESS TWA, line 805) instead of COPY PDRTWA2. at line 210.
+        both = (
+            EntityReference("PDCBVC", "copybook", "PDRTWA2", "PDCBVC|COPYBOOK|PDRTWA2"),
+            EntityReference("PDCBVC", "variable", "PDRTWA2", "PDCBVC|VARIABLE|PDRTWA2"),
+        )
+        for question in (
+            "Where is PDRTWA2 copied in?",
+            "Which paragraph copies PDRTWA2?",
+            "Where is PDRTWA2 copied?",
+        ):
+            with self.subTest(question=question):
+                scope = QueryScope(
+                    program="PDCBVC", programs=("PDCBVC",), intent="general", entities=both,
+                )
+                plan = build_query_plan(question, scope, intent="general")
+                self.assertEqual(plan.intent, "copybooks")
+
+    def test_a_dataflow_question_about_the_same_name_stays_dataflow(self) -> None:
+        # The COPY construct has to be in the question; the name alone is not it.
+        both = (
+            EntityReference("PDCBVC", "copybook", "PDRTWA2", "PDCBVC|COPYBOOK|PDRTWA2"),
+            EntityReference("PDCBVC", "variable", "PDRTWA2", "PDCBVC|VARIABLE|PDRTWA2"),
+        )
+        scope = QueryScope(
+            program="PDCBVC", programs=("PDCBVC",), intent="general", entities=both,
+        )
+        plan = build_query_plan("Where is PDRTWA2 read?", scope, intent="general")
+        self.assertNotEqual(plan.intent, "copybooks")
+
+    def test_the_copy_rule_needs_a_copybook_of_that_name(self) -> None:
+        # A variable that happens to appear near the word "copied" is not a
+        # copybook question.
+        scope = QueryScope(
+            program="PDCBVC", programs=("PDCBVC",), intent="general",
+            entities=(EntityReference(
+                "PDCBVC", "variable", "NPAGT", "PDCBVC|VARIABLE|NPAGT"),),
+        )
+        plan = build_query_plan("Where is NPAGT copied to?", scope, intent="general")
+        self.assertNotEqual(plan.intent, "copybooks")
+
+
+class GenerationMustNotEchoItsContextTest(unittest.TestCase):
+    """The prompt's evidence blocks are input, never an answer."""
+
+    def test_an_echoed_evidence_block_is_not_an_answer(self) -> None:
+        # Observed production failure: "How does PDCBVC terminate?" was answered
+        # with the generation prompt's own evidence scaffolding --
+        # "text: Program PDCBVC executes CICS commands ABEND, ADDRESS, ...".
+        for echoed in (
+            "text: Program PDCBVC executes CICS commands ABEND, ADDRESS [Source 1]",
+            "<evidence_record>\nprogram: PDCBVC\ntext:\nsomething\n</evidence_record>",
+            "chunk_type: architecture.cics_operations\ntext: whatever",
+            "source_path: /workspace/x.json\ntext: whatever",
+        ):
+            with self.subTest(echoed=echoed[:40]):
+                self.assertTrue(_echoes_generation_context(echoed))
+
+    def test_a_real_answer_is_not_mistaken_for_scaffolding(self) -> None:
+        for answer in (
+            "The program PDCBVC terminates by executing SYNCPOINT and then RETURN. [Source 1]",
+            "PDCBVC business rules (1 matching unique direct-evidence rule(s)):\n- BR-001",
+            "COPY statements in PDCBVC:\n- PDRTWA2: DATA DIVISION, line 210 — `COPY PDRTWA2.`",
+            "",
+        ):
+            with self.subTest(answer=answer[:40]):
+                self.assertFalse(_echoes_generation_context(answer))
 
 
 class ParagraphCountDisagreementTest(unittest.TestCase):

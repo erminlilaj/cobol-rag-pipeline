@@ -947,7 +947,17 @@ def build_query_plan(
         # above re-derived the intent, resolved_intent no longer matches what the
         # keyword pass produced and full confidence is kept.
         confidence = min(confidence, _TOPICAL_INTENT_CONFIDENCE)
-    if not operations:
+    if not operations and not named_program_request:
+        # No extracted operation usually means the request was read loosely, so
+        # the plan steps aside for the planner. A named-program overview is the
+        # exception: the whole question was matched against the resolved program
+        # name, which is as specific as this layer gets. Capping it sent
+        # "Summarise PDCBVC." below the authority line, where the planner
+        # reclassified it as source_metrics -- line counts for a request to
+        # describe the program -- and the metrics renderer could not answer it,
+        # so it fell to generation and failed citation validation on both
+        # analyzed programs. "Describe PDB305" was unaffected only because
+        # "describe" happens to be an extracted operation.
         confidence = min(confidence, 0.7)
     domain = _INTENT_DOMAIN.get(resolved_intent, "general")
     tasks, relations = _fallback_tasks_and_relations(q, resolved_intent)

@@ -90,6 +90,7 @@ from cobol_rag.retrieve import (
     detect_intent_with_basis,
 )
 from cobol_rag.scope import (
+    _programs_holding,
     EntityReference,
     QueryScope,
     SessionState,
@@ -2665,6 +2666,74 @@ class CollectionFollowupTest(unittest.TestCase):
             with self.subTest(question=question):
                 self.assertTrue(refers_to_previous_turn(question.lower()))
                 self.assertTrue(_is_explicit_followup(question.lower(), question))
+
+
+class MultiProgramCorpusTest(unittest.TestCase):
+    """Claims about the corpus must match the scope actually searched."""
+
+    _ENTITIES = (
+        EntityReference("PDCBVC", "map", "PDCBVC1", "PDCBVC|MAP|PDCBVC1"),
+        EntityReference("PDCBVC", "copybook", "PDRTWA2", "PDCBVC|COPYBOOK|PDRTWA2"),
+        EntityReference("PDB305", "map", "PDB3051", "PDB305|MAP|PDB3051"),
+        EntityReference("PDB305", "copybook", "PDRTWA2", "PDB305|COPYBOOK|PDRTWA2"),
+    )
+
+    def test_an_identifier_in_another_program_is_located_not_denied(self) -> None:
+        # Observed production failure: with PDCBVC selected, a map belonging to
+        # PDB305 was reported "not present in the analyzed corpus". The search
+        # was scoped to one program; the claim was about all of them.
+        found = _programs_holding(self._ENTITIES, ["PDB3051"])
+        self.assertEqual(found, {"PDB3051": {"PDB305"}})
+
+    def test_an_identifier_in_several_programs_names_all_of_them(self) -> None:
+        found = _programs_holding(self._ENTITIES, ["PDRTWA2"])
+        self.assertEqual(found["PDRTWA2"], {"PDCBVC", "PDB305"})
+
+    def test_an_identifier_in_no_program_is_absent_from_the_corpus(self) -> None:
+        # Only here is "not present in the analyzed corpus" a true statement.
+        self.assertEqual(_programs_holding(self._ENTITIES, ["NOSUCH1"]), {})
+
+    def test_the_helper_does_not_hard_code_a_program_count(self) -> None:
+        # A third program must need no code change: the answer comes from the
+        # catalogue, so adding entities is enough.
+        extended = self._ENTITIES + (
+            EntityReference("PDX999", "copybook", "PDRTWA2", "PDX999|COPYBOOK|PDRTWA2"),
+        )
+        self.assertEqual(
+            _programs_holding(extended, ["PDRTWA2"])["PDRTWA2"],
+            {"PDCBVC", "PDB305", "PDX999"},
+        )
+
+
+class NamedProgramOverviewTest(unittest.TestCase):
+    """An overview request matched against a resolved program name is specific."""
+
+    def test_a_summary_request_keeps_authority_without_an_operation_verb(self) -> None:
+        # Observed production failure: "Summarise PDCBVC." was capped at 0.7 for
+        # having no extracted operation, so the planner reclassified it as
+        # source_metrics -- line counts for a request to describe the program --
+        # and the answer fell to generation and failed citation validation on
+        # both analyzed programs. "Describe PDB305" escaped only because
+        # "describe" happens to be an extracted operation.
+        for question, program in (
+            ("Summarise PDCBVC.", "PDCBVC"),
+            ("Summarise PDB305.", "PDB305"),
+            ("Describe PDB305", "PDB305"),
+            ("Tell me about PDCBVC", "PDCBVC"),
+        ):
+            with self.subTest(question=question):
+                scope = QueryScope(program=program, programs=(program,), intent="general")
+                plan = build_query_plan(question, scope, intent="general")
+                self.assertEqual(plan.intent, "program_summary")
+                self.assertGreaterEqual(plan.confidence, 0.9)
+
+    def test_a_narrower_request_about_a_program_is_not_an_overview(self) -> None:
+        # The anchor still has to match the whole request.
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="general")
+        plan = build_query_plan(
+            "Explain PDCBVC's control flow from start to finish", scope, intent="general",
+        )
+        self.assertNotEqual(plan.intent, "program_summary")
 
 
 class MapEntityTest(unittest.TestCase):

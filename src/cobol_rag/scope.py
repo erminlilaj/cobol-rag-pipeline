@@ -5,6 +5,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any
 
 from cobol_rag.final_scripts_answers import find_final_scripts_root
@@ -143,6 +144,28 @@ class SessionState:
         self.last_result_entities.clear()
 
 
+def _programs_holding(
+    entities: Sequence[EntityReference], tokens: Sequence[str],
+) -> dict[str, set[str]]:
+    """Which analyzed programs hold each identifier, across the whole corpus.
+
+    Driven entirely by the catalogue, so it stays correct as programs are added:
+    nothing here knows how many there are or what they are called.
+    """
+    found: dict[str, set[str]] = {}
+    for token in tokens:
+        upper = token.upper()
+        holders = {
+            entity.program
+            for entity in entities
+            if entity.program
+            and (entity.value == upper or entity.value.startswith(upper + "-"))
+        }
+        if holders:
+            found[token] = holders
+    return found
+
+
 def resolve_query_scope(
     question: str,
     *,
@@ -204,8 +227,8 @@ def resolve_query_scope(
             intent=intent,
             ambiguous=True,
             reason=(
-                "The named COBOL entity exists in multiple analyzed programs. "
-                "Name the target program explicitly."
+                "The named COBOL entity exists in multiple analyzed programs "
+                f"({', '.join(entity_programs)}). Name the one you mean."
             ),
         )
     elif len(programs) > 1:
@@ -291,6 +314,32 @@ def resolve_query_scope(
 
     if unresolved_references:
         named = ", ".join(f"`{value}`" for value in unresolved_references[:3])
+        # The search above is scoped to the selected program, so "absent" here
+        # only ever meant "absent from that program". Claiming the corpus does
+        # not hold it is a stronger statement than the lookup supports, and it
+        # was false as soon as a second program existed: with PDCBVC selected,
+        # a map belonging to PDB305 was reported as not present anywhere.
+        elsewhere = _programs_holding(entities, unresolved_references)
+        if elsewhere:
+            located = "; ".join(
+                f"`{token}` is in {', '.join(sorted(found))}"
+                for token, found in elsewhere.items()
+            )
+            in_scope = f" not in {program}" if program else " not in the selected program"
+            return QueryScope(
+                program=program,
+                programs=tuple(sorted({p for found in elsewhere.values() for p in found})),
+                entities=tuple(resolved_entities),
+                intent=intent,
+                confidence=0.3,
+                program_source=program_source,
+                entity_source="question_unresolved",
+                ambiguous=True,
+                reason=(
+                    f"{named} is{in_scope}. {located}. "
+                    "Name that program to ask about it."
+                ),
+            )
         return QueryScope(
             program=program,
             programs=tuple(mentioned_programs) if mentioned_programs else (),

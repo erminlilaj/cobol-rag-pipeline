@@ -74,6 +74,7 @@ from cobol_rag.retrieve import (
     retrieve_with_trace,
 )
 from cobol_rag.scope import (
+    named_identifiers_in,
     source_addresses_in,
     QueryScope,
     source_address_entity,
@@ -516,9 +517,21 @@ def answer_query(
     # A multi-program corpus is ambiguous only for a technical request. Small
     # talk and general knowledge must reach the semantic router before program
     # selection is enforced.
-    explicit_unknown_program = "not present in the analyzed corpus" in initial_scope.reason.lower()
+    # Scope ambiguity is worth reporting when the question named something COBOL:
+    # that is what created the ambiguity, and the scope's reason says exactly
+    # which program to name or which identifier is meant. Small talk names
+    # nothing, so it still reaches the semantic router untouched.
+    #
+    # This used to test whether the reason contained the words "not present in
+    # the analyzed corpus", so a correct explanation phrased any other way was
+    # discarded and replaced with "I could not classify that request" -- which
+    # is how "Where is PDRTWA2 used?", a copybook in two analyzed programs, lost
+    # a message naming both of them.
+    ambiguity_is_about_something_named = bool(
+        named_identifiers_in(question) or initial_scope.programs
+    )
     if initial_scope.ambiguous and (
-        initial_plan.intent != "general" or explicit_unknown_program
+        initial_plan.intent != "general" or ambiguity_is_about_something_named
     ):
         return finish(
             initial_scope.reason, [], route="unclear", scope=initial_scope,

@@ -76,6 +76,7 @@ from cobol_rag.query_plan import (
 from cobol_rag.final_scripts_answers import (
     _answer_artifact_inventory,
     _answer_cics_operations,
+    _answer_counts,
     _answer_literal_assignments,
     _length_ranking,
     _cics_statement_resources,
@@ -2703,6 +2704,64 @@ class MultiProgramCorpusTest(unittest.TestCase):
             _programs_holding(extended, ["PDRTWA2"])["PDRTWA2"],
             {"PDCBVC", "PDB305", "PDX999"},
         )
+
+
+class ParagraphCountDisagreementTest(unittest.TestCase):
+    """Four analyzers count paragraphs and no two agree; say so."""
+
+    def _corpus(self, directory: str, program: str, mapa: int, nodes: int, scanned: int) -> Path:
+        root = Path(directory)
+        (root / "program.summary.json").write_text(json.dumps({
+            "program": program, "content": f"{program} contains approximately 392 LOC "
+            f"and {mapa} paragraphs.", "meta": {"paragraphs": mapa, "loc": 392},
+        }), encoding="utf-8")
+        (root / "controlflow.cfg.json").write_text(json.dumps({
+            "program": program, "nodes": [f"P{n}" for n in range(nodes)],
+        }), encoding="utf-8")
+        (root / "program.comments.json").write_text(json.dumps({
+            "program": program, "count": 65,
+            "metrics": {"total_lines": 912, "total_procedure_paragraphs": scanned},
+        }), encoding="utf-8")
+        return root
+
+    def test_every_recorded_count_is_reported_with_its_source(self) -> None:
+        # Observed production failure on both analyzed programs: generation was
+        # asked for a single number it could not ground, and the turn was
+        # rejected. PDCBVC records 14/65/71 and PDB305 19/53/73 -- picking one
+        # would be a guess wearing a citation.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._corpus(directory, "PDCBVC", 14, 65, 71)
+            answer = _answer_counts(root, "PDCBVC", "how many paragraphs does pdcbvc have?")
+            for value in ("14", "65", "71"):
+                self.assertIn(value, answer)
+            self.assertIn("program.summary.json", answer)
+            self.assertIn("controlflow.cfg.json", answer)
+            self.assertIn("program.comments.json", answer)
+            self.assertIn("no single number is authoritative", answer)
+
+    def test_only_the_counts_that_exist_are_reported(self) -> None:
+        # A program whose analysis produced fewer counters reports fewer, rather
+        # than inventing or omitting the disagreement.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "controlflow.cfg.json").write_text(json.dumps({
+                "program": "PDX999", "nodes": ["A", "B", "C"],
+            }), encoding="utf-8")
+            answer = _answer_counts(root, "PDX999", "how many paragraphs does pdx999 have?")
+            self.assertIn("3", answer)
+            self.assertIn("controlflow.cfg.json", answer)
+            self.assertNotIn("program.summary.json", answer)
+
+    def test_counting_paragraphs_of_a_variable_is_not_a_program_metric(self) -> None:
+        # The resolved entity is what separates "how many paragraphs does the
+        # program have" from "how many paragraphs modify NPAGT".
+        scope = QueryScope(
+            program="PDCBVC", programs=("PDCBVC",), intent="general",
+            entities=(EntityReference(
+                "PDCBVC", "variable", "NPAGT", "PDCBVC|VARIABLE|NPAGT"),),
+        )
+        plan = build_query_plan("how many paragraphs modify NPAGT?", scope, intent="general")
+        self.assertNotEqual(plan.intent, "source_metrics")
 
 
 class NamedProgramOverviewTest(unittest.TestCase):

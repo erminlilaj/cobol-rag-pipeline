@@ -1307,6 +1307,7 @@ def _answer_counts(root: Path, program: str, q: str) -> str | None:
     copybooks = _read_json(_artifact_path(root, "architecture.copybooks.json"))
     calls = _read_json(_artifact_path(root, "architecture.call_parameters.json"))
     literals = _read_json(_artifact_path(root, "dataflow.literal_assignments.json"))
+    controlflow = _read_json(_artifact_path(root, "controlflow.cfg.json"))
 
     if "copy" in q and isinstance(copybooks, dict):
         all_copybooks = copybooks.get("content", {}).get("all", [])
@@ -1319,6 +1320,26 @@ def _answer_counts(root: Path, program: str, q: str) -> str | None:
     if ("literal" in q or "forced" in q or "hardcoded" in q) and isinstance(literals, dict):
         items = literals.get("assignments", [])
         return f"{program} has {len(items)} literal assignments in `dataflow.literal_assignments.json`."
+
+    if "paragraph" in q:
+        # Four analyzers count paragraphs and no two agree, on either analyzed
+        # program (PDCBVC 14/65/71, PDB305 19/53/73). Picking one and stating it
+        # as the count would be a guess wearing a citation, and generation was
+        # previously asked to produce a single number and could not ground it.
+        # Every recorded count is reported with the artifact that recorded it.
+        counted = _paragraph_counts(program, summary, controlflow, comments)
+        if counted:
+            lines = [
+                f"Analyzers disagree on the paragraph count for {program}; "
+                f"{len(counted)} artifact(s) record one:"
+            ]
+            lines.extend(f"- {source}: {value}" for source, value in counted)
+            lines.append(
+                "These count different things -- a MAPA record, control-flow graph "
+                "nodes, and paragraphs seen while scanning source -- so no single "
+                "number is authoritative."
+            )
+            return "\n".join(lines)
 
     if comments and any(term in q for term in ("line", "lines", "loc", "code")):
         total_lines = comments.get("metrics", {}).get("total_lines")
@@ -1341,6 +1362,33 @@ def _answer_counts(root: Path, program: str, q: str) -> str | None:
             return " ".join(parts)
 
     return None
+
+
+def _paragraph_counts(
+    program: str,
+    summary: dict[str, Any] | None,
+    controlflow: dict[str, Any] | None,
+    comments: dict[str, Any] | None,
+) -> list[tuple[str, int]]:
+    """Every paragraph count the analysis recorded, with its source artifact.
+
+    Driven by what each artifact holds, so a program whose analysis produced
+    only some of them reports only those, and a new counter added upstream is
+    one entry here rather than a rewrite.
+    """
+    counted: list[tuple[str, int]] = []
+    mapa = _extract_paragraph_count(summary)
+    if mapa is not None:
+        counted.append(("`program.summary.json` (MAPA record)", mapa))
+    if isinstance(controlflow, dict):
+        nodes = controlflow.get("nodes")
+        if isinstance(nodes, list) and nodes:
+            counted.append(("`controlflow.cfg.json` (graph nodes)", len(nodes)))
+    if isinstance(comments, dict):
+        scanned = comments.get("metrics", {}).get("total_procedure_paragraphs")
+        if isinstance(scanned, int):
+            counted.append(("`program.comments.json` (procedure paragraphs)", scanned))
+    return counted
 
 
 def _extract_approx_loc(summary: dict[str, Any] | None) -> int | None:

@@ -697,7 +697,10 @@ def build_query_plan(
         resolved_intent = "program_summary"
     elif resolved_intent == "general" and re.search(r"\bliteral assignments?\b", q):
         resolved_intent = "static_values"
-    elif _is_source_metrics_question(q):
+    elif _is_source_metrics_question(q) and not scope.entities:
+        # Counting the program's paragraphs is a program metric; counting the
+        # paragraphs that touch a named variable is that variable's evidence.
+        # The resolved entity is what tells them apart.
         resolved_intent = "source_metrics"
     elif (
         resolved_intent in {"general", "control_flow", "ui_navigation"}
@@ -1964,10 +1967,11 @@ def _is_condition_effect_question(q: str) -> bool:
 def _is_source_metrics_question(q: str) -> bool:
     return bool(
         re.search(
-            r"\b(?:how many|number of|count(?: of)?)\b.{0,40}\b(?:lines?|loc|lines? of code)\b",
+            r"\b(?:how many|number of|count(?: of)?)\b.{0,40}"
+            r"\b(?:lines?|loc|lines? of code|paragraphs?)\b",
             q,
         )
-        or re.search(r"\b(?:loc|line count)\b", q)
+        or re.search(r"\b(?:loc|line count|paragraph count)\b", q)
     )
 
 

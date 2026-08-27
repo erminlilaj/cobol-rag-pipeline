@@ -2796,6 +2796,40 @@ class AmbiguousEntityKindTest(unittest.TestCase):
                 plan = build_query_plan(question, scope, intent="general")
                 self.assertEqual(plan.intent, "copybooks")
 
+    def test_a_name_that_is_two_kinds_still_reaches_a_capability(self) -> None:
+        # Every entity-to-intent branch needs one kind of entity, so a name that
+        # is two kinds matched none of them and the question was left with no
+        # capability. PD1VOCI is both a called program and a copybook, and
+        # "what is passed to PD1VOCI?" fell to generation, where it answered
+        # correctly about two runs in three.
+        both = (
+            EntityReference("PDCBVC", "call", "PD1VOCI", "PDCBVC|PD1VOCI|CICSLINK"),
+            EntityReference("PDCBVC", "copybook", "PD1VOCI", "PDCBVC|COPYBOOK|PD1VOCI"),
+        )
+        for question in (
+            "What is passed to PD1VOCI?",
+            "What parameters are passed to PD1VOCI?",
+            "Is PD1VOCI called with a COMMAREA?",
+        ):
+            with self.subTest(question=question):
+                scope = QueryScope(
+                    program="PDCBVC", programs=("PDCBVC",), intent="general", entities=both,
+                )
+                plan = build_query_plan(question, scope, intent="general")
+                self.assertEqual(plan.intent, "external_programs")
+
+    def test_the_same_two_kinds_go_to_the_copybook_for_a_copy_question(self) -> None:
+        # The question decides which kind, in both directions.
+        both = (
+            EntityReference("PDCBVC", "call", "PD1VOCI", "PDCBVC|PD1VOCI|CICSLINK"),
+            EntityReference("PDCBVC", "copybook", "PD1VOCI", "PDCBVC|COPYBOOK|PD1VOCI"),
+        )
+        scope = QueryScope(
+            program="PDCBVC", programs=("PDCBVC",), intent="general", entities=both,
+        )
+        plan = build_query_plan("Where is PD1VOCI copied in?", scope, intent="general")
+        self.assertEqual(plan.intent, "copybooks")
+
     def test_a_dataflow_question_about_the_same_name_stays_dataflow(self) -> None:
         # The COPY construct has to be in the question; the name alone is not it.
         both = (

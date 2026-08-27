@@ -783,6 +783,14 @@ def build_query_plan(
             # A named map is a screen, and the only evidence of it is the CICS
             # SEND/RECEIVE that names it.
             resolved_intent = "cics_operations"
+        elif "call" in entity_types and _CALL_INTERFACE_QUESTION.search(q):
+            # Each branch above needs one kind of entity, so a name that is two
+            # kinds matched none of them and the question was left with no
+            # capability at all. PD1VOCI is both a called program and a
+            # copybook, and "what is passed to PD1VOCI?" fell through to
+            # generation, where it was answered correctly about two runs in
+            # three. Asking what a call is given is a question about the call.
+            resolved_intent = "external_programs"
 
     operations = tuple(
         operation
@@ -1992,6 +2000,11 @@ def _is_condition_effect_question(q: str) -> bool:
     )
 
 
+# What a call is handed: its parameters, its COMMAREA, what is passed to it.
+_CALL_INTERFACE_QUESTION = re.compile(
+    r"\bpass(?:ed|es|ing)?\b|\bparameters?\b|\barguments?\b|\bcommarea\b",
+    re.IGNORECASE,
+)
 _PARAGRAPH_INVENTORY = re.compile(
     r"\b(?:list|name|show|enumerate|which are|what are)\b[^.?]{0,40}\bparagraphs?\b",
     re.IGNORECASE,

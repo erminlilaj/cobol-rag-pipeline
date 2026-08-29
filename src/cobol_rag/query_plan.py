@@ -1208,8 +1208,16 @@ def merge_semantic_plan(plan: QueryPlan, update: dict[str, Any]) -> QueryPlan:
                 policy_rejections.append(f"output_field_not_authorized:{output_field}")
         output_fields = plan.output_fields
         source_domains = plan.source_domains
-    else:
+    elif plan.output_fields:
         output_fields = _unique((*plan.output_fields, *semantic_output_fields))
+    else:
+        # The question named no field, so the planner's list is a guess at what
+        # might be interesting -- not a requirement. Treating it as one made the
+        # contract demand fields nobody asked for: "Which calls are only in
+        # PDB305?" was answered correctly and then rejected for lacking
+        # source_line, line_count and control_usage, none of which a set
+        # difference has. A field filter belongs to the user's words.
+        output_fields = ()
     requires_comparison = bool(
         plan.requires_comparison or update.get("requires_comparison")
         or "compare" in operations or len(plan.programs) > 1

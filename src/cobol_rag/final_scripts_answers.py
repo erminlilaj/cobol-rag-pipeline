@@ -22,17 +22,34 @@ def answer_from_final_scripts(
 
     # A question naming several programs and a set relation is answered by
     # joining their evidence, not by resolving one program and ignoring the rest.
-    if plan is not None and len(plan.programs) > 1:
+    if plan is not None and plan.programs:
         # Imported here rather than at module scope: scope.py imports this module
         # for find_final_scripts_root, so a top-level import would be a cycle.
         from cobol_rag.scope import set_relation_in
 
         relation = set_relation_in(question)
-        capability = _COMPARISON_CAPABILITY_FOR_INTENT.get(plan.intent or "")
-        if relation and capability:
+        capability = (
+            _COMPARISON_CAPABILITY_FOR_INTENT.get(plan.intent or "")
+            or _comparison_subject(question)
+        )
+        # One named program is a comparison only when that program is what the
+        # relation is about: "only in PDB305" is, "only in WORKING-STORAGE" is a
+        # question about a section that happens to share the wording.
+        addresses_programs = len(plan.programs) > 1 or _relation_names_a_program(
+            question, plan.programs,
+        )
+        if relation and capability and addresses_programs:
             compared = answer_program_comparison(plan.programs, capability, relation)
             if compared:
                 return compared
+            # The relation was understood and could not be executed. Falling
+            # through would answer a different question -- listing everything
+            # when the user asked what is unique -- so say so instead.
+            return (
+                f"A {relation} across programs was requested but could not be "
+                f"computed from the recorded {capability.replace('_', ' ')}. "
+                "Name the programs to compare."
+            )
 
     program = plan.program if plan and plan.program else program_from_question(question, root)
     if program is None:
@@ -371,7 +388,15 @@ def _asks_about_artifact_inventory(q: str) -> bool:
     asks_for_files = "file" in q and any(
         term in q for term in ("name", "names", "have", "available", "indexed", "analyzed", "analysed", "list")
     )
-    return asks_for_files or any(
+    # A source member is a physical file of the program -- the .CBL and its
+    # copybooks -- and the inventory is the only answer that names them. Without
+    # this, "which source members does PDB305 have?" was answered with the
+    # program overview: a summary of the program, not a list of its files.
+    asks_for_members = bool(
+        re.search(r"\bsource members?\b|\bsource files?\b", q)
+        and re.search(r"\b(?:which|what|list|name|show|have|has|are)\b", q)
+    )
+    return asks_for_files or asks_for_members or any(
         term in q for term in ("artifact inventory", "available artifacts", "indexed artifacts", "analyzed artifacts")
     )
 
@@ -1520,6 +1545,97 @@ def _comparable_keys(program: str, capability: str) -> set[str] | None:
     return keys
 
 
+def _render_sole_difference(
+    named: list[str], subject: str, capability: str,
+) -> str | None:
+    """What one program has that no other analyzed program does."""
+    spec = _COMPARABLE_CAPABILITIES.get(capability)
+    if not spec:
+        return None
+    artifact, _, _, noun = spec
+    blind = [p for p in named if capability in unavailable_capabilities(p)]
+    if blind:
+        return (
+            f"{', '.join(blind)} has no {noun} evidence in the analyzed artifacts, "
+            f"so what is unique to {subject} cannot be established without reading "
+            f"an absent capability as an empty result. "
+            f"Source: `program.capability_manifest.json`."
+        )
+    sets: dict[str, set[str]] = {}
+    for program in named:
+        keys = _comparable_keys(program, capability)
+        if keys is None:
+            return f"No {noun} evidence could be read for {program}. Source: `{artifact}`."
+        sets[program] = keys
+    others = set.union(*[v for k, v in sets.items() if k != subject]) if len(sets) > 1 else set()
+    only = sorted(sets.get(subject, set()) - others)
+    compared = ", ".join(p for p in named if p != subject)
+    return "\n".join([
+        f"{noun.capitalize()}s in {subject} and in no other analyzed program "
+        f"({len(only)}): {', '.join(only) or 'none'}",
+        f"Compared against: {compared}.",
+        f"Recorded per program: " + ", ".join(f"{p} {len(v)}" for p, v in sets.items()) + ".",
+        f"Matched by name as recorded in `{artifact}`; identical names are not "
+        "proof of identical content.",
+    ])
+
+
+_RELATION_THEN_NAME = re.compile(
+    r"\b(?:only in|unique to|specific to|not in|absent from|missing from|"
+    r"shared by|common to|in both)\b[^.?]{0,24}?\b([A-Z][A-Z0-9-]{2,})\b",
+    re.IGNORECASE,
+)
+
+
+# The subject of a comparison, read from the question when the intent does not
+# name one. "Which calls are only in PDB305?" classifies as general because the
+# bare word "calls" is not external-programs vocabulary, but the noun says
+# plainly which evidence is being compared. Only consulted inside a recognised
+# comparison, so it cannot steer an ordinary question.
+_COMPARISON_SUBJECT_WORDS: tuple[tuple[str, str], ...] = (
+    (r"\bcopybooks?\b|\bcopy members?\b", "copybook_evidence"),
+    (r"\bcics (?:commands?|operations?)\b", "cics_evidence"),
+    (r"\bparagraphs?\b", "paragraph_evidence"),
+    (r"\bvariables?\b|\bfields?\b|\bdata items?\b", "variable_inventory"),
+    (r"\bcalls?\b|\bcalled programs?\b|\bexternal programs?\b", "call_evidence"),
+)
+
+
+def _comparison_subject(question: str) -> str | None:
+    lowered = question.lower()
+    for pattern, capability in _COMPARISON_SUBJECT_WORDS:
+        if re.search(pattern, lowered):
+            return capability
+    return None
+
+
+def _relation_names_a_program(question: str, programs: Sequence[str]) -> bool:
+    """True when the set relation is about a program rather than something else."""
+    known = {str(p).upper() for p in programs}
+    return any(
+        match.group(1).upper() in known
+        for match in _RELATION_THEN_NAME.finditer(question)
+    )
+
+
+def analyzed_programs() -> tuple[str, ...]:
+    """Every program the corpus holds, from the registry the platform writes."""
+    root = find_final_scripts_root()
+    if root is None:
+        return ()
+    registry = _read_json(root / "corpus.registry.json")
+    if isinstance(registry, dict) and isinstance(registry.get("programs"), list):
+        names = [
+            str(item.get("program", "")).strip().upper()
+            for item in registry["programs"] if isinstance(item, dict)
+        ]
+        return tuple(sorted(name for name in names if name))
+    return tuple(sorted(
+        path.name.upper() for path in root.iterdir()
+        if path.is_dir() and not path.name.startswith("_")
+    ))
+
+
 def answer_program_comparison(
     programs: Sequence[str],
     capability: str,
@@ -1532,7 +1648,19 @@ def answer_program_comparison(
     infers from two rendered answers.
     """
     named = [p for p in dict.fromkeys(str(x).upper() for x in programs if x)]
-    if len(named) < 2 or relation not in _SET_RELATIONS:
+    if relation not in _SET_RELATIONS:
+        return None
+    if len(named) == 1 and relation == "difference":
+        # "Which calls are only in PDB305?" names one program and means it
+        # against the others. The corpus knows what the others are, so the
+        # question is answerable rather than under-specified.
+        others = [p for p in analyzed_programs() if p not in named]
+        if not others:
+            return None
+        named = named + others
+        sole = programs and str(programs[0]).upper()
+        return _render_sole_difference(named, sole, capability)
+    if len(named) < 2:
         return None
     spec = _COMPARABLE_CAPABILITIES.get(capability)
     if not spec:

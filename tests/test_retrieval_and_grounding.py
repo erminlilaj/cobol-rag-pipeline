@@ -80,6 +80,8 @@ from cobol_rag.final_scripts_answers import (
     _answer_counts,
     _control_flow_direction,
     answer_control_flow_edges,
+    _comparison_subject,
+    _relation_names_a_program,
     answer_program_comparison,
     _answer_literal_assignments,
     _length_ranking,
@@ -2790,6 +2792,41 @@ class ProgramComparisonTest(unittest.TestCase):
                 self.assertIsNone(
                     answer_program_comparison(["PDCBVC"], "call_evidence", "comparison"))
 
+    def test_one_named_program_means_against_the_rest_of_the_corpus(self) -> None:
+        # "Which calls are only in PDB305?" names one program and means it
+        # against the others. Requiring two named programs declined it, and the
+        # fallback then listed everything -- an answer to a different question.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._corpus(directory)
+            with (
+                patch("cobol_rag.final_scripts_answers.find_final_scripts_root", return_value=root),
+                patch("cobol_rag.final_scripts_answers.find_program_artifact_root",
+                      side_effect=lambda r, p: Path(r) / p),
+                patch("cobol_rag.final_scripts_answers.unavailable_capabilities",
+                      return_value=frozenset()),
+                patch("cobol_rag.final_scripts_answers.analyzed_programs",
+                      return_value=("PDCBVC", "PDB305")),
+            ):
+                answer = answer_program_comparison(["PDB305"], "call_evidence", "difference")
+            self.assertIn("PD1AC", answer)
+            self.assertNotIn("PD0UTI01", answer)   # shared, so not unique
+            self.assertIn("Compared against: PDCBVC", answer)
+
+    def test_a_relation_about_something_other_than_a_program(self) -> None:
+        # "only in WORKING-STORAGE" shares the wording and is a question about a
+        # section, not a set difference between programs.
+        self.assertTrue(_relation_names_a_program(
+            "Which calls are only in PDB305?", ("PDB305",)))
+        self.assertFalse(_relation_names_a_program(
+            "Which variables are only in WORKING-STORAGE?", ("PDB305",)))
+
+    def test_the_comparison_subject_can_come_from_the_question(self) -> None:
+        # The bare word "calls" is not external-programs vocabulary, so the
+        # intent is general and names no capability; the noun does.
+        self.assertEqual(_comparison_subject("Which calls are only in PDB305?"), "call_evidence")
+        self.assertEqual(_comparison_subject("Which copybooks are shared?"), "copybook_evidence")
+        self.assertIsNone(_comparison_subject("Which datasets are written?"))
+
     def test_set_relations_are_read_from_the_question(self) -> None:
         for question, expected in (
             ("Which copybooks are shared by PDB305 and PDCBVC?", "intersection"),
@@ -2803,6 +2840,31 @@ class ProgramComparisonTest(unittest.TestCase):
         ):
             with self.subTest(question=question):
                 self.assertEqual(set_relation_in(question), expected)
+
+
+class InventedFieldsAreNotRequirementsTest(unittest.TestCase):
+    """A field the question never named cannot make a correct answer fail."""
+
+    def test_planner_fields_do_not_become_a_contract(self) -> None:
+        # Observed production failure: "Which calls are only in PDB305?" named no
+        # field, the planner proposed twenty, and the contract then rejected a
+        # correct answer for lacking source_line, line_count and control_usage.
+        base = QueryPlan(intent="external_programs", program="PDB305", programs=("PDB305",))
+        self.assertEqual(base.output_fields, ())
+        merged = merge_semantic_plan(base, {
+            "output_fields": ["source_line", "line_count", "control_usage", "target"],
+        })
+        self.assertEqual(merged.output_fields, ())
+
+    def test_fields_the_question_named_are_still_kept(self) -> None:
+        # A filter the user asked for is a real constraint and must survive.
+        base = QueryPlan(
+            intent="external_programs", program="PDCBVC", programs=("PDCBVC",),
+            output_fields=("name", "source_line"),
+        )
+        merged = merge_semantic_plan(base, {"output_fields": ["target"]})
+        self.assertIn("name", merged.output_fields)
+        self.assertIn("source_line", merged.output_fields)
 
 
 class ReverseControlFlowTest(unittest.TestCase):

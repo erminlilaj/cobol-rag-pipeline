@@ -721,6 +721,8 @@ def _detect_intent(query: str) -> str:
             "evidence artifacts",
             "name of the files",
             "files you have",
+            "source member",
+            "source members",
         )
     ):
         return "artifact_inventory"

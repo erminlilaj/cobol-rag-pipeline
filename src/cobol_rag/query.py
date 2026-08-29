@@ -26,6 +26,7 @@ from cobol_rag.evidence import (
 )
 from cobol_rag.final_scripts_answers import (
     absent_capability_answer,
+    _COMPARISON_CAPABILITY_FOR_INTENT,
     answer_control_flow_edges,
     answer_source_line_spans,
     answer_source_lines,
@@ -2382,7 +2383,14 @@ def _direct_handler_supports(plan: QueryPlan) -> bool:
     if plan.response_language not in {"", "en"}:
         return False
     if len(plan.programs) > 1:
-        return False
+        # A set relation over several programs is answered by joining their
+        # evidence, which is a fixed formatter's job. Refusing every
+        # multi-program plan sent "which copybooks are shared by A and B" to
+        # generation, where it failed validation.
+        return bool(
+            _COMPARISON_CAPABILITY_FOR_INTENT.get(plan.intent or "")
+            and plan.requires_comparison
+        )
     if "call_context" in plan.tasks:
         return (
             plan.intent == "external_programs"

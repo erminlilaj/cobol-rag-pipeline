@@ -80,6 +80,7 @@ from cobol_rag.final_scripts_answers import (
     _answer_counts,
     _control_flow_direction,
     answer_control_flow_edges,
+    answer_program_comparison,
     _answer_literal_assignments,
     _length_ranking,
     _cics_statement_resources,
@@ -101,6 +102,7 @@ from cobol_rag.scope import (
     resolve_query_scope,
     source_address_entity,
     refers_to_previous_turn,
+    set_relation_in,
     source_address_in,
     source_addresses_in,
 )
@@ -2707,6 +2709,100 @@ class MultiProgramCorpusTest(unittest.TestCase):
             _programs_holding(extended, ["PDRTWA2"])["PDRTWA2"],
             {"PDCBVC", "PDB305", "PDX999"},
         )
+
+
+class ProgramComparisonTest(unittest.TestCase):
+    """Comparing programs is a set operation over evidence, not a description."""
+
+    def _corpus(self, directory: str) -> Path:
+        root = Path(directory)
+        for program, calls in (("PDCBVC", ["PD1VOCI", "PD0UTI01", "PDPRED"]),
+                               ("PDB305", ["PD1AC", "PD0UTI01", "PDPRED"])):
+            d = root / program
+            d.mkdir(parents=True)
+            (d / "architecture.call_parameters.json").write_text(
+                json.dumps({"program": program, "calls": [{"target": t} for t in calls]}),
+                encoding="utf-8")
+        return root
+
+    def _answer(self, directory: str, capability: str, relation: str) -> str | None:
+        with (
+            patch("cobol_rag.final_scripts_answers.find_final_scripts_root",
+                  return_value=Path(directory)),
+            patch("cobol_rag.final_scripts_answers.find_program_artifact_root",
+                  side_effect=lambda r, p: Path(r) / p),
+            patch("cobol_rag.final_scripts_answers.unavailable_capabilities",
+                  return_value=frozenset()),
+        ):
+            return answer_program_comparison(["PDCBVC", "PDB305"], capability, relation)
+
+    def test_a_comparison_reports_all_three_sets(self) -> None:
+        # Observed production failure: "Compare the external calls of PDB305 and
+        # PDCBVC" failed validation while both programs answered individually.
+        with tempfile.TemporaryDirectory() as directory:
+            answer = self._answer(self._corpus(directory).as_posix(), "call_evidence", "comparison")
+            self.assertIn("PD0UTI01", answer)
+            self.assertIn("PDPRED", answer)
+            self.assertIn("Only in PDCBVC", answer)
+            self.assertIn("PD1VOCI", answer)
+            self.assertIn("Only in PDB305", answer)
+            self.assertIn("PD1AC", answer)
+
+    def test_shared_reports_only_the_intersection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            answer = self._answer(self._corpus(directory).as_posix(), "call_evidence", "intersection")
+            self.assertIn("PD0UTI01", answer)
+            self.assertNotIn("Only in", answer)
+            self.assertNotIn("PD1VOCI", answer)
+
+    def test_an_absent_capability_is_not_reported_as_an_empty_set(self) -> None:
+        # The trap this design exists to avoid. screen_lineage is unavailable for
+        # PDCBVC and available for PDB305, so a plain join would render "PDCBVC:
+        # none" -- which reads as "PDCBVC has no screen fields" when the truth is
+        # that the analysis produced no evidence of that kind.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._corpus(directory)
+            with (
+                patch("cobol_rag.final_scripts_answers.find_final_scripts_root",
+                      return_value=root),
+                patch("cobol_rag.final_scripts_answers.find_program_artifact_root",
+                      side_effect=lambda r, p: Path(r) / p),
+                patch("cobol_rag.final_scripts_answers.unavailable_capabilities",
+                      side_effect=lambda p: frozenset({"call_evidence"}) if p == "PDCBVC" else frozenset()),
+            ):
+                answer = answer_program_comparison(
+                    ["PDCBVC", "PDB305"], "call_evidence", "intersection")
+            self.assertIn("PDCBVC", answer)
+            self.assertIn("no outgoing call evidence", answer)
+            self.assertIn("capability_manifest", answer)
+            self.assertNotIn("PD0UTI01", answer)
+
+    def test_a_capability_that_is_not_set_shaped_is_declined(self) -> None:
+        # Comparing two program summaries is not an intersection.
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertIsNone(
+                self._answer(self._corpus(directory).as_posix(), "program_summary", "intersection"))
+
+    def test_one_program_is_not_a_comparison(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("cobol_rag.final_scripts_answers.find_final_scripts_root",
+                       return_value=self._corpus(directory)):
+                self.assertIsNone(
+                    answer_program_comparison(["PDCBVC"], "call_evidence", "comparison"))
+
+    def test_set_relations_are_read_from_the_question(self) -> None:
+        for question, expected in (
+            ("Which copybooks are shared by PDB305 and PDCBVC?", "intersection"),
+            ("What do PDCBVC and PDB305 have in common?", "intersection"),
+            ("Compare the external calls of PDB305 and PDCBVC.", "comparison"),
+            ("Which calls are only in PDCBVC?", "difference"),
+            ("Which variables are unique to PDB305?", "difference"),
+            # not comparisons
+            ("Which copybooks are unused?", None),
+            ("Where is NPAGT written?", None),
+        ):
+            with self.subTest(question=question):
+                self.assertEqual(set_relation_in(question), expected)
 
 
 class ReverseControlFlowTest(unittest.TestCase):

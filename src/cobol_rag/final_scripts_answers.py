@@ -19,6 +19,21 @@ def answer_from_final_scripts(
     root = find_final_scripts_root()
     if root is None:
         return None
+
+    # A question naming several programs and a set relation is answered by
+    # joining their evidence, not by resolving one program and ignoring the rest.
+    if plan is not None and len(plan.programs) > 1:
+        # Imported here rather than at module scope: scope.py imports this module
+        # for find_final_scripts_root, so a top-level import would be a cycle.
+        from cobol_rag.scope import set_relation_in
+
+        relation = set_relation_in(question)
+        capability = _COMPARISON_CAPABILITY_FOR_INTENT.get(plan.intent or "")
+        if relation and capability:
+            compared = answer_program_comparison(plan.programs, capability, relation)
+            if compared:
+                return compared
+
     program = plan.program if plan and plan.program else program_from_question(question, root)
     if program is None:
         return None
@@ -1434,6 +1449,140 @@ def answer_control_flow_edges(
             "structure rather than written as a statement."
         )
     lines.append("Source: `controlflow.cfg.json`.")
+    return "\n".join(lines)
+
+
+# What "the same thing" means for each comparable capability: the artifact to
+# read, the list inside it, and the field that identifies a row across programs.
+# Capabilities absent here are not set-shaped -- comparing two program summaries
+# is not an intersection -- and are declined rather than approximated.
+_COMPARABLE_CAPABILITIES: dict[str, tuple[str, str, str, str]] = {
+    # capability: (artifact, path to the list, key field, human noun)
+    "call_evidence": ("architecture.call_parameters.json", "calls", "target", "outgoing call"),
+    "copybook_evidence": ("architecture.copybooks.json", "content.all", "", "copybook"),
+    "variable_inventory": ("dataflow.used_variables.json", "variables", "variable", "variable"),
+    "cics_evidence": ("architecture.cics_operations.json", "content.commands", "", "CICS command"),
+    "paragraph_evidence": ("controlflow.cfg.json", "nodes", "", "paragraph"),
+}
+
+_SET_RELATIONS = ("intersection", "difference", "union", "comparison")
+
+# Which capability an intent is asking to compare. Intents absent here have no
+# set-shaped evidence, so a comparison of them is declined rather than faked.
+_COMPARISON_CAPABILITY_FOR_INTENT: dict[str, str] = {
+    "external_programs": "call_evidence",
+    "copybooks": "copybook_evidence",
+    "variable_inventory": "variable_inventory",
+    "variable_dataflow": "variable_inventory",
+    "cics_operations": "cics_evidence",
+    "control_flow": "paragraph_evidence",
+}
+
+
+def _dig(payload: Any, path: str) -> Any:
+    for part in path.split("."):
+        if not isinstance(payload, dict):
+            return None
+        payload = payload.get(part)
+    return payload
+
+
+def _comparable_keys(program: str, capability: str) -> set[str] | None:
+    """The identifying names this program contributes for a capability.
+
+    None means the evidence could not be read at all, which is different from an
+    empty set meaning the program genuinely has none.
+    """
+    spec = _COMPARABLE_CAPABILITIES.get(capability)
+    if not spec:
+        return None
+    artifact, path, field, _ = spec
+    root = find_final_scripts_root()
+    if root is None:
+        return None
+    program_root = find_program_artifact_root(root, program)
+    if program_root is None:
+        return None
+    payload = _read_json(_artifact_path(program_root, artifact))
+    if not isinstance(payload, dict):
+        return None
+    rows = _dig(payload, path)
+    if not isinstance(rows, list):
+        return None
+    keys: set[str] = set()
+    for row in rows:
+        value = row if isinstance(row, str) else (
+            row.get(field) if isinstance(row, dict) and field else None
+        )
+        text = str(value or "").strip().upper()
+        if text:
+            keys.add(text)
+    return keys
+
+
+def answer_program_comparison(
+    programs: Sequence[str],
+    capability: str,
+    relation: str,
+) -> str | None:
+    """Compare one capability across programs by joining on identifying names.
+
+    The same single-program evidence is read once per program and reduced to a
+    set of names, so the comparison is arithmetic rather than something a model
+    infers from two rendered answers.
+    """
+    named = [p for p in dict.fromkeys(str(x).upper() for x in programs if x)]
+    if len(named) < 2 or relation not in _SET_RELATIONS:
+        return None
+    spec = _COMPARABLE_CAPABILITIES.get(capability)
+    if not spec:
+        return None
+    artifact, _, _, noun = spec
+
+    # An empty side means "no evidence of this kind", not "none exist". Saying
+    # the program has none would be a claim the analysis never made.
+    blind = [p for p in named if capability in unavailable_capabilities(p)]
+    if blind:
+        listed = ", ".join(blind)
+        return (
+            f"{listed} has no {noun} evidence in the analyzed artifacts, so a "
+            f"comparison across {', '.join(named)} would read an absent capability "
+            f"as an empty result. Source: `program.capability_manifest.json`."
+        )
+
+    sets: dict[str, set[str]] = {}
+    for program in named:
+        keys = _comparable_keys(program, capability)
+        if keys is None:
+            return (
+                f"No {noun} evidence could be read for {program}. "
+                f"Source: `{artifact}`."
+            )
+        sets[program] = keys
+
+    shared = set.intersection(*sets.values())
+    lines: list[str] = []
+    if relation in {"intersection", "comparison"}:
+        lines.append(
+            f"{noun.capitalize()}s in every one of {', '.join(named)} "
+            f"({len(shared)}): {', '.join(sorted(shared)) or 'none'}"
+        )
+    if relation in {"difference", "comparison"}:
+        for program in named:
+            others = set.union(*[v for k, v in sets.items() if k != program])
+            only = sorted(sets[program] - others)
+            lines.append(
+                f"Only in {program} ({len(only)}): {', '.join(only) or 'none'}"
+            )
+    if relation == "union":
+        every = sorted(set.union(*sets.values()))
+        lines.append(f"{noun.capitalize()}s across {', '.join(named)} ({len(every)}): {', '.join(every)}")
+    counts = ", ".join(f"{p} {len(v)}" for p, v in sets.items())
+    lines.append(f"Recorded per program: {counts}.")
+    lines.append(
+        f"Matched by name as recorded in `{artifact}`; identical names are not "
+        "proof of identical content."
+    )
     return "\n".join(lines)
 
 

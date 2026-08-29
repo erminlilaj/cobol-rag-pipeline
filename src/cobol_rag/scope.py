@@ -409,8 +409,28 @@ def resolve_query_scope(
 
 
 
+# Set operations over two programs' evidence. "Which copybooks are shared by A
+# and B" is a comparison; requiring the word "compare" rejected it and answered
+# "ask for a comparison or choose one program", which is what it had just asked.
+_SET_RELATION_WORDS: tuple[tuple[str, str], ...] = (
+    (r"\b(?:shared|common|in both|both programs|same in both)\b", "intersection"),
+    (r"\b(?:only in|unique to|specific to|not in|absent from|missing from)\b", "difference"),
+    (r"\b(?:compare|comparison|difference|differences|versus|vs\.?)\b", "comparison"),
+    (r"\b(?:across both|combined|together|in total across)\b", "union"),
+)
+
+
+def set_relation_in(question: str) -> str | None:
+    """Which set operation over programs the question asks for, or None."""
+    lowered = question.lower()
+    for pattern, relation in _SET_RELATION_WORDS:
+        if re.search(pattern, lowered):
+            return relation
+    return None
+
+
 def _looks_like_comparison(question: str) -> bool:
-    return bool(re.search(r"\b(?:compare|comparison|difference|differences|versus|vs\.?)\b", question.lower()))
+    return set_relation_in(question) is not None
 
 def contextualize_question(question: str, scope: QueryScope) -> str:
     additions: list[str] = []

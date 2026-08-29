@@ -78,6 +78,8 @@ from cobol_rag.final_scripts_answers import (
     _answer_artifact_inventory,
     _answer_cics_operations,
     _answer_counts,
+    _control_flow_direction,
+    answer_control_flow_edges,
     _answer_literal_assignments,
     _length_ranking,
     _cics_statement_resources,
@@ -2705,6 +2707,90 @@ class MultiProgramCorpusTest(unittest.TestCase):
             _programs_holding(extended, ["PDRTWA2"])["PDRTWA2"],
             {"PDCBVC", "PDB305", "PDX999"},
         )
+
+
+class ReverseControlFlowTest(unittest.TestCase):
+    """Reaching a paragraph is a graph question the graph can answer exactly."""
+
+    _CFG = {"program": "PDCBVC", "nodes": ["MAIN", "ABEND00", "CHECK", "RANGE-A", "RANGE-B"],
+            "edges": [
+                {"from": "MAIN", "to": "ABEND00", "type": "JUMP", "line": 227,
+                 "condition": "NOT (TWCOB-FASE = '1')", "evidence": "GO TO ABEND00."},
+                {"from": "CHECK", "to": "ABEND00", "type": "CALL", "line": 765,
+                 "condition": "PXCSEMAF-OUTCOME NOT = SPACE", "evidence": "PERFORM ABEND00"},
+                {"from": "MAIN", "to": "RANGE-A", "type": "CALL_RANGE", "line": 255,
+                 "range_start": "RANGE-A", "range_end": "RANGE-B",
+                 "evidence": "PERFORM RANGE-A THRU RANGE-B."},
+                {"from": "RANGE-A", "to": "RANGE-B", "type": "RANGE_FLOW"},
+                {"from": "ABEND00", "to": "CHECK", "type": "JUMP", "line": 900,
+                 "evidence": "GO TO CHECK."},
+            ]}
+
+    def _root(self, directory: str) -> Path:
+        root = Path(directory)
+        (root / "controlflow.cfg.json").write_text(json.dumps(self._CFG), encoding="utf-8")
+        return root
+
+    def _answer(self, directory: str, target: str, direction: str) -> str | None:
+        with (
+            patch("cobol_rag.final_scripts_answers.find_final_scripts_root",
+                  return_value=Path(directory)),
+            patch("cobol_rag.final_scripts_answers.find_program_artifact_root",
+                  side_effect=lambda r, p: Path(r)),
+        ):
+            return answer_control_flow_edges("PDCBVC", target, direction)
+
+    def test_what_reaches_a_paragraph_is_read_from_the_graph(self) -> None:
+        # Observed production failure: "Which condition sends PDCBVC to ABEND00?"
+        # asked for clarification on one run and answered on another, because it
+        # depended on retrieval surfacing the control-flow chunk and generation
+        # then producing verifiable citations. The graph holds all six paths.
+        with tempfile.TemporaryDirectory() as directory:
+            answer = self._answer(self._root(directory).as_posix(), "ABEND00", "incoming")
+            self.assertIn("MAIN", answer)
+            self.assertIn("CHECK", answer)
+            self.assertIn("227", answer)
+            self.assertIn("765", answer)
+            self.assertIn("NOT (TWCOB-FASE = '1')", answer)
+            # The outgoing edge from ABEND00 is not something that reaches it.
+            self.assertNotIn("900", answer)
+
+    def test_a_perform_range_is_not_reported_as_a_jump(self) -> None:
+        # PERFORM A THRU B reaches a paragraph as part of a range rather than by
+        # a transfer naming it. Flattening the two answers "what reaches X" with
+        # things that never mention X.
+        with tempfile.TemporaryDirectory() as directory:
+            answer = self._answer(self._root(directory).as_posix(), "RANGE-A", "incoming")
+            self.assertIn("PERFORM range", answer)
+            self.assertIn("PERFORM RANGE-A THRU RANGE-B", answer)
+
+    def test_an_edge_with_no_statement_is_declared_not_hidden(self) -> None:
+        # RANGE_FLOW and FALLTHROUGH edges are implied by structure and have no
+        # line. Saying so is better than a silently short list.
+        with tempfile.TemporaryDirectory() as directory:
+            answer = self._answer(self._root(directory).as_posix(), "RANGE-B", "incoming")
+            self.assertIn("no source line", answer)
+
+    def test_direction_is_read_from_the_question(self) -> None:
+        for question, expected in (
+            ("Which condition sends PDCBVC to ABEND00?", "incoming"),
+            ("What reaches XCTL-LIV4?", "incoming"),
+            ("What triggers ABEND00?", "incoming"),
+            ("Who calls READ-TAB-SEMAF?", "incoming"),
+            ("What does BROWSE-FASE1 do?", "outgoing"),
+            ("Where does MUOVI-DATI go?", "outgoing"),
+            # not graph questions at all
+            ("Where is NPAGT written?", None),
+            ("Which copybooks are unused?", None),
+        ):
+            with self.subTest(question=question):
+                self.assertEqual(_control_flow_direction(question.lower()), expected)
+
+    def test_a_paragraph_not_in_the_graph_is_left_to_other_handling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertIsNone(
+                self._answer(self._root(directory).as_posix(), "NOSUCHPARA", "incoming")
+            )
 
 
 class ParagraphInventoryTest(unittest.TestCase):

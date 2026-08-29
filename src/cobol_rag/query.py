@@ -26,6 +26,7 @@ from cobol_rag.evidence import (
 )
 from cobol_rag.final_scripts_answers import (
     absent_capability_answer,
+    answer_control_flow_edges,
     answer_source_line_spans,
     answer_source_lines,
     answer_from_final_scripts,
@@ -1944,6 +1945,17 @@ def _try_structured_plan_answer(
     targets = plan.entity_values_for("paragraph")
     if not paragraph_tasks or not targets:
         return None
+    # The graph answers this exactly, and reading it does not depend on whether
+    # retrieval happened to surface the control-flow chunk. Both routes reach the
+    # same renderer so the answer does not change with the path taken -- and the
+    # rendered edges carry their source line, which the retrieved chunks do not.
+    if len(targets) == 1 and plan.program:
+        direction = (
+            "incoming" if "paragraph_references" in paragraph_tasks else "outgoing"
+        )
+        exact = answer_control_flow_edges(plan.program, targets[0], direction)
+        if exact:
+            return exact
     edges = _flat_control_flow_edges(sources)
     lines: list[str] = []
     for target in targets:

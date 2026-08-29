@@ -31,6 +31,17 @@ def answer_from_final_scripts(
     intent = plan.intent if plan else intent
     use_text_fallback = plan is None
 
+    # A named paragraph plus a direction is a graph question, and the graph can
+    # answer it exactly. Placed before the other handlers because those answer
+    # about the program as a whole, while this asks about one node in it.
+    if plan is not None:
+        direction = _control_flow_direction(q)
+        paragraphs = plan.entity_values_for("paragraph")
+        if direction and len(paragraphs) == 1:
+            answer = answer_control_flow_edges(program, paragraphs[0], direction)
+            if answer:
+                return answer
+
     if intent == "artifact_inventory" or (use_text_fallback and _asks_about_artifact_inventory(q)):
         answer = _answer_artifact_inventory(root, program)
         if answer:
@@ -1312,6 +1323,118 @@ def _cics_location(operation: dict[str, Any]) -> str:
     if included_at is not None:
         return f"{source_file} {line_label}, included by the main source at line {included_at}"
     return f"{source_file} {line_label}"
+
+
+# Reaching a paragraph and leaving one are the two directions of the same graph.
+# These name the direction, not a catalogue of phrasings.
+_REACHES_TARGET = re.compile(
+    r"\b(?:reach(?:es|ed)?|lead(?:s|ing)? to|trigger(?:s|ed)?|send(?:s|ing)? .{0,20}\bto\b|"
+    r"jump(?:s|ed)? to|go(?:es)? to|enter(?:s|ed)?|arrive(?:s)? at|call(?:s|ed)? into|"
+    r"referenc\w*|mention\w*|who calls|what calls)\b",
+    re.IGNORECASE,
+)
+_LEAVES_SOURCE = re.compile(
+    r"\b(?:does .{0,24}\b(?:do|call|perform|reach)\b|executed by|performed by|"
+    r"outgoing|leaves|exits? (?:to|from)|where does .{0,24}\bgo\b)\b",
+    re.IGNORECASE,
+)
+# PERFORM A THRU B reaches a paragraph as part of a range rather than by a jump
+# of its own. Flattening the two together answers "what reaches X" with things
+# that never name X.
+_RANGE_EDGE_TYPES = {"CALL_RANGE", "RANGE_FLOW"}
+
+
+def _control_flow_direction(q: str) -> str | None:
+    """Which way round the graph the question is asking, or None."""
+    if _REACHES_TARGET.search(q):
+        return "incoming"
+    if _LEAVES_SOURCE.search(q):
+        return "outgoing"
+    return None
+
+
+def _render_control_flow_edge(edge: dict[str, Any], direction: str) -> str:
+    other = edge.get("from") if direction == "incoming" else edge.get("to")
+    condition = edge.get("condition")
+    line = edge.get("line")
+    where = f", line {line}" if line else ""
+    evidence = edge.get("evidence")
+    statement = f": `{evidence}`" if evidence else ""
+    if edge.get("type") in _RANGE_EDGE_TYPES:
+        span = ""
+        if edge.get("range_start") and edge.get("range_end"):
+            span = f" PERFORM {edge['range_start']} THRU {edge['range_end']}"
+        reached = "reached as part of" if direction == "incoming" else "reaches, as part of"
+        detail = f"- {other or '?'}{where} — {reached}{span or ' a PERFORM range'}{statement}"
+    else:
+        when = f" when {condition}" if condition else " unconditionally"
+        detail = f"- {other or '?'}{where}{when}{statement}"
+    return detail
+
+
+def answer_control_flow_edges(
+    program: str | None,
+    target: str,
+    direction: str,
+) -> str | None:
+    """List what reaches a paragraph, or what it reaches, read from the graph.
+
+    Read rather than retrieved. The same question previously depended on whether
+    retrieval happened to surface the control-flow chunk and whether generation
+    then produced verifiable citations, so it answered correctly on some runs and
+    asked for clarification on others.
+    """
+    if not program or not target:
+        return None
+    root = find_final_scripts_root()
+    if root is None:
+        return None
+    program_root = find_program_artifact_root(root, program)
+    if program_root is None:
+        return None
+    payload = _read_json(_artifact_path(program_root, "controlflow.cfg.json"))
+    if not isinstance(payload, dict):
+        return None
+    edges = [item for item in payload.get("edges", []) if isinstance(item, dict)]
+    if not edges:
+        return None
+    target = target.upper()
+    if target not in {str(node).upper() for node in payload.get("nodes", [])}:
+        return None
+
+    key, verb = ("to", "reach") if direction == "incoming" else ("from", "left by")
+    matched = [e for e in edges if str(e.get(key, "")).upper() == target]
+    if not matched:
+        heading = "reaches" if direction == "incoming" else "is reached from"
+        return (
+            f"No recorded control-flow edge {heading} {target} in {program}. "
+            f"Source: `controlflow.cfg.json`."
+        )
+
+    direct = [e for e in matched if e.get("type") not in _RANGE_EDGE_TYPES]
+    ranged = [e for e in matched if e.get("type") in _RANGE_EDGE_TYPES]
+    headline = (
+        f"{len(matched)} recorded control-flow edge(s) reach {target} in {program}:"
+        if direction == "incoming"
+        else f"{target} in {program} transfers control along {len(matched)} recorded edge(s):"
+    )
+    lines = [headline]
+    lines.extend(_render_control_flow_edge(e, direction) for e in direct)
+    if ranged:
+        lines.append(
+            "Reached through a PERFORM range rather than a jump of its own:"
+            if direction == "incoming"
+            else "Part of a PERFORM range rather than its own transfer:"
+        )
+        lines.extend(_render_control_flow_edge(e, direction) for e in ranged)
+    uncited = sum(1 for e in matched if not e.get("line"))
+    if uncited:
+        lines.append(
+            f"{uncited} edge(s) have no source line: they are implied by program "
+            "structure rather than written as a statement."
+        )
+    lines.append("Source: `controlflow.cfg.json`.")
+    return "\n".join(lines)
 
 
 def _answer_counts(

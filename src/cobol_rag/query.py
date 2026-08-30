@@ -24,11 +24,17 @@ from cobol_rag.evidence import (
     EvidenceState,
     disposition_for_results,
 )
+from cobol_rag.query_ir import compile_query
 from cobol_rag.final_scripts_answers import (
     absent_capability_answer,
     _COMPARISON_CAPABILITY_FOR_INTENT,
+    answer_program_comparison,
     _control_flow_direction,
     answer_control_flow_edges,
+    _graph_payload,
+    answer_field_projection,
+    answer_graph_predicate,
+    answer_edges_between,
     answer_source_line_spans,
     answer_source_lines,
     answer_from_final_scripts,
@@ -641,6 +647,28 @@ def answer_query(
                 scope=QueryScope(intent="general"), plan=nontechnical_plan,
                 execution_mode=("conversational" if routing.route == "conversational" else "clarification"),
             )
+        # A question that compiles to a typed query is answered from the
+        # artifacts directly, before the guards that assume every question must
+        # match a capability signature. Those guards reject on the question's
+        # shape -- an edge question naming both endpoints, a property of the
+        # graph, a field of a named entity -- none of which the older plan could
+        # express, so all three were refused while their answers sat in the
+        # artifacts. Compilation returns None for anything else, so every
+        # question that already had a path keeps it.
+        typed_answer = _typed_query_answer(initial_plan, question)
+        if typed_answer:
+            return finish(
+                typed_answer,
+                [],
+                scope=initial_scope,
+                plan=initial_plan,
+                execution_mode="typed_query",
+                debug={
+                    "status": "accepted",
+                    "validation": {"stage": "typed_query", "passed": True, "reasons": []},
+                },
+            )
+
         if needs_answerability_check:
             answerable, answerability_reason = _assess_technical_answerability(
                 question, config, initial_scope,
@@ -1926,6 +1954,99 @@ def _deduplicate_retrieval_results(results: list[RetrievalResult]) -> list[Retri
     return list(unique.values())
 
 
+
+def _typed_query_answer(plan: Any, question: str) -> str | None:
+    """Compile the question to a typed query and execute it, or return None."""
+    if not question:
+        return None
+    try:
+        graph_nodes = _graph_node_names(plan.program) if plan.program else ()
+        compiled = compile_query(
+            question,
+            program=plan.program,
+            programs=plan.programs or ((plan.program,) if plan.program else ()),
+            paragraphs=plan.entity_values_for("paragraph"),
+            variables=plan.entity_values_for("variable"),
+            graph_nodes=graph_nodes,
+            entity_type=_comparison_entity_type(plan),
+        )
+    except Exception:
+        return None
+    if compiled is None:
+        return None
+
+    try:
+        return _execute_typed_query(compiled, plan)
+    except Exception:
+        # A defect in a typed executor must degrade to the paths that existed
+        # before it, not fail the request.
+        return None
+
+
+def _execute_typed_query(compiled: Any, plan: Any) -> str | None:
+    if compiled.kind == "graph_edges" and compiled.source and compiled.target:
+        return answer_edges_between(
+            compiled.program, compiled.source, compiled.target, compiled.projection
+        )
+    if compiled.kind == "graph_predicate":
+        return answer_graph_predicate(compiled.program, compiled.predicate)
+    if compiled.kind == "field_projection":
+        targets = [prog for prog in (compiled.programs or ()) if prog]
+        if len(targets) > 1:
+            # The same projection in each program, reported side by side. The
+            # answer to whether they agree is then visible rather than asserted.
+            rendered = []
+            for target in targets:
+                one = answer_field_projection(target, compiled.entity, compiled.field)
+                if one:
+                    rendered.append(one)
+            if len(rendered) > 1:
+                return "\n\n".join(rendered)
+            if rendered:
+                return rendered[0]
+            return None
+        return answer_field_projection(
+            compiled.program, compiled.entity, compiled.field
+        )
+    if compiled.kind == "set_relation" and len(compiled.programs) > 1:
+        capability = _capability_for_entity_type(
+            compiled.entity_type
+        ) or _COMPARISON_CAPABILITY_FOR_INTENT.get(plan.intent)
+        if capability:
+            return answer_program_comparison(
+                compiled.programs, capability, compiled.relation
+            )
+    return None
+
+
+def _graph_node_names(program: str) -> tuple[str, ...]:
+    payload = _graph_payload(program)
+    if not isinstance(payload, dict):
+        return ()
+    return tuple(str(node).upper() for node in payload.get("nodes", []) if node)
+
+
+def _capability_for_entity_type(entity_type: str | None) -> str | None:
+    if not entity_type:
+        return None
+    return {
+        "copybook": "copybook_evidence",
+        "variable": "variable_inventory",
+        "paragraph": "paragraph_evidence",
+        "call": "call_evidence",
+        "map": "cics_evidence",
+        "mapset": "cics_evidence",
+    }.get(entity_type)
+
+
+def _comparison_entity_type(plan: Any) -> str | None:
+    for entity in getattr(plan, "entities", ()) or ():
+        entity_type = getattr(entity, "entity_type", None)
+        if entity_type and entity_type != "unknown_identifier":
+            return entity_type
+    return None
+
+
 def _try_structured_plan_answer(
     plan: QueryPlan,
     sources: list[RetrievalResult],
@@ -1938,6 +2059,15 @@ def _try_structured_plan_answer(
     # with the paths leaving ABEND00 -- the opposite of the question.
     asked = _control_flow_direction(question.lower()) if question else None
     targets = plan.entity_values_for("paragraph")
+
+    # A typed query first, for the shapes a flat entity bag cannot express:
+    # both endpoints of an edge, a property of the graph, a field of a named
+    # entity. Returns None for everything else, so questions that already have
+    # a path keep it.
+    typed = _typed_query_answer(plan, question)
+    if typed:
+        return typed
+
     if asked and len(targets) == 1 and plan.program:
         exact = answer_control_flow_edges(plan.program, targets[0], asked)
         if exact:

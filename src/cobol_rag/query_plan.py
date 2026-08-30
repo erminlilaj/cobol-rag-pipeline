@@ -1780,6 +1780,14 @@ def validate_plan_answer(plan: QueryPlan, answer: str) -> PlanContractValidation
         if entity.entity_type in NAMED_IDENTIFIER_ENTITY_TYPES and entity.value.lower() not in lowered:
             reasons.append(f"missing_requested_entity:{entity.value}")
 
+    # An answer about control flow must assert only transfers the graph records.
+    # Checking that citations support the text does not catch this: the text can
+    # be fully cited and still state a relation that is not in the evidence.
+    # "Under what condition does A reach B" was answered with a condition taken
+    # from an unrelated edge and a destination that is not a paragraph at all,
+    # and every sentence of it was citable.
+    reasons.extend(_uncovered_control_flow_claims(plan, answer))
+
     # Program-level capabilities describe a whole program rather than a location in
     # it, so requiring a source line from them rejects a correct answer for a field
     # the capability never renders.
@@ -2077,3 +2085,68 @@ def _requests_exhaustive_results(q: str) -> bool:
 
 def _unique(values: Any) -> tuple[str, ...]:
     return tuple(dict.fromkeys(str(value) for value in values if str(value)))
+
+
+_FLOW_CLAIM = re.compile(
+    r"(?<![A-Z0-9-])(?P<source>[A-Z][A-Z0-9-]{2,})\s*(?:->|→|\bto\b)\s*"
+    r"(?P<target>[A-Z][A-Z0-9-]{2,})(?![A-Z0-9-])"
+)
+_CONDITION_CLAIM = re.compile(r"\bwhen\s+(?P<condition>[^.\n:`]{3,120})", re.IGNORECASE)
+
+
+def _uncovered_control_flow_claims(plan: Any, answer: str) -> list[str]:
+    """Flow claims in an answer that the control-flow graph does not record.
+
+    Only runs when the question was about named paragraphs, so it cannot reject
+    answers from capabilities that legitimately speak in another vocabulary.
+    """
+    named = [
+        entity.value.upper()
+        for entity in getattr(plan, "entities", ()) or ()
+        if getattr(entity, "entity_type", None) == "paragraph"
+    ]
+    if not named or not getattr(plan, "program", None) or not answer:
+        return []
+
+    try:
+        from cobol_rag.final_scripts_answers import _graph_payload
+
+        payload = _graph_payload(plan.program)
+    except Exception:
+        return []
+    if not isinstance(payload, dict):
+        return []
+
+    nodes = {str(node).upper() for node in payload.get("nodes", []) if node}
+    if not nodes:
+        return []
+    edges = [edge for edge in payload.get("edges", []) if isinstance(edge, dict)]
+    recorded_pairs = {
+        (str(edge.get("from", "")).upper(), str(edge.get("to", "")).upper()) for edge in edges
+    }
+    # Conditions are compared without spacing so that a rendering difference is
+    # not mistaken for a claim the evidence does not support.
+    recorded_conditions = {
+        re.sub(r"\s+", "", str(edge.get("condition") or "")).upper()
+        for edge in edges
+        if edge.get("condition")
+    }
+
+    reasons: list[str] = []
+    for match in _FLOW_CLAIM.finditer(answer.upper()):
+        source, target = match.group("source"), match.group("target")
+        if source not in nodes or target not in nodes:
+            continue  # not a claim about two paragraphs
+        if (source, target) not in recorded_pairs:
+            reasons.append(f"unrecorded_control_flow:{source}->{target}")
+
+    if recorded_conditions:
+        for match in _CONDITION_CLAIM.finditer(answer):
+            claim = re.sub(r"\s+", "", match.group("condition")).upper().rstrip(".,;")
+            if not claim or claim in {"", "UNCONDITIONALLY"}:
+                continue
+            if not any(claim in recorded or recorded in claim for recorded in recorded_conditions):
+                reasons.append("unrecorded_condition")
+                break
+    return reasons
+

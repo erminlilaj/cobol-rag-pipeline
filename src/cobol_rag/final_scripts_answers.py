@@ -3635,3 +3635,177 @@ def _deduplicate_simple_or_terms(condition: str) -> str:
         return condition
     joined = ") OR (".join(cleaned)
     return f"({joined})" if outer_parentheses else joined
+
+
+# ---------------------------------------------------------------------------
+# Typed query execution
+#
+# Each of these answers one shape the flat plan could not express. They read
+# artifacts directly, so the answer does not depend on retrieval surfacing the
+# right chunk or on generation producing citable text.
+# ---------------------------------------------------------------------------
+
+def _graph_payload(program: str | None) -> dict[str, Any] | None:
+    if not program:
+        return None
+    root = find_final_scripts_root()
+    if root is None:
+        return None
+    program_root = find_program_artifact_root(root, program)
+    if program_root is None:
+        return None
+    payload = _read_json(_artifact_path(program_root, "controlflow.cfg.json"))
+    return payload if isinstance(payload, dict) else None
+
+
+def answer_edges_between(
+    program: str, source: str, target: str, projection: str = "all"
+) -> str | None:
+    """Edges from one named paragraph to another.
+
+    A question naming both endpoints previously matched nothing: the edge
+    capability took a single paragraph, so the pair fell through to free
+    generation, which answered one of them with a fabricated target.
+    """
+    payload = _graph_payload(program)
+    if payload is None:
+        return None
+    nodes = {str(node).upper() for node in payload.get("nodes", [])}
+    source, target = source.upper(), target.upper()
+    if source not in nodes or target not in nodes:
+        return None
+
+    edges = [
+        edge
+        for edge in payload.get("edges", [])
+        if isinstance(edge, dict)
+        and str(edge.get("from", "")).upper() == source
+        and str(edge.get("to", "")).upper() == target
+    ]
+    if not edges:
+        # Before reporting an absence, check the other direction. Which of two
+        # named paragraphs is the source is read from the question's grammar,
+        # and a reading that finds nothing while the opposite reading finds
+        # edges is far more likely to be a misread question than a real gap.
+        reversed_edges = [
+            edge
+            for edge in payload.get("edges", [])
+            if isinstance(edge, dict)
+            and str(edge.get("from", "")).upper() == target
+            and str(edge.get("to", "")).upper() == source
+        ]
+        if reversed_edges:
+            source, target, edges = target, source, reversed_edges
+        else:
+            # Absence is a real answer here, and a different one from "no
+            # evidence was retrieved": both paragraphs exist in the graph and it
+            # records no edge between them, in either direction.
+            return (
+                f"No recorded control-flow edge runs between {source} and {target} in "
+                f"{program}, in either direction. Both paragraphs are in the graph, so "
+                f"this is a recorded absence rather than missing evidence.\n"
+                f"Source: `controlflow.cfg.json`."
+            )
+
+    lines = [
+        f"{len(edges)} recorded control-flow edge(s) run from {source} to {target} in {program}:"
+    ]
+    for edge in edges:
+        line = edge.get("line")
+        where = f", line {line}" if line else ""
+        condition = edge.get("condition")
+        when = f" when {condition}" if condition else " unconditionally"
+        evidence = edge.get("evidence")
+        statement = f": `{evidence}`" if evidence else ""
+        lines.append(f"- {source} -> {target}{where}{when}{statement}")
+    if projection == "condition" and not any(e.get("condition") for e in edges):
+        lines.append(
+            "No condition is recorded on these edges; the transfer is unconditional."
+        )
+    lines.append("Source: `controlflow.cfg.json`.")
+    return "\n".join(lines)
+
+
+def answer_graph_predicate(program: str, predicate: str) -> str | None:
+    """Paragraphs selected by a property of the graph rather than by name."""
+    payload = _graph_payload(program)
+    if payload is None:
+        return None
+    nodes = [str(node).upper() for node in payload.get("nodes", []) if node]
+    if not nodes:
+        return None
+    edges = [edge for edge in payload.get("edges", []) if isinstance(edge, dict)]
+
+    if predicate == "unreferenced":
+        recorded = (payload.get("meta") or {}).get("isolated_nodes")
+        if isinstance(recorded, list) and recorded:
+            selected = [str(name).upper() for name in recorded]
+        else:
+            reached = {str(edge.get("to", "")).upper() for edge in edges}
+            selected = [node for node in nodes if node not in reached]
+        heading = (
+            f"{len(selected)} paragraph(s) in {program} are never reached by a recorded "
+            f"PERFORM, GO TO or fall-through"
+        )
+    elif predicate == "terminal":
+        leaves = {str(edge.get("from", "")).upper() for edge in edges}
+        selected = [node for node in nodes if node not in leaves]
+        heading = f"{len(selected)} paragraph(s) in {program} transfer control nowhere"
+    else:
+        return None
+
+    if not selected:
+        return (
+            f"Every paragraph in {program} is reached by at least one recorded edge.\n"
+            f"Source: `controlflow.cfg.json`."
+        )
+    body = "\n".join(f"- {name}" for name in sorted(selected))
+    return (
+        f"{heading} ({len(nodes)} paragraphs total):\n{body}\n"
+        f"Source: `controlflow.cfg.json`."
+    )
+
+
+def answer_field_projection(program: str, entity: str, field: str) -> str | None:
+    """One recorded field of one named variable.
+
+    Answering "which copybook declares X" from the program's copybook inventory
+    returns a true list that is not the answer; the response contract then had
+    to reject it, so the question went unanswered while the fact sat in the
+    variable's own record.
+    """
+    if field != "origin":
+        return None
+    root = find_final_scripts_root()
+    if root is None:
+        return None
+    program_root = find_program_artifact_root(root, program)
+    if program_root is None:
+        return None
+    payload = _read_json(_artifact_path(program_root, "dataflow.used_variables.json"))
+    variables = (
+        payload.get("variables") if isinstance(payload, dict) else payload
+    ) or []
+    entity = entity.upper()
+    for variable in variables:
+        if not isinstance(variable, dict):
+            continue
+        if str(variable.get("variable") or "").upper() != entity:
+            continue
+        origin = str(variable.get("origin") or "").strip()
+        if not origin:
+            return (
+                f"{entity} is recorded in {program}, but no declaring source is "
+                f"recorded for it.\nSource: `dataflow.used_variables.json`."
+            )
+        if origin.upper().startswith("COPY:"):
+            member = origin.split(":", 1)[1]
+            answer = f"{entity} is declared in copybook `{member}` in {program}."
+        else:
+            answer = f"{entity} is declared in {origin} in {program}, not in a copybook."
+        declarations = (variable.get("evidence") or {}).get("declaration_sites") or []
+        for site in declarations[:2]:
+            if isinstance(site, dict) and site.get("statement"):
+                answer += f"\n- line {site.get('line_start') or site.get('line')}: `{site['statement']}`"
+        return answer + "\nSource: `dataflow.used_variables.json`."
+    return None

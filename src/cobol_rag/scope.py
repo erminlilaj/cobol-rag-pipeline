@@ -188,14 +188,13 @@ def resolve_query_scope(
         entity.program for entity in globally_named_entities
         if entity.program not in {"__GLOBAL__", "GLOBAL"}
     ))
-    multi_program_comparison = len(mentioned_programs) > 1 and _looks_like_comparison(question)
-    if len(mentioned_programs) > 1 and not multi_program_comparison:
-        return QueryScope(
-            programs=tuple(mentioned_programs),
-            intent=intent,
-            ambiguous=True,
-            reason="More than one analyzed program is named; ask for a comparison or choose one program.",
-        )
+    # Naming two analyzed programs is itself the request to consider both. The
+    # relation between them is read where it can be and defaults to a
+    # comparison, which shows each side's evidence and asserts nothing beyond
+    # it. Requiring a recognised phrase before accepting the question refused
+    # "copybooks used by A but not by B" over the preposition alone, while a
+    # comparison would have answered it and every paraphrase of it.
+    multi_program_comparison = len(mentioned_programs) > 1
 
     program: str | None = None
     program_source = "unresolved"
@@ -311,6 +310,16 @@ def resolve_query_scope(
                 f" ({examples}). Use the exact COBOL identifier."
             ),
         )
+
+    # An unresolved bare word only means the question is unanswerable when the
+    # question named nothing else. A message that already names something the
+    # corpus holds has a subject, and refusing it because a second word looked
+    # like a name answers nothing: "is the PERFORM of READ-TAB-SEMAF
+    # conditional" resolved the paragraph and was still rejected over the verb.
+    # Deciding this by whether anything resolved needs no list of words to
+    # ignore, so a COBOL keyword the list never anticipated behaves correctly.
+    if unresolved_references and resolved_entities:
+        unresolved_references = []
 
     if unresolved_references:
         named = ", ".join(f"`{value}`" for value in unresolved_references[:3])

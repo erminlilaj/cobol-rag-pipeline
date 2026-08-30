@@ -1,0 +1,20 @@
+{"id": "R1", "cluster": "reverse_flow", "question": "What reaches ABEND00 in PDCBVC?", "must_include": ["227", "TWCOB-FASE"]}
+{"id": "R2", "cluster": "reverse_flow", "question": "What reaches ABEND00 in PDB305?", "must_include": ["PDB305"]}
+{"id": "R3", "cluster": "reverse_flow", "question": "Which condition sends PDCBVC to ABEND00?", "must_include": ["ABEND00"]}
+{"id": "R4", "cluster": "reverse_flow", "question": "What does XCTL-MAIN do in PDCBVC?", "must_include": ["XCTL-MAIN"]}
+{"id": "C1", "cluster": "comparison", "question": "Compare the external calls of PDCBVC and PDB305.", "must_include": ["PD0UTI01", "PDPRED"]}
+{"id": "C2", "cluster": "comparison", "question": "Which copybooks are shared by PDCBVC and PDB305?", "must_include": ["PDRTWA2", "PDIABEND"]}
+{"id": "C3", "cluster": "comparison", "question": "Which calls are only in PDB305?", "must_include": ["PD1AC"], "must_not_include": ["PD0UTI01"]}
+{"id": "C4", "cluster": "comparison", "question": "Which variables are unique to PDCBVC?", "must_include": ["NPAGT"]}
+{"id": "I1", "cluster": "inventory", "question": "How many paragraphs does PDCBVC have?", "must_include": ["14", "65"]}
+{"id": "I2", "cluster": "inventory", "question": "List the paragraphs in PDB305", "must_include": ["ABEND00"]}
+{"id": "I3", "cluster": "inventory", "question": "Which source members does PDB305 have?", "must_include": ["PDB305.CBL"]}
+{"id": "E1", "cluster": "evidence", "question": "What is on line 227 and 114 of PDCBVC?", "must_include": ["227", "114"]}
+{"id": "E2", "cluster": "evidence", "question": "Which paragraph sends the PDCBVC1 map?", "must_include": ["SEND-PDCBVC1"]}
+{"id": "E3", "cluster": "evidence", "question": "What gives NPAGT its value in PDCBVC?", "must_include": ["397"]}
+{"id": "E4", "cluster": "evidence", "question": "List every hardcoded value assigned in INIZ-PARAM.", "must_include": ["INIZ-PARAM"], "must_not_include": ["WABEND-CODE"]}
+{"id": "E5", "cluster": "evidence", "question": "Which call uses the largest LENGTH value?", "must_include": ["PD1VOCI", "32000"]}
+{"id": "E6", "cluster": "evidence", "question": "Which DB2 tables does PDB305 access?", "must_include": ["DUAL"]}
+{"id": "S1", "cluster": "safety", "question": "Where is FAKE-VAR-999 used in PDCBVC?", "must_not_include": ["NPAGT"]}
+{"id": "S2", "cluster": "safety", "question": "Tell me about program ZZTOP99.", "must_not_include": ["declares"]}
+{"id": "S3", "cluster": "safety", "question": "Does PDCBVC write to any dataset?", "expect": "No JCL linkage \u2014 absence, not a gap."}

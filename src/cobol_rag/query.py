@@ -27,6 +27,7 @@ from cobol_rag.evidence import (
 from cobol_rag.final_scripts_answers import (
     absent_capability_answer,
     _COMPARISON_CAPABILITY_FOR_INTENT,
+    _control_flow_direction,
     answer_control_flow_edges,
     answer_source_line_spans,
     answer_source_lines,
@@ -1003,7 +1004,7 @@ def answer_query(
         return finish(message, [], scope=scope, outcome=outcome, plan=plan)
 
     pipeline_attempts: list[dict[str, Any]] = []
-    structured_answer = _try_structured_plan_answer(plan, sources)
+    structured_answer = _try_structured_plan_answer(plan, sources, contextual_question)
     if structured_answer:
         contract = validate_plan_answer(plan, structured_answer)
         if contract.passed:
@@ -1550,7 +1551,7 @@ def _attempt_evidence_subtask(
             guard_status=outcome.guard.status,
         )
 
-    structured = _try_structured_plan_answer(subplan, outcome.results)
+    structured = _try_structured_plan_answer(subplan, outcome.results, question)
     if structured:
         contract = validate_evidence_answer(subplan, structured)
         attempts.append(_subtask_attempt(
@@ -1928,9 +1929,19 @@ def _deduplicate_retrieval_results(results: list[RetrievalResult]) -> list[Retri
 def _try_structured_plan_answer(
     plan: QueryPlan,
     sources: list[RetrievalResult],
+    question: str = "",
 ) -> str | None:
     """Execute relation tasks over structured evidence after semantic planning."""
     tasks = set(plan.tasks)
+    # The direction the question asked for outranks the task label it was given.
+    # "What reaches ABEND00?" was planned as path_from_paragraph and answered
+    # with the paths leaving ABEND00 -- the opposite of the question.
+    asked = _control_flow_direction(question.lower()) if question else None
+    targets = plan.entity_values_for("paragraph")
+    if asked and len(targets) == 1 and plan.program:
+        exact = answer_control_flow_edges(plan.program, targets[0], asked)
+        if exact:
+            return exact
     if tasks & {"db2_tables", "jcl_datasets"}:
         return _structured_dataset_answer(tasks, sources)
     if tasks & {"commented_code", "unreachable_code", "unused_copybooks", "review_copybooks"}:

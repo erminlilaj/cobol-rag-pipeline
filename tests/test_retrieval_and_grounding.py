@@ -2944,6 +2944,18 @@ class ReverseControlFlowTest(unittest.TestCase):
             with self.subTest(question=question):
                 self.assertEqual(_control_flow_direction(question.lower()), expected)
 
+    def test_the_asked_direction_outranks_the_task_it_was_planned_as(self) -> None:
+        # Observed production failure: "What reaches ABEND00 in PDCBVC?" was
+        # planned as path_from_paragraph and answered with the paths *leaving*
+        # ABEND00 -- the opposite of the question. A task label is a guess at
+        # what was meant; the direction is in the question itself.
+        self.assertEqual(_control_flow_direction("what reaches abend00 in pdcbvc?"), "incoming")
+        self.assertEqual(_control_flow_direction("what does xctl-main do in pdcbvc?"), "outgoing")
+        # A whole-program walkthrough names no single paragraph and must keep
+        # using the forward-flow renderer.
+        self.assertIsNone(
+            _control_flow_direction("walk me through what pdcbvc does from start to finish."))
+
     def test_a_paragraph_not_in_the_graph_is_left_to_other_handling(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             self.assertIsNone(

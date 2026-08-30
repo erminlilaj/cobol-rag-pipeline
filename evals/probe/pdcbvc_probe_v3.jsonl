@@ -6,7 +6,7 @@
 {"id": "C2", "cluster": "comparison", "question": "Which copybooks are shared by PDCBVC and PDB305?", "must_include": ["PDRTWA2", "PDIABEND"]}
 {"id": "C3", "cluster": "comparison", "question": "Which calls are only in PDB305?", "must_include": ["PD1AC"], "must_not_include": ["PD0UTI01"]}
 {"id": "C4", "cluster": "comparison", "question": "Which variables are unique to PDCBVC?", "must_include": ["NPAGT"]}
-{"id": "I1", "cluster": "inventory", "question": "How many paragraphs does PDCBVC have?", "must_include": ["14", "65"]}
+{"id": "I1", "cluster": "inventory", "question": "How many paragraphs does PDCBVC have?", "must_include": ["14", "70"], "note": "65 was the CFG node count before 42095a8. Nodes were derived from edge endpoints, so 5 paragraphs with no edges were missing. program.source_lines.jsonl independently counts 70."}
 {"id": "I2", "cluster": "inventory", "question": "List the paragraphs in PDB305", "must_include": ["ABEND00"]}
 {"id": "I3", "cluster": "inventory", "question": "Which source members does PDB305 have?", "must_include": ["PDB305.CBL"]}
 {"id": "E1", "cluster": "evidence", "question": "What is on line 227 and 114 of PDCBVC?", "must_include": ["227", "114"]}

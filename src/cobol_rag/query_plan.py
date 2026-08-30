@@ -660,8 +660,25 @@ def build_query_plan(
     resolved_intent = intent or scope.intent or "general"
     detected_intent = resolved_intent
     explicit_followup = _is_explicit_followup(q, question)
-    if explicit_followup and resolved_intent == "general" and state and state.current_intent:
-        resolved_intent = state.current_intent
+    if explicit_followup and state and state.current_intent:
+        # A follow-up names no subject of its own -- that is what makes it one
+        # -- so it cannot be introducing a new one, and the words in it qualify
+        # the previous subject rather than replacing it. "How many variables
+        # does PDB305 have?" then "which of them control flow?" was read as a
+        # request for the control-flow domain and answered with a walkthrough
+        # of the program's transitions, losing the variables entirely.
+        #
+        # Naming a different kind of thing is the exception: "what about the
+        # copybooks?" moves to copybooks and should. The entity type the
+        # message names is what separates the two, so nothing here depends on
+        # recognising particular follow-up phrasings.
+        named_type = _followup_entity_type(question)
+        previous_type = (state.current_entity_type or "").lower() or None
+        changes_subject = bool(named_type and previous_type and named_type != previous_type)
+        if not changes_subject and (
+            resolved_intent == "general" or named_type is None
+        ):
+            resolved_intent = state.current_intent
 
     named_program_request = bool(
         scope.program
@@ -1818,8 +1835,31 @@ def validate_plan_answer(plan: QueryPlan, answer: str) -> PlanContractValidation
         "call_option_usage": ("cics/call option usage:",),
         "lineage_terminal": ("lineage completion:",),
     }
+    # A section is required only when the thing it describes is what the
+    # question is about. The planner attached variable_reads and
+    # variable_writes to "ABEND00 is entered from which paragraphs", and the
+    # contract then discarded a correct and complete list of control-flow edges
+    # for not containing variable sections -- which the capability that
+    # produced it does not render and never will. Requiring a section about
+    # variables when no variable is named is enforcing something the question
+    # did not ask for.
+    section_subject = {
+        "variable_reads": "variable",
+        "variable_writes": "variable",
+        "variable_lineage": "variable",
+        "variable_composition": "variable",
+        "call_option_usage": "call",
+    }
+    named_types = {
+        entity.entity_type for entity in plan.entities if getattr(entity, "entity_type", None)
+    }
     for task, markers in required_sections.items():
-        if task in plan.tasks and not any(marker in lowered for marker in markers):
+        if task not in plan.tasks:
+            continue
+        subject = section_subject.get(task)
+        if subject and named_types and subject not in named_types:
+            continue
+        if not any(marker in lowered for marker in markers):
             reasons.append(f"missing_requested_section:{task}")
     if "control_usage" in plan.output_fields:
         control_usage_markers = (
@@ -2048,6 +2088,22 @@ def _condition_terms(question: str) -> tuple[str, ...]:
         terms.extend(neither.groups())
     terms.extend(re.findall(r"(?:=|EQUALS?|EQUAL TO)\s*'?([A-Z0-9-]+)", upper))
     return _unique(term.strip() for term in terms if term.strip())
+
+
+
+def _followup_entity_type(question: str) -> str | None:
+    """The kind of thing a follow-up names, if it names one.
+
+    Shared with the typed-query compiler so that both read the entity type the
+    same way; two readings of what a question is about is one more than the
+    system can keep consistent.
+    """
+    try:
+        from cobol_rag.query_ir import entity_type_named
+
+        return entity_type_named(question)
+    except Exception:
+        return None
 
 
 def _is_explicit_followup(q: str, question: str = "") -> bool:

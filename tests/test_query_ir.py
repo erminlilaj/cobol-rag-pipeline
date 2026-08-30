@@ -4,6 +4,7 @@ import unittest
 
 from cobol_rag.query_ir import (
     FieldProjection,
+    Inventory,
     GraphEdges,
     GraphPredicate,
     SetRelation,
@@ -206,3 +207,51 @@ class UnresolvedReferenceTest(unittest.TestCase):
         for name in ("PDXXXX", "PDCBVC", "PDB305", "ABEND00"):
             with self.subTest(name=name):
                 self.assertNotIn(name, COBOL_RESERVED_WORDS)
+
+
+class InventoryQueryTest(unittest.TestCase):
+    """"Which maps does it send" and "which of them control flow" are one
+    shape: a kind of thing, and a property that narrows it.
+
+    Offered only where the planner produced no route, so it fills a gap rather
+    than overriding a route that works.
+    """
+
+    def compile(self, question, **kw):
+        kw.setdefault("program", "PDB305")
+        kw.setdefault("graph_nodes", NODES)
+        kw.setdefault("allow_inventory", True)
+        return compile_query(question, **kw)
+
+    def test_a_kind_of_thing_compiles_to_an_inventory(self) -> None:
+        q = self.compile("Which BMS maps does PDB305 send to the screen?")
+        self.assertIsInstance(q, Inventory)
+        self.assertEqual(q.entity_type, "map")
+        self.assertIsNone(q.property_filter)
+
+    def test_a_named_property_narrows_it(self) -> None:
+        q = self.compile("which variables control flow?")
+        self.assertEqual((q.entity_type, q.property_filter), ("variable", "controls_flow"))
+
+    def test_a_followup_inherits_the_kind_it_is_narrowing(self) -> None:
+        # "Which of them control flow?" names no kind of its own.
+        q = self.compile("Which of them control flow?", inherited_entity_type="variable")
+        self.assertIsInstance(q, Inventory)
+        self.assertEqual((q.entity_type, q.property_filter), ("variable", "controls_flow"))
+
+    def test_nothing_is_offered_when_a_route_already_exists(self) -> None:
+        self.assertIsNone(
+            self.compile("Which BMS maps does PDB305 send?", allow_inventory=False)
+        )
+
+    def test_a_question_naming_no_kind_compiles_to_nothing(self) -> None:
+        self.assertIsNone(self.compile("what happened here?"))
+
+    def test_an_edge_question_is_not_taken_over_by_the_inventory(self) -> None:
+        """Inventory runs last, so a more specific shape still wins."""
+        q = self.compile(
+            "under what condition does BROWSE-FASE1 reach XCTL-LIV4?",
+            program="PDCBVC",
+            paragraphs=("BROWSE-FASE1", "XCTL-LIV4"),
+        )
+        self.assertIsInstance(q, GraphEdges)

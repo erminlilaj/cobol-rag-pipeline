@@ -1384,8 +1384,33 @@ _LEAVES_SOURCE = re.compile(
 _RANGE_EDGE_TYPES = {"CALL_RANGE", "RANGE_FLOW"}
 
 
+# Subjects that are not part of the control-flow graph. A question about one
+# of these is not a flow question whatever verb it uses, and the verbs overlap:
+# "which maps does the program SEND TO the screen" reads as a flow direction to
+# any pattern built from flow vocabulary, because CICS and control flow share
+# the word. The subject settles it and no list of verbs can.
+_NON_FLOW_SUBJECT = re.compile(
+    r"(?<![a-z])(?:map|mapset|screen|copybook|copy\s+member|variable|field|"
+    r"table|dataset|file|literal|comment)s?(?![a-z])",
+    re.IGNORECASE,
+)
+_FLOW_SUBJECT = re.compile(
+    r"(?<![a-z])(?:paragraph|section|routine|program|control\s+flow|flow|edge|"
+    r"jump|branch|path)s?(?![a-z])",
+    re.IGNORECASE,
+)
+
+
 def _control_flow_direction(q: str) -> str | None:
-    """Which way round the graph the question is asking, or None."""
+    """Which way round the graph the question is asking, or None.
+
+    Answered only for questions whose subject is in the graph. Without that
+    test a CICS question was routed to control flow and answered with a
+    walkthrough of the program's transitions -- a true statement about
+    something the question did not ask about.
+    """
+    if _NON_FLOW_SUBJECT.search(q) and not _FLOW_SUBJECT.search(q):
+        return None
     if _REACHES_TARGET.search(q):
         return "incoming"
     if _LEAVES_SOURCE.search(q):
@@ -3809,3 +3834,190 @@ def answer_field_projection(program: str, entity: str, field: str) -> str | None
                 answer += f"\n- line {site.get('line_start') or site.get('line')}: `{site['statement']}`"
         return answer + "\nSource: `dataflow.used_variables.json`."
     return None
+
+
+def screen_field_names(program: str | None) -> tuple[str, ...]:
+    """Every field the screen-lineage artifact records, for recognising one."""
+    payload = _screen_lineage(program)
+    if not payload:
+        return ()
+    fields = (payload.get("content") or {}).get("fields") or []
+    names: list[str] = []
+    for field in fields:
+        if isinstance(field, dict) and field.get("field"):
+            names.append(str(field["field"]).upper())
+    return tuple(names)
+
+
+def _screen_lineage(program: str | None) -> dict[str, Any] | None:
+    if not program:
+        return None
+    root = find_final_scripts_root()
+    if root is None:
+        return None
+    program_root = find_program_artifact_root(root, program)
+    if program_root is None:
+        return None
+    payload = _read_json(_artifact_path(program_root, "screen_field_lineage.json"))
+    return payload if isinstance(payload, dict) else None
+
+
+def answer_screen_field(program: str, field: str) -> str | None:
+    """What a screen field is and where the program touches it.
+
+    The lineage artifact was generated on every run and read by nothing, so
+    questions about a screen field had no path at all and were answered by
+    generation, which returned the field's own name as its description.
+    """
+    payload = _screen_lineage(program)
+    if not payload:
+        return None
+    content = payload.get("content") or {}
+    fields = content.get("fields") or []
+    field = field.upper()
+
+    record = next(
+        (
+            item
+            for item in fields
+            if isinstance(item, dict) and str(item.get("field", "")).upper() == field
+        ),
+        None,
+    )
+    if record is None:
+        family = next(
+            (
+                item
+                for item in fields
+                if isinstance(item, dict)
+                and str(item.get("family", "")).upper() == field
+            ),
+            None,
+        )
+        record = family
+    if record is None:
+        return None
+
+    lines = [f"Screen field {record.get('field')} in {program}:"]
+    if record.get("family"):
+        members = record.get("family_members") or []
+        # BMS emits one family per screen field; naming the siblings is what
+        # says which parts of the same field a name refers to.
+        lines.append(
+            f"- BMS field family `{record['family']}`"
+            + (f" ({', '.join(members)})" if members else "")
+        )
+    if record.get("origin"):
+        lines.append(f"- Declared in: {record['origin']}")
+    for label, key in (
+        ("Set in", "modified_in"),
+        ("Read in", "used_in"),
+        ("Defined in", "defined_in"),
+    ):
+        values = record.get(key) or []
+        if values:
+            lines.append(f"- {label}: {', '.join(str(v) for v in values)}")
+    if record.get("controls_flow"):
+        lines.append("- Controls flow: yes")
+    for site in (record.get("write_sites") or [])[:4]:
+        if isinstance(site, dict) and site.get("statement"):
+            where = site.get("line_start") or site.get("line")
+            lines.append(f"  - {site.get('paragraph')} line {where}: `{site['statement']}`")
+    related = [
+        str(item.get("variable"))
+        for item in (record.get("related_variables") or [])
+        if isinstance(item, dict) and item.get("variable")
+    ]
+    if related:
+        lines.append(f"- Moved to or from: {', '.join(dict.fromkeys(related))}")
+    limitations = content.get("limitations")
+    if limitations:
+        lines.append(f"Scope: {limitations}")
+    lines.append("Source: `screen_field_lineage.json`.")
+    return "\n".join(lines)
+
+
+def answer_inventory(
+    program: str, entity_type: str, property_filter: str | None = None
+) -> str | None:
+    """Everything of one kind in a program, narrowed by a property if given.
+
+    "Which maps does it send" had no capability and fell to retrieval, which
+    answered with whatever chunk surfaced -- a control-flow walkthrough. "Which
+    of them control flow" asked for a property the evidence records per
+    variable and no renderer emitted.
+    """
+    root = find_final_scripts_root()
+    if root is None:
+        return None
+    program_root = find_program_artifact_root(root, program)
+    if program_root is None:
+        return None
+
+    if entity_type == "variable":
+        payload = _read_json(_artifact_path(program_root, "dataflow.used_variables.json"))
+        variables = (
+            payload.get("variables") if isinstance(payload, dict) else payload
+        ) or []
+        selected = [
+            variable
+            for variable in variables
+            if isinstance(variable, dict)
+            and (not property_filter or bool(variable.get(property_filter)))
+        ]
+        if not selected:
+            return None
+        names = sorted(str(v.get("variable")) for v in selected if v.get("variable"))
+        qualifier = " that control flow" if property_filter == "controls_flow" else ""
+        head = f"{len(names)} variable(s) in {program}{qualifier}:"
+        body = "\n".join(f"- {name}" for name in names)
+        return f"{head}\n{body}\nSource: `dataflow.used_variables.json`."
+
+    if entity_type in {"map", "mapset"}:
+        payload = _read_json(_artifact_path(program_root, "architecture.cics_operations.json"))
+        operations = []
+        if isinstance(payload, dict):
+            for key in ("operations", "content", "evidence"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    operations = value
+                    break
+                if isinstance(value, dict) and isinstance(value.get("operations"), list):
+                    operations = value["operations"]
+                    break
+        found: dict[str, set[str]] = {}
+        pattern = _MAPSET_NAME if entity_type == "mapset" else _CICS_MAP_NAME_ONLY
+        for operation in operations:
+            if not isinstance(operation, dict):
+                continue
+            statement = str(operation.get("statement") or operation.get("evidence") or "")
+            for match in pattern.finditer(statement):
+                name = match.group(1).upper()
+                found.setdefault(name, set()).add(
+                    str(
+                        operation.get("command")
+                        or operation.get("operation")
+                        or operation.get("type")
+                        or ""
+                    ).upper()
+                )
+        if not found:
+            return None
+        lines = [f"{len(found)} {entity_type}(s) referenced by {program}:"]
+        for name, verbs in sorted(found.items()):
+            used = ", ".join(sorted(v for v in verbs if v)) or "referenced"
+            lines.append(f"- {name} — {used}")
+        lines.append("Source: `architecture.cics_operations.json`.")
+        return "\n".join(lines)
+
+    return None
+
+
+# MAP('X') without matching MAPSET('X'); the two are separate operands and a
+# pattern that accepts either reports a mapset as a map.
+_CICS_MAP_NAME_ONLY = re.compile(
+    r"(?<!SET)\bMAP\s*\(\s*['\"]?([A-Z0-9$#@-]{1,8})['\"]?\s*\)", re.IGNORECASE
+)
+_MAPSET_NAME = re.compile(
+    r"\bMAPSET\s*\(\s*['\"]?([A-Z0-9$#@-]{1,8})['\"]?\s*\)", re.IGNORECASE
+)

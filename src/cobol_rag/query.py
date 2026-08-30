@@ -31,6 +31,9 @@ from cobol_rag.final_scripts_answers import (
     answer_program_comparison,
     _control_flow_direction,
     answer_control_flow_edges,
+    answer_screen_field,
+    answer_inventory,
+    screen_field_names,
     _graph_payload,
     answer_field_projection,
     answer_graph_predicate,
@@ -619,6 +622,32 @@ def answer_query(
             "Please name the exact previously discussed variable you want the summary to focus on.",
             [], route="unclear", execution_mode="clarification",
         )
+    # A question that compiles to a typed query is answered from the artifacts
+    # directly, before every later stage. Those stages assume a question must
+    # match a capability signature and reject on its shape -- both endpoints of
+    # an edge, a property of the graph, a field of a named entity, an inventory
+    # of a kind of thing -- none of which the older plan could express, so they
+    # were refused while their answers sat in the artifacts. Compilation
+    # returns None for anything else, so questions that already have a path
+    # keep it.
+    #
+    # This sits outside the semantic-refinement branch deliberately: placed
+    # inside it, it ran only for questions the planner was unsure about, and
+    # the ones it was confident and wrong about never reached it.
+    typed_answer = _typed_query_answer(initial_plan, question)
+    if typed_answer:
+        return finish(
+            typed_answer,
+            [],
+            scope=initial_scope,
+            plan=initial_plan,
+            execution_mode="typed_query",
+            debug={
+                "status": "accepted",
+                "validation": {"stage": "typed_query", "passed": True, "reasons": []},
+            },
+        )
+
     if plan_needs_semantic_refinement(question, initial_plan):
         routing = _resolve_weak_technical_route(
             question,
@@ -647,28 +676,6 @@ def answer_query(
                 scope=QueryScope(intent="general"), plan=nontechnical_plan,
                 execution_mode=("conversational" if routing.route == "conversational" else "clarification"),
             )
-        # A question that compiles to a typed query is answered from the
-        # artifacts directly, before the guards that assume every question must
-        # match a capability signature. Those guards reject on the question's
-        # shape -- an edge question naming both endpoints, a property of the
-        # graph, a field of a named entity -- none of which the older plan could
-        # express, so all three were refused while their answers sat in the
-        # artifacts. Compilation returns None for anything else, so every
-        # question that already had a path keeps it.
-        typed_answer = _typed_query_answer(initial_plan, question)
-        if typed_answer:
-            return finish(
-                typed_answer,
-                [],
-                scope=initial_scope,
-                plan=initial_plan,
-                execution_mode="typed_query",
-                debug={
-                    "status": "accepted",
-                    "validation": {"stage": "typed_query", "passed": True, "reasons": []},
-                },
-            )
-
         if needs_answerability_check:
             answerable, answerability_reason = _assess_technical_answerability(
                 question, config, initial_scope,
@@ -1968,7 +1975,19 @@ def _typed_query_answer(plan: Any, question: str) -> str | None:
             paragraphs=plan.entity_values_for("paragraph"),
             variables=plan.entity_values_for("variable"),
             graph_nodes=graph_nodes,
+            screen_fields=screen_field_names(plan.program) if plan.program else (),
             entity_type=_comparison_entity_type(plan),
+            inherited_entity_type=_inherited_entity_type(plan),
+            # Only where the planner produced no route of its own, so this
+            # fills a gap instead of overriding something that works.
+            # A gap to fill, not a route to override: offered when the planner
+            # produced nothing, and for a follow-up, which by definition names
+            # no subject of its own and so is narrowing the previous one.
+            allow_inventory=(
+                not plan.tasks
+                or plan.intent in {"general", None}
+                or bool(getattr(plan, "explicit_followup", False))
+            ),
         )
     except Exception:
         return None
@@ -1988,6 +2007,12 @@ def _execute_typed_query(compiled: Any, plan: Any) -> str | None:
         return answer_edges_between(
             compiled.program, compiled.source, compiled.target, compiled.projection
         )
+    if compiled.kind == "inventory":
+        return answer_inventory(
+            compiled.program, compiled.entity_type, compiled.property_filter
+        )
+    if compiled.kind == "screen_field":
+        return answer_screen_field(compiled.program, compiled.field)
     if compiled.kind == "graph_predicate":
         return answer_graph_predicate(compiled.program, compiled.predicate)
     if compiled.kind == "field_projection":
@@ -2037,6 +2062,18 @@ def _capability_for_entity_type(entity_type: str | None) -> str | None:
         "map": "cics_evidence",
         "mapset": "cics_evidence",
     }.get(entity_type)
+
+
+def _inherited_entity_type(plan: Any) -> str | None:
+    """The kind of thing a follow-up is narrowing, carried from the plan."""
+    for task in getattr(plan, "tasks", ()) or ():
+        if str(task).startswith("variable"):
+            return "variable"
+        if str(task).startswith("copybook"):
+            return "copybook"
+        if str(task).startswith("paragraph"):
+            return "paragraph"
+    return None
 
 
 def _comparison_entity_type(plan: Any) -> str | None:

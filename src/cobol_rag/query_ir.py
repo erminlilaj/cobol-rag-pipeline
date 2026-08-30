@@ -93,7 +93,38 @@ class FieldProjection:
         return "field_projection"
 
 
-Query = GraphEdges | GraphPredicate | SetRelation | FieldProjection
+@dataclass(frozen=True)
+class ScreenField:
+    """A field of the program's screen, and where the program touches it."""
+
+    program: str
+    field: str
+
+    @property
+    def kind(self) -> str:
+        return "screen_field"
+
+
+@dataclass(frozen=True)
+class Inventory:
+    """Everything of one kind in a program, optionally filtered by a property.
+
+    "Which maps does it send" and "which of them control flow" are the same
+    shape: a kind of thing, and a property that narrows it.
+    """
+
+    program: str
+    entity_type: str
+    property_filter: str | None = None
+
+    @property
+    def kind(self) -> str:
+        return "inventory"
+
+
+Query = (
+    GraphEdges | GraphPredicate | SetRelation | FieldProjection | ScreenField | Inventory
+)
 
 
 # --------------------------------------------------------------------------
@@ -122,6 +153,7 @@ _ORIGIN_FIELD = re.compile(
 )
 
 _COPYBOOK_WORD = re.compile(r"(?<![a-z])cop\w*(?![a-z])", re.I)
+_SCREEN_WORD = re.compile(r"(?<![a-z])(?:screen|map|bms|display|field)s?(?![a-z])", re.I)
 
 
 ENTITY_TYPE_NAMES: tuple[str, ...] = (
@@ -180,6 +212,23 @@ def _relation_between(question: str, first_end: int, second_start: int) -> str |
 # Compilation
 # --------------------------------------------------------------------------
 
+# Properties of a record that a question can narrow an inventory by. Names the
+# field in the evidence, so adding one is a statement about the data rather
+# than about phrasing.
+_PROPERTY_FILTERS: tuple[tuple[str, str], ...] = (
+    (r"(?<![a-z])controls?\s+(?:the\s+)?flow(?![a-z])", "controls_flow"),
+    (r"(?<![a-z])control\s+flow(?![a-z])", "controls_flow"),
+    (r"(?<![a-z])flow[- ]controlling(?![a-z])", "controls_flow"),
+)
+
+
+def property_filter_named(question: str) -> str | None:
+    for pattern, field in _PROPERTY_FILTERS:
+        if re.search(pattern, question, re.I):
+            return field
+    return None
+
+
 def compile_query(
     question: str,
     *,
@@ -188,7 +237,10 @@ def compile_query(
     paragraphs: Sequence[str] = (),
     variables: Sequence[str] = (),
     graph_nodes: Sequence[str] = (),
+    screen_fields: Sequence[str] = (),
     entity_type: str | None = None,
+    inherited_entity_type: str | None = None,
+    allow_inventory: bool = False,
 ) -> Query | None:
     """Compile a question into a typed query, or None to leave it alone.
 
@@ -230,6 +282,15 @@ def compile_query(
     if not program:
         return None
 
+    # A named field that the screen artifact records is a screen question, and
+    # the corpus decides that rather than the wording: the program's own list of
+    # screen fields is what makes the name one.
+    screen = {str(f).upper() for f in screen_fields}
+    if screen and _SCREEN_WORD.search(question):
+        for name in variables:
+            if name.upper() in screen:
+                return ScreenField(program=program, field=name.upper())
+
     nodes = {str(n).upper() for n in graph_nodes}
     named_nodes = [p.upper() for p in paragraphs if p.upper() in nodes]
     named_nodes = list(dict.fromkeys(named_nodes))
@@ -259,6 +320,18 @@ def compile_query(
     # asking for the paragraphs the relation does not hold for.
     if not named_nodes and _FLOW_RELATION.search(question) and _NEGATION.search(question):
         return GraphPredicate(program=program, predicate="unreferenced")
+
+    # An inventory of a kind of thing, narrowed by a property if one is named.
+    # Offered only where the planner produced no route of its own, so this
+    # fills a gap rather than overriding something that already works.
+    if allow_inventory:
+        wanted = entity_type_named(question) or inherited_entity_type
+        if wanted:
+            return Inventory(
+                program=program,
+                entity_type=wanted,
+                property_filter=property_filter_named(question),
+            )
 
     # Which copybook declares a named variable: a field of that variable, not
     # the program's copybook inventory. Answering it from the inventory was a

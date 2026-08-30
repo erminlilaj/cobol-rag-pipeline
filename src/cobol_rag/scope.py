@@ -144,6 +144,27 @@ class SessionState:
         self.last_result_entities.clear()
 
 
+# Words COBOL reserves. A reserved word cannot be a user-defined name, so one
+# appearing in a question is language rather than a reference to something the
+# corpus should hold. Distinct in kind from a stoplist of question phrasings:
+# this set is fixed by the language, not by what questions have been seen.
+COBOL_RESERVED_WORDS = frozenset({
+    "ACCEPT", "ADD", "ALTER", "AND", "CALL", "CANCEL", "CLOSE", "COMPUTE",
+    "CONTINUE", "DELETE", "DISPLAY", "DIVIDE", "ELSE", "END", "END-ADD",
+    "END-CALL", "END-COMPUTE", "END-DELETE", "END-DIVIDE", "END-EVALUATE",
+    "END-EXEC", "END-IF", "END-MULTIPLY", "END-PERFORM", "END-READ",
+    "END-RETURN", "END-REWRITE", "END-SEARCH", "END-START", "END-STRING",
+    "END-SUBTRACT", "END-UNSTRING", "END-WRITE", "ENTRY", "EVALUATE", "EXEC",
+    "EXECUTE", "EXIT", "GO", "GOBACK", "IF", "INITIALIZE", "INSPECT", "INTO",
+    "INVOKE", "MERGE", "MOVE", "MULTIPLY", "NEXT", "NOT", "OPEN", "OR",
+    "PERFORM", "READ", "RECEIVE", "RELEASE", "RETURN", "REWRITE", "SEARCH",
+    "SEND", "SET", "SORT", "START", "STOP", "STRING", "SUBTRACT", "THEN",
+    "THRU", "THROUGH", "UNSTRING", "UNTIL", "USE", "VARYING", "WHEN", "WRITE",
+    "SECTION", "DIVISION", "PARAGRAPH", "PROCEDURE", "WORKING-STORAGE",
+    "LINKAGE", "COPY", "REPLACE", "USING", "GIVING", "FROM",
+})
+
+
 def _programs_holding(
     entities: Sequence[EntityReference], tokens: Sequence[str],
 ) -> dict[str, set[str]]:
@@ -221,6 +242,32 @@ def resolve_query_scope(
         program = entity_programs[0]
         program_source = "unique_entity"
     elif len(entity_programs) > 1:
+        # A question that names a program the corpus does not hold is answered
+        # about that first. Reporting instead that some other identifier is
+        # ambiguous across programs answers a question the user did not ask and
+        # never mentions that the program they named is not analyzed.
+        unnamed = [
+            token
+            for token in _explicit_identifier_tokens(question)
+            if "-" not in token
+            and len(token) >= 4
+            and token.upper() not in COBOL_RESERVED_WORDS
+            and token not in programs
+            and not any(
+                entity.value == token or entity.value.startswith(token + "-")
+                for entity in entities
+            )
+        ]
+        if unnamed:
+            named = ", ".join(f"`{token}`" for token in unnamed[:3])
+            return QueryScope(
+                intent=intent,
+                ambiguous=True,
+                reason=(
+                    f"{named} is not an analyzed program. Analyzed programs are: "
+                    f"{', '.join(programs)}."
+                ),
+            )
         return QueryScope(
             programs=entity_programs,
             intent=intent,
@@ -311,15 +358,20 @@ def resolve_query_scope(
             ),
         )
 
-    # An unresolved bare word only means the question is unanswerable when the
-    # question named nothing else. A message that already names something the
-    # corpus holds has a subject, and refusing it because a second word looked
-    # like a name answers nothing: "is the PERFORM of READ-TAB-SEMAF
-    # conditional" resolved the paragraph and was still rejected over the verb.
-    # Deciding this by whether anything resolved needs no list of words to
-    # ignore, so a COBOL keyword the list never anticipated behaves correctly.
-    if unresolved_references and resolved_entities:
-        unresolved_references = []
+    # A word that COBOL reserves cannot name anything, so finding it in a
+    # question is not evidence that the corpus is missing something: "is the
+    # PERFORM of READ-TAB-SEMAF conditional" was refused over the verb while
+    # the paragraph resolved. This is the language's own reserved list, fixed
+    # by the standard, and not a list of phrasings to ignore -- which is why it
+    # can be relied on for words nobody thought to add.
+    #
+    # Everything else that resolves to nothing stays reported, even alongside
+    # entities that did resolve. Dropping those too was briefly tried and made
+    # "In PDXXXX, which paragraphs call ABEND00?" answer about ABEND00 without
+    # ever saying that PDXXXX is not analyzed.
+    unresolved_references = [
+        token for token in unresolved_references if token.upper() not in COBOL_RESERVED_WORDS
+    ]
 
     if unresolved_references:
         named = ", ".join(f"`{value}`" for value in unresolved_references[:3])

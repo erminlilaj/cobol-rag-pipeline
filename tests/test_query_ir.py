@@ -187,3 +187,22 @@ class NoGuessTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnresolvedReferenceTest(unittest.TestCase):
+    """A reserved word is language; anything else that resolves to nothing is
+    a name the corpus does not hold, and saying so is the answer."""
+
+    def test_reserved_words_are_not_missing_entities(self) -> None:
+        from cobol_rag.scope import COBOL_RESERVED_WORDS
+
+        for word in ("PERFORM", "MOVE", "EVALUATE", "COMPUTE", "INITIALIZE"):
+            with self.subTest(word=word):
+                self.assertIn(word, COBOL_RESERVED_WORDS)
+
+    def test_a_plausible_program_name_is_not_reserved(self) -> None:
+        from cobol_rag.scope import COBOL_RESERVED_WORDS
+
+        for name in ("PDXXXX", "PDCBVC", "PDB305", "ABEND00"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, COBOL_RESERVED_WORDS)

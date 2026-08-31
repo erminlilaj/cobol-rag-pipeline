@@ -240,9 +240,17 @@ def parse_response_contract(question: str) -> ResponseContract:
         if bullet_match:
             exact_item_count = _contract_number(bullet_match.group(1))
 
+    # "only" restricts the answer's content -- but not when it restricts where
+    # the answer may come from. "Using only analyzed evidence" asks for no
+    # speculation, and reading it as "print nothing but the requested field"
+    # pushed a question with a perfectly good direct answer onto generation,
+    # which then could not verify what it wrote.
     only_requested_content = bool(
         re.search(
-            r"\b(?:only|nothing else|no extra (?:text|content|explanation)|without (?:extra|additional) (?:text|content|explanation))\b",
+            r"\b(?:only(?!\s+(?:\w+\s+){0,2}(?:evidence|artifacts?|sources?|"
+            r"facts?|data|what\s+is\s+(?:recorded|analyzed)))"
+            r"|nothing else|no extra (?:text|content|explanation)"
+            r"|without (?:extra|additional) (?:text|content|explanation))\b",
             q,
         )
     )

@@ -199,6 +199,9 @@ _UNUSED_QUESTION = re.compile(
     r"left\s+over|leftover|obsolete)(?![a-z])",
     re.I,
 )
+_LITERAL_QUESTION = re.compile(
+    r"(?<![a-z])(?:literal|forced|hard[- ]?coded|constant|assigned\s+value)s?(?![a-z])", re.I
+)
 _SCREEN_WORD = re.compile(r"(?<![a-z])(?:screen|map|bms|display|field)s?(?![a-z])", re.I)
 # Asking what something is for, rather than for a list of them.
 # A question whose subject is the corpus: it asks which programs do something,
@@ -457,6 +460,18 @@ def compile_query(
     # question that names a second program only in passing -- "what is this
     # copybook for, and which other programs use it" -- is not a comparison,
     # and treating it as one took every part of every multi-program question.
+    # A comparison that names one entity is about that entity in each program,
+    # not about the programs' inventories. Comparing inventories answered
+    # "compare the literals assigned to TWCOB-FASE" with the variable names the
+    # programs share -- true, and about something else.
+    if len(named_programs) > 1 and variables and _LITERAL_QUESTION.search(question):
+        return FieldProjection(
+            program=program or named_programs[0],
+            entity=variables[0].upper(),
+            field="literals",
+            programs=named_programs,
+        )
+
     if len(named_programs) > 1 and not _PURPOSE_QUESTION.search(question) and not (
         corpus_entity and _CORPUS_SUBJECT.search(question)
     ):

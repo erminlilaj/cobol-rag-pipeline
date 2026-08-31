@@ -985,9 +985,17 @@ def _answer_program_summary(
             f"- {text.rstrip('.')} (`{source.rstrip('/')}`)."
             for text, source in summary_items
         )
-    if response and response.max_lines is not None:
+    # A request for two sentences and a request for two lines want the same
+    # thing from this renderer, which writes one sentence per line. Honouring
+    # only max_lines meant "explain this in two sentences" fell through to the
+    # full overview and was then rejected by its own contract for being longer
+    # than two sentences -- a limit the short form was written to meet.
+    budget = response.max_lines if response and response.max_lines is not None else (
+        response.max_sentences if response else None
+    )
+    if response and budget is not None:
         first_line = f"{program} is a {character}."
-        if response.max_lines == 1:
+        if budget == 1:
             return first_line
         compact_facts = [
             re.sub(r"\s+covering\s+.*$", "", fact.split(":", 1)[0]).rstrip(".")
@@ -4520,3 +4528,42 @@ def answer_unused_code(program: str) -> str | None:
         "\nSource: `quality.dead_code.json`, `architecture.unused_copybooks.json`."
     )
     return answer
+
+
+def answer_literal_projection(program: str, entity: str) -> str | None:
+    """The literal values assigned to one named variable in one program.
+
+    Comparing this across programs is that projection read in each. Routed to
+    the variable inventory instead, the comparison returned the set of variable
+    names the programs share, which is a true statement about something else.
+    """
+    root = find_final_scripts_root()
+    if root is None:
+        return None
+    program_root = find_program_artifact_root(root, program)
+    if program_root is None:
+        return None
+    payload = _read_json(_artifact_path(program_root, "dataflow.literal_assignments.json"))
+    assignments = (payload or {}).get("assignments") or []
+    entity = entity.upper()
+    matched = [
+        item
+        for item in assignments
+        if isinstance(item, dict) and str(item.get("target_variable", "")).upper() == entity
+    ]
+    if not matched:
+        return (
+            f"No literal value is assigned to {entity} in {program}.\n"
+            f"Source: `dataflow.literal_assignments.json`."
+        )
+    values = sorted({str(item.get("literal")) for item in matched})
+    lines = [
+        f"{entity} in {program} is assigned {len(values)} distinct literal value(s): "
+        f"{', '.join(repr(value) for value in values)}"
+    ]
+    for item in matched:
+        lines.append(
+            f"- {item.get('paragraph')} line {item.get('line')}: `{item.get('statement')}`"
+        )
+    lines.append("Source: `dataflow.literal_assignments.json`.")
+    return "\n".join(lines)

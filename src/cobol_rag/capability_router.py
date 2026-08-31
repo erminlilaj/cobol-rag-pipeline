@@ -15,6 +15,7 @@ never invents a program or an identifier.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Sequence
 
@@ -253,6 +254,32 @@ class CapabilityMatch:
     @property
     def confident(self) -> bool:
         return self.score >= MIN_CAPABILITY_SCORE and self.margin >= MIN_CAPABILITY_MARGIN
+
+
+# Words that describe the shape of the reply rather than its subject. They are
+# parsed into the response contract before ranking, so leaving them in the text
+# only moves the question away from the capability that owns it: "explain
+# PDB305 in exactly two sentences using only analyzed evidence" ranked on the
+# instructions rather than on PDB305 and landed on outgoing calls, while
+# "explain PDB305" ranked correctly.
+_FORMAT_INSTRUCTION = re.compile(
+    r"(?<![a-z])(?:in\s+)?(?:exactly|at\s+most|no\s+more\s+than|only|just)?\s*"
+    r"(?:one|two|three|four|five|\d+)?\s*"
+    r"(?:sentences?|lines?|words?|bullets?|items?|paragraphs?)(?![a-z])"
+    r"|(?<![a-z])using\s+only\s+[\w\s]{0,24}evidence(?![a-z])"
+    r"|(?<![a-z])(?:be\s+)?(?:brief|concise|short|detailed|verbose)(?![a-z])"
+    r"|(?<![a-z])as\s+(?:a\s+)?(?:list|table|json|csv|bullets?)(?![a-z])",
+    re.IGNORECASE,
+)
+
+
+def subject_of(question: str) -> str:
+    """The question with its formatting instructions removed."""
+    stripped = _FORMAT_INSTRUCTION.sub(" ", question or "")
+    stripped = re.sub(r"\s{2,}", " ", stripped).strip(" ,.;:")
+    # Never rank on nothing: a question that is only an instruction keeps its
+    # original text rather than becoming an empty vector.
+    return stripped if len(stripped.split()) >= 2 else (question or "")
 
 
 def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:

@@ -38,6 +38,7 @@ from cobol_rag.final_scripts_answers import (
     answer_copybook_role,
     answer_corpus_references,
     answer_unused_code,
+    answer_literal_projection,
     analyzed_programs,
     corpus_references,
     corpus_entity_names,
@@ -2211,15 +2212,17 @@ def _execute_typed_query(plan: Any, compiled: Any) -> str | None:
     if compiled.kind == "field_projection":
         targets = [prog for prog in (compiled.programs or ()) if prog]
         if len(targets) > 1:
-            rendered = [
-                one for one in (
-                    answer_field_projection(target, compiled.entity, compiled.field)
-                    for target in targets
-                ) if one
-            ]
+            project = (
+                answer_literal_projection
+                if compiled.field == "literals"
+                else lambda prog, ent: answer_field_projection(prog, ent, compiled.field)
+            )
+            rendered = [one for one in (project(t, compiled.entity) for t in targets) if one]
             if rendered:
                 return "\n\n".join(rendered)
             return None
+        if compiled.field == "literals":
+            return answer_literal_projection(compiled.program, compiled.entity)
         return answer_field_projection(
             compiled.program, compiled.entity, compiled.field
         )

@@ -363,7 +363,11 @@ def _names_the_actor(question: str, entity: str) -> bool:
     if re.search(rf"(?<![A-Z0-9-]){name}(?![A-Z0-9-])\s+(?:CALLS?|USES?|INCLUDES?)\b", upper):
         return True
     # Passive with an agent: "called by X", "used by X".
-    if re.search(rf"\b(?:CALLED|USED|INCLUDED|REFERENCED)\s+BY\s+{name}\b", upper):
+    # "called by both A and B" puts a quantifier between the preposition and
+    # the name, and the name is still the actor.
+    if re.search(
+        rf"\b(?:CALLED|USED|INCLUDED|REFERENCED)\s+BY\s+(?:\w+\s+){{0,2}}{name}\b", upper
+    ):
         return True
     return False
 
@@ -395,8 +399,11 @@ def compile_query(
     # the copybook being in several programs is the answer, not an ambiguity --
     # and what made "which program calls PDCBVC" answer with PDCBVC's own
     # outgoing calls, the only direction a program-scoped capability has.
+    # Naming two analyzed programs makes the question a comparison between
+    # them, not a lookup of what refers to one of them.
     if (
         corpus_entity
+        and len(named_programs) < 2
         and _CORPUS_SUBJECT.search(question)
         and not _names_the_actor(question, corpus_entity)
     ):

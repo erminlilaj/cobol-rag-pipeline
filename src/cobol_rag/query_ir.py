@@ -116,6 +116,7 @@ class Inventory:
     program: str
     entity_type: str
     property_filter: str | None = None
+    in_paragraph: str | None = None
 
     @property
     def kind(self) -> str:
@@ -219,13 +220,48 @@ _PROPERTY_FILTERS: tuple[tuple[str, str], ...] = (
     (r"(?<![a-z])controls?\s+(?:the\s+)?flow(?![a-z])", "controls_flow"),
     (r"(?<![a-z])control\s+flow(?![a-z])", "controls_flow"),
     (r"(?<![a-z])flow[- ]controlling(?![a-z])", "controls_flow"),
+    (r"(?<![a-z])literal\s+length(?![a-z])", "literal_length"),
+    (r"(?<![a-z])length\s+literal(?![a-z])", "literal_length"),
+    (r"(?<![a-z])(?:temporary[- ]storage|ts\s+queue|tsq)(?![a-z])", "ts_queue"),
 )
+
+# Entity types a question can name that are not registry entities. CICS
+# operations are recorded per program rather than as named things, so they need
+# their own word.
+_OPERATION_WORD = re.compile(
+    r"(?<![a-z])(?:cics\s+)?(?:command|operation|statement)s?(?![a-z])", re.I
+)
+_CALL_WORD = re.compile(r"(?<![a-z])(?:call|link|xctl)s?(?![a-z])", re.I)
 
 
 def property_filter_named(question: str) -> str | None:
     for pattern, field in _PROPERTY_FILTERS:
         if re.search(pattern, question, re.I):
             return field
+    return None
+
+
+
+def paragraph_scope(
+    question: str, graph_nodes: Sequence[str], program: str | None = None
+) -> str | None:
+    """A paragraph the question restricts the answer to, rather than asks about.
+
+    "Which variables does LINK-PD0UTI01 modify" names a paragraph as a scope,
+    not as the subject. Without reading it, the question was answered with
+    every variable in the program.
+
+    The program's own name is excluded. Statements before the first paragraph
+    label belong to an implicit paragraph named after the program, so the
+    program is a node in its own graph -- and "in PDCBVC" then reads as a
+    restriction to that one paragraph rather than as naming the program.
+    """
+    excluded = {str(program).upper()} if program else set()
+    nodes = {str(n).upper() for n in graph_nodes} - excluded
+    upper = question.upper()
+    for name in sorted(nodes, key=len, reverse=True):
+        if re.search(rf"(?<![A-Z0-9-]){re.escape(name)}(?![A-Z0-9-])", upper):
+            return name
     return None
 
 
@@ -324,14 +360,33 @@ def compile_query(
     # An inventory of a kind of thing, narrowed by a property if one is named.
     # Offered only where the planner produced no route of its own, so this
     # fills a gap rather than overriding something that already works.
-    if allow_inventory:
-        wanted = entity_type_named(question) or inherited_entity_type
-        if wanted:
+    predicate = property_filter_named(question)
+    scope_paragraph = paragraph_scope(question, graph_nodes, program)
+    wanted = entity_type_named(question) or inherited_entity_type
+    if wanted is None and _OPERATION_WORD.search(question):
+        wanted = "cics_operation"
+    elif wanted is None and _CALL_WORD.search(question):
+        wanted = "call"
+
+    # A narrowed set is answered whenever the narrowing is readable, even where
+    # the planner had a route: returning the unnarrowed set is the failure this
+    # exists to prevent, and it looks like a successful answer.
+    if wanted and (predicate or scope_paragraph):
+        # A paragraph that is the subject of a flow question is not a scope.
+        if not (scope_paragraph and wanted == "paragraph"):
             return Inventory(
                 program=program,
                 entity_type=wanted,
-                property_filter=property_filter_named(question),
+                property_filter=predicate,
+                in_paragraph=scope_paragraph,
             )
+
+    if allow_inventory and wanted:
+        return Inventory(
+            program=program,
+            entity_type=wanted,
+            property_filter=predicate,
+        )
 
     # Which copybook declares a named variable: a field of that variable, not
     # the program's copybook inventory. Answering it from the inventory was a

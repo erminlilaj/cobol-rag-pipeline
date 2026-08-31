@@ -4021,3 +4021,168 @@ _CICS_MAP_NAME_ONLY = re.compile(
 _MAPSET_NAME = re.compile(
     r"\bMAPSET\s*\(\s*['\"]?([A-Z0-9$#@-]{1,8})['\"]?\s*\)", re.IGNORECASE
 )
+
+
+# ---------------------------------------------------------------------------
+# Qualified inventories
+#
+# A question that narrows a set -- "calls with a literal LENGTH", "operations
+# on a temporary-storage queue", "variables modified by LINK-PD0UTI01" -- was
+# answered with the unnarrowed set, which contains the answer and buries it.
+# Returning a superset is worse than returning nothing: it reads as an answer,
+# so nothing signals that the qualifier was dropped.
+# ---------------------------------------------------------------------------
+
+def _numeric(value: Any) -> bool:
+    return bool(value) and str(value).strip().isdigit()
+
+
+def _cics_operations(program_root: Path) -> list[dict[str, Any]]:
+    payload = _read_json(_artifact_path(program_root, "architecture.cics_operations.json"))
+    if not isinstance(payload, dict):
+        return []
+    content = payload.get("content")
+    if isinstance(content, dict) and isinstance(content.get("operations"), list):
+        return [item for item in content["operations"] if isinstance(item, dict)]
+    if isinstance(payload.get("operations"), list):
+        return [item for item in payload["operations"] if isinstance(item, dict)]
+    return []
+
+
+# Predicates a question can narrow a set by, and the kinds of thing each one
+# applies to. Naming the pairing here is what lets an unsupported combination
+# be refused rather than silently ignored.
+INVENTORY_PREDICATES: dict[str, set[str]] = {
+    "controls_flow": {"variable"},
+    "literal_length": {"call"},
+    "ts_queue": {"cics_operation"},
+}
+
+
+def answer_qualified_inventory(
+    program: str,
+    entity_type: str,
+    predicate: str | None = None,
+    in_paragraph: str | None = None,
+) -> str | None:
+    root = find_final_scripts_root()
+    if root is None:
+        return None
+    program_root = find_program_artifact_root(root, program)
+    if program_root is None:
+        return None
+
+    if predicate and entity_type not in INVENTORY_PREDICATES.get(predicate, set()):
+        supported = ", ".join(sorted(INVENTORY_PREDICATES.get(predicate, set()))) or "nothing recorded"
+        return (
+            f"The analysis does not record `{predicate}` for {entity_type}s, so that "
+            f"restriction cannot be applied in {program}. It is recorded for: {supported}. "
+            f"Answering without the restriction would return every {entity_type} in the "
+            f"program, which is not what was asked."
+        )
+
+    if entity_type == "call":
+        payload = _read_json(_artifact_path(program_root, "architecture.call_parameters.json"))
+        calls = (payload or {}).get("calls") or []
+        selected = [
+            call
+            for call in calls
+            if isinstance(call, dict)
+            and (not in_paragraph or str(call.get("paragraph", "")).upper() == in_paragraph)
+            and (predicate != "literal_length" or _numeric(call.get("length")))
+        ]
+        if not selected:
+            detail = " with a literal LENGTH" if predicate == "literal_length" else ""
+            where = f" in {in_paragraph}" if in_paragraph else ""
+            others = [
+                f"{c.get('target')} (LENGTH {c.get('length') or 'not specified'})"
+                for c in calls
+                if isinstance(c, dict)
+            ]
+            listed = ("\nRecorded calls and their LENGTH operands: " + "; ".join(others)) if others else ""
+            return (
+                f"No call{detail} is recorded in {program}{where}.{listed}\n"
+                f"Source: `architecture.call_parameters.json`."
+            )
+        lines = [f"{len(selected)} call(s) in {program} match:"]
+        for call in selected:
+            lines.append(
+                f"- {call.get('target')}: {call.get('call_type')} in {call.get('paragraph')} "
+                f"line {call.get('line_start')}; LENGTH={call.get('length')}"
+            )
+        lines.append("Source: `architecture.call_parameters.json`.")
+        return "\n".join(lines)
+
+    if entity_type == "cics_operation":
+        operations = _cics_operations(program_root)
+        selected = []
+        for operation in operations:
+            statement = str(operation.get("statement") or "").upper()
+            command = str(operation.get("command") or "").upper()
+            if in_paragraph and str(operation.get("paragraph", "")).upper() != in_paragraph:
+                continue
+            if predicate == "ts_queue" and not (
+                command in {"WRITEQ", "READQ", "DELETEQ"} and " TS" in statement
+            ):
+                continue
+            selected.append(operation)
+        if not selected:
+            detail = " on a temporary-storage queue" if predicate == "ts_queue" else ""
+            where = f" in {in_paragraph}" if in_paragraph else ""
+            return (
+                f"No CICS operation{detail} is recorded in {program}{where}.\n"
+                f"Source: `architecture.cics_operations.json`."
+            )
+        lines = [f"{len(selected)} CICS operation(s) in {program} match:"]
+        for operation in selected:
+            lines.append(
+                f"- {operation.get('command')} in {operation.get('paragraph')} "
+                f"line {operation.get('line_start')}: `{operation.get('statement')}`"
+            )
+        lines.append("Source: `architecture.cics_operations.json`.")
+        return "\n".join(lines)
+
+    if entity_type == "variable" and in_paragraph:
+        # The reverse join. Evidence is recorded per variable, so a question
+        # about one paragraph had to be answered by scanning every variable --
+        # which the renderer did by listing all of them.
+        payload = _read_json(_artifact_path(program_root, "dataflow.used_variables.json"))
+        variables = (
+            payload.get("variables") if isinstance(payload, dict) else payload
+        ) or []
+        written: dict[str, list[str]] = {}
+        read: dict[str, list[str]] = {}
+        for variable in variables:
+            if not isinstance(variable, dict):
+                continue
+            name = str(variable.get("variable") or "").upper()
+            evidence = variable.get("evidence") or {}
+            for kind, bucket in (
+                ("write_sites", written),
+                ("read_write_sites", written),
+                ("read_sites", read),
+            ):
+                for site in evidence.get(kind) or []:
+                    if str(site.get("paragraph", "")).upper() != in_paragraph:
+                        continue
+                    line = site.get("line_start") or site.get("line")
+                    statement = " ".join(str(site.get("statement") or "").split())
+                    bucket.setdefault(name, []).append(f"line {line}: `{statement}`")
+        if not written and not read:
+            return (
+                f"No variable access is recorded in {in_paragraph} in {program}.\n"
+                f"Source: `dataflow.used_variables.json`."
+            )
+        lines = [f"Variable access recorded in {in_paragraph} ({program}):"]
+        if written:
+            lines.append(f"Modified ({len(written)}):")
+            for name in sorted(written):
+                lines.append(f"- {name} — {'; '.join(written[name][:3])}")
+        if read:
+            lines.append(f"Read ({len(read)}):")
+            for name in sorted(read):
+                lines.append(f"- {name} — {'; '.join(read[name][:3])}")
+        lines.append("Source: `dataflow.used_variables.json`.")
+        return "\n".join(lines)
+
+    return None

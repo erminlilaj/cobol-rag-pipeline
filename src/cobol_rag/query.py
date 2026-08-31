@@ -33,6 +33,7 @@ from cobol_rag.final_scripts_answers import (
     answer_control_flow_edges,
     answer_screen_field,
     answer_inventory,
+    answer_qualified_inventory,
     screen_field_names,
     _graph_payload,
     answer_field_projection,
@@ -2008,6 +2009,15 @@ def _execute_typed_query(compiled: Any, plan: Any) -> str | None:
             compiled.program, compiled.source, compiled.target, compiled.projection
         )
     if compiled.kind == "inventory":
+        if compiled.property_filter or compiled.in_paragraph:
+            qualified = answer_qualified_inventory(
+                compiled.program,
+                compiled.entity_type,
+                compiled.property_filter,
+                compiled.in_paragraph,
+            )
+            if qualified:
+                return qualified
         return answer_inventory(
             compiled.program, compiled.entity_type, compiled.property_filter
         )

@@ -2114,7 +2114,11 @@ def _part_is_covered(part: str, answer: str) -> bool:
     distinctive = [w for w in words if w.lower() not in _GENERIC_PART_WORDS]
     if not distinctive:
         return True  # nothing of its own to look for; an elaboration
-    lowered = answer.lower()
+    # Compare against the findings, not the caveats. An artifact's scope note
+    # carries words like "control" and "evidence" that match almost any part
+    # and made an unanswered question look covered.
+    findings = _re.split(r"\n\s*(?:Scope|Note|Limitations?):", answer)[0]
+    lowered = findings.lower()
     present = sum(1 for word in distinctive if word.lower() in lowered)
     # Most of what the part names, not merely one word of it. A part sharing a
     # single name with the answer is not thereby answered: "does PDCBVC pass a

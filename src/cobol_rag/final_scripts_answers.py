@@ -3918,8 +3918,10 @@ def answer_screen_field(program: str, field: str) -> str | None:
         values = record.get(key) or []
         if values:
             lines.append(f"- {label}: {', '.join(str(v) for v in values)}")
-    if record.get("controls_flow"):
-        lines.append("- Controls flow: yes")
+    # Stated either way. Omitting the line when false answers "does this field
+    # control flow?" with silence, which reads as the question being ignored
+    # rather than as the answer being no.
+    lines.append(f"- Controls flow: {'yes' if record.get('controls_flow') else 'no'}")
     for site in (record.get("write_sites") or [])[:4]:
         if isinstance(site, dict) and site.get("statement"):
             where = site.get("line_start") or site.get("line")
@@ -4107,10 +4109,16 @@ def answer_qualified_inventory(
             )
         lines = [f"{len(selected)} call(s) in {program} match:"]
         for call in selected:
-            lines.append(
-                f"- {call.get('target')}: {call.get('call_type')} in {call.get('paragraph')} "
-                f"line {call.get('line_start')}; LENGTH={call.get('length')}"
-            )
+            passed = ", ".join(str(value) for value in (call.get("parameters") or []))
+            detail = f"- {call.get('target')}: {call.get('call_type')} in {call.get('paragraph')} line {call.get('line_start')}"
+            # What is passed is the usual point of the question; reporting the
+            # target and the length without it answered a narrower question.
+            if passed:
+                detail += f"; parameters: {passed}"
+            if call.get("commarea"):
+                detail += f"; COMMAREA={call['commarea']}"
+            detail += f"; LENGTH={call.get('length') or 'not specified'}"
+            lines.append(detail)
         lines.append("Source: `architecture.call_parameters.json`.")
         return "\n".join(lines)
 

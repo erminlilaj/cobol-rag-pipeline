@@ -345,6 +345,29 @@ def paragraph_scope(
     return None
 
 
+
+def _names_the_actor(question: str, entity: str) -> bool:
+    """Whether the named program is doing the calling rather than being called.
+
+    "Which programs call PDCBVC" and "which programs does PDCBVC call" ask
+    opposite questions and differ only in where the name sits relative to the
+    verb. Reading the plural "programs" without reading that reversed the
+    second one: a request for a program's own outgoing calls came back as the
+    list of programs that call it, which is a different fact and was empty.
+    """
+    upper = question.upper()
+    name = re.escape(entity.upper())
+    # The name is the grammatical subject: "does X call", "X calls", "X uses".
+    if re.search(rf"\bDOES\s+{name}\b", upper):
+        return True
+    if re.search(rf"(?<![A-Z0-9-]){name}(?![A-Z0-9-])\s+(?:CALLS?|USES?|INCLUDES?)\b", upper):
+        return True
+    # Passive with an agent: "called by X", "used by X".
+    if re.search(rf"\b(?:CALLED|USED|INCLUDED|REFERENCED)\s+BY\s+{name}\b", upper):
+        return True
+    return False
+
+
 def compile_query(
     question: str,
     *,
@@ -372,7 +395,11 @@ def compile_query(
     # the copybook being in several programs is the answer, not an ambiguity --
     # and what made "which program calls PDCBVC" answer with PDCBVC's own
     # outgoing calls, the only direction a program-scoped capability has.
-    if corpus_entity and _CORPUS_SUBJECT.search(question):
+    if (
+        corpus_entity
+        and _CORPUS_SUBJECT.search(question)
+        and not _names_the_actor(question, corpus_entity)
+    ):
         return CorpusReferences(
             entity=corpus_entity.upper(),
             relation=corpus_relation_named(question),

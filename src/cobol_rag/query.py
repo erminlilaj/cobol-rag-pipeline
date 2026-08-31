@@ -24,7 +24,7 @@ from cobol_rag.evidence import (
     EvidenceState,
     disposition_for_results,
 )
-from cobol_rag.query_ir import compile_query
+from cobol_rag.query_ir import compile_queries
 from cobol_rag.final_scripts_answers import (
     absent_capability_answer,
     _COMPARISON_CAPABILITY_FOR_INTENT,
@@ -2019,52 +2019,139 @@ def _corpus_subject_entity(question: str, plan: Any) -> str | None:
 
 
 def _typed_query_answer(plan: Any, question: str) -> str | None:
-    """Compile the question to a typed query and execute it, or return None."""
+    """Compile every part of the question and answer each one.
+
+    A question with several parts is answered part by part. Anything that
+    compiled but produced nothing is named rather than omitted: a missing
+    section is indistinguishable from a question that was never asked, and
+    that is what made half-answers read as complete ones.
+    """
     if not question:
         return None
     try:
-        graph_nodes = _graph_node_names(plan.program) if plan.program else ()
-        compiled = compile_query(
-            question,
-            program=plan.program,
-            programs=plan.programs or ((plan.program,) if plan.program else ()),
-            paragraphs=plan.entity_values_for("paragraph"),
-            variables=plan.entity_values_for("variable"),
-            graph_nodes=graph_nodes,
-            screen_fields=screen_field_names(plan.program) if plan.program else (),
-            copybooks=program_copybooks(plan.program) if plan.program else (),
-            corpus_entity=_corpus_subject_entity(question, plan),
-            entity_type=_comparison_entity_type(plan),
-            inherited_entity_type=_inherited_entity_type(plan),
-            # Only where the planner produced no route of its own, so this
-            # fills a gap instead of overriding something that works.
-            # A gap to fill, not a route to override: offered when the planner
-            # produced nothing, and for a follow-up, which by definition names
-            # no subject of its own and so is narrowing the previous one.
-            allow_inventory=(
-                not plan.tasks
-                or plan.intent in {"general", None}
-                or bool(getattr(plan, "explicit_followup", False))
-            ),
-        )
+        context = _typed_query_context(plan, question)
+        compiled = compile_queries(question, **context)
     except Exception:
         return None
-    if compiled is None:
+    if not compiled:
         return None
 
-    try:
-        return _execute_typed_query(compiled, plan)
-    except Exception:
-        # A defect in a typed executor must degrade to the paths that existed
-        # before it, not fail the request.
+    answered: list[str] = []
+    unanswered: list[str] = []
+    for part, query in compiled:
+        rendered = None
+        if query is not None:
+            try:
+                rendered = _execute_typed_query(plan, query)
+            except Exception:
+                rendered = None
+        if rendered:
+            answered.append(rendered)
+        elif len(compiled) > 1:
+            unanswered.append(part.strip())
+
+    answered = _drop_contained(answered)
+    if not answered:
         return None
+    answer = "\n\n".join(answered)
 
-
-def _execute_typed_query(compiled: Any, plan: Any) -> str | None:
-    if compiled.kind == "graph_edges" and compiled.source and compiled.target:
-        return answer_edges_between(
-            compiled.program, compiled.source, compiled.target, compiled.projection
+    # Only report a part as unanswered when the answer does not already cover
+    # it. Claiming a part was missed while its answer sits above is as
+    # misleading as dropping it silently, and it was: "is it paragraphs or
+    # copybooks" was reported unanswered by a reply that listed both.
+    genuinely_missing = [
+        part for part in dict.fromkeys(unanswered) if not _part_is_covered(part, answer)
+    ]
+    if genuinely_missing:
+        answer += "\n\nNot answered from the artifacts:\n" + "\n".join(
+            f"- {part}" for part in genuinely_missing
         )
+    return answer
+
+
+def _drop_contained(blocks: list[str]) -> list[str]:
+    """Remove a block whose findings another block already states.
+
+    Two parts of one question often compile to overlapping queries -- a shared
+    set and a full comparison -- and rendering both repeats the same list under
+    two headings.
+    """
+    kept: list[str] = []
+    for block in blocks:
+        body = {line.strip() for line in block.splitlines() if line.strip().startswith("-")}
+        superseded = False
+        for other in blocks:
+            if other is block or len(other) <= len(block):
+                continue
+            other_body = {
+                line.strip() for line in other.splitlines() if line.strip().startswith("-")
+            }
+            if body and body <= other_body:
+                superseded = True
+                break
+        if not superseded and block not in kept:
+            kept.append(block)
+    return kept
+
+
+# Words that carry no subject of their own. A part built only from these is an
+# elaboration of the part before it ("and how many in total"), not a separate
+# request, so its absence is not something to report.
+_GENERIC_PART_WORDS = frozenset({
+    "a", "all", "an", "and", "any", "are", "be", "by", "can", "did", "do", "does",
+    "each", "for", "from", "how", "if", "in", "is", "it", "its", "many", "much",
+    "of", "on", "one", "or", "so", "that", "the", "their", "them", "there",
+    "these", "they", "this", "those", "to", "total", "was", "were", "what",
+    "when", "where", "which", "who", "why", "with",
+})
+
+
+def _part_is_covered(part: str, answer: str) -> bool:
+    """Whether an answer already addresses a part of the question."""
+    import re as _re
+
+    words = [word for word in _re.findall(r"[A-Za-z0-9-]{3,}", part)]
+    distinctive = [w for w in words if w.lower() not in _GENERIC_PART_WORDS]
+    if not distinctive:
+        return True  # nothing of its own to look for; an elaboration
+    lowered = answer.lower()
+    present = sum(1 for word in distinctive if word.lower() in lowered)
+    # Most of what the part names, not merely one word of it. A part sharing a
+    # single name with the answer is not thereby answered: "does PDCBVC pass a
+    # literal LENGTH" mentions PDCBVC, and so does an answer about who calls a
+    # program, while saying nothing about LENGTH.
+    return present * 2 >= len(distinctive)
+
+
+def _typed_query_context(plan: Any, question: str) -> dict[str, Any]:
+    graph_nodes = _graph_node_names(plan.program) if plan.program else ()
+    return {
+        "program": plan.program,
+        "programs": plan.programs or ((plan.program,) if plan.program else ()),
+        "paragraphs": plan.entity_values_for("paragraph"),
+        "variables": plan.entity_values_for("variable"),
+        "graph_nodes": graph_nodes,
+        "screen_fields": screen_field_names(plan.program) if plan.program else (),
+        "copybooks": program_copybooks(plan.program) if plan.program else (),
+        "corpus_entity": _corpus_subject_entity(question, plan),
+        "entity_type": _comparison_entity_type(plan),
+        "inherited_entity_type": _inherited_entity_type(plan),
+        "allow_inventory": (
+            not plan.tasks
+            or plan.intent in {"general", None}
+            or bool(getattr(plan, "explicit_followup", False))
+        ),
+    }
+
+
+def _execute_typed_query(plan: Any, compiled: Any) -> str | None:
+    """Run one typed query against the artifacts."""
+    if compiled.kind == "unused_code":
+        return answer_unused_code(compiled.program)
+    if compiled.kind == "corpus_references":
+        return answer_corpus_references(compiled.entity, compiled.relation)
+    if compiled.kind == "copybook_role":
+        return answer_copybook_role(compiled.program, compiled.copybook)
     if compiled.kind == "inventory":
         if compiled.property_filter or compiled.in_paragraph:
             qualified = answer_qualified_inventory(
@@ -2078,12 +2165,6 @@ def _execute_typed_query(compiled: Any, plan: Any) -> str | None:
         return answer_inventory(
             compiled.program, compiled.entity_type, compiled.property_filter
         )
-    if compiled.kind == "unused_code":
-        return answer_unused_code(compiled.program)
-    if compiled.kind == "corpus_references":
-        return answer_corpus_references(compiled.entity, compiled.relation)
-    if compiled.kind == "copybook_role":
-        return answer_copybook_role(compiled.program, compiled.copybook)
     if compiled.kind == "screen_field":
         return answer_screen_field(compiled.program, compiled.field)
     if compiled.kind == "graph_predicate":
@@ -2091,20 +2172,21 @@ def _execute_typed_query(compiled: Any, plan: Any) -> str | None:
     if compiled.kind == "field_projection":
         targets = [prog for prog in (compiled.programs or ()) if prog]
         if len(targets) > 1:
-            # The same projection in each program, reported side by side. The
-            # answer to whether they agree is then visible rather than asserted.
-            rendered = []
-            for target in targets:
-                one = answer_field_projection(target, compiled.entity, compiled.field)
-                if one:
-                    rendered.append(one)
-            if len(rendered) > 1:
-                return "\n\n".join(rendered)
+            rendered = [
+                one for one in (
+                    answer_field_projection(target, compiled.entity, compiled.field)
+                    for target in targets
+                ) if one
+            ]
             if rendered:
-                return rendered[0]
+                return "\n\n".join(rendered)
             return None
         return answer_field_projection(
             compiled.program, compiled.entity, compiled.field
+        )
+    if compiled.kind == "graph_edges" and compiled.source and compiled.target:
+        return answer_edges_between(
+            compiled.program, compiled.source, compiled.target, compiled.projection
         )
     if compiled.kind == "set_relation" and len(compiled.programs) > 1:
         capability = _capability_for_entity_type(

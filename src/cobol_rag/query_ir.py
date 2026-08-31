@@ -205,7 +205,9 @@ _SCREEN_WORD = re.compile(r"(?<![a-z])(?:screen|map|bms|display|field)s?(?![a-z]
 # or who does something to a named thing. The plural "programs" and the passive
 # or interrogative subject are what mark it, not any particular verb.
 _CORPUS_SUBJECT = re.compile(
-    r"(?<![a-z])(?:which|what|any|all|how\s+many)\s+(?:other\s+)?programs?(?![a-z])"
+    # Adjectives may sit between the determiner and "programs" -- "which other
+    # analyzed programs" -- so allow a few words rather than one fixed one.
+    r"(?<![a-z])(?:which|what|any|all|how\s+many)\s+(?:\w+\s+){0,3}programs?(?![a-z])"
     r"|(?<![a-z])who\s+(?:calls|uses|includes|references)(?![a-z])"
     r"|(?<![a-z])(?:called|used|included|referenced)\s+by\s+(?:which|what)(?![a-z])",
     re.I,
@@ -390,7 +392,13 @@ def compile_query(
     # Two programs and one entity type is a set question whatever words joined
     # them. Refusing the ones whose phrasing was unrecognised was the single
     # largest source of unanswered comparison questions.
-    if len(named_programs) > 1:
+    # A set question needs the programs to be what the question is about. A
+    # question that names a second program only in passing -- "what is this
+    # copybook for, and which other programs use it" -- is not a comparison,
+    # and treating it as one took every part of every multi-program question.
+    if len(named_programs) > 1 and not _PURPOSE_QUESTION.search(question) and not (
+        corpus_entity and _CORPUS_SUBJECT.search(question)
+    ):
         where = _positions(question, named_programs)
         relation = None
         if len(where) > 1:
@@ -513,3 +521,60 @@ def _asks_for_condition(question: str) -> bool:
     return bool(
         re.search(r"(?<![a-z])(?:condition|when|guard\w*|under\s+what|why)(?![a-z])", question, re.I)
     )
+
+
+# ---------------------------------------------------------------------------
+# Compound questions
+#
+# A question can ask several things at once, and the parts often need different
+# capabilities: "what is this copybook for, and which other programs use it" is
+# a role question and a corpus question. Compiling to one query answered the
+# first part and dropped the second without saying so, which reads as a
+# complete answer to a question that was only half read.
+# ---------------------------------------------------------------------------
+
+# Clause boundaries strong enough to separate questions. Plain "and" is not one
+# of them: it joins operands far more often than clauses ("PDCBVC and PDB305"),
+# so it splits only before a word that starts a new question.
+_PART_BOUNDARY = re.compile(
+    r",\s*and\s+|;\s*|\?\s+|"
+    r"\s+and\s+(?=(?:which|what|who|where|when|how|does|do|did|is|are|was|were|"
+    r"can|could|should|if|whether)\b)",
+    re.IGNORECASE,
+)
+
+
+def split_question(question: str) -> list[str]:
+    """The separate things a question asks, in the order asked."""
+    parts = [part.strip(" ,;?") for part in _PART_BOUNDARY.split(question or "")]
+    return [part for part in parts if len(part.split()) >= 2]
+
+
+def compile_queries(question: str, **context: Any) -> list[tuple[str, Query | None]]:
+    """Every part of a question with the query it compiles to, in order.
+
+    A part that compiles to nothing is kept with a None rather than dropped.
+    Dropping it is what made a half-read question look fully answered: the
+    missing part left no trace, so the reply was indistinguishable from one
+    that had answered everything asked.
+    """
+    whole = compile_query(question, **context)
+    parts = split_question(question)
+    if len(parts) < 2:
+        return [(question, whole)] if whole else []
+
+    compiled: list[tuple[str, Query | None]] = []
+    seen: list[Query] = []
+    for part in parts:
+        # Each part is compiled against the same resolved context, so a part
+        # that names nothing of its own ("and which programs use it") still
+        # sees the entities the question as a whole resolved.
+        query = compile_query(part, **context)
+        if query is not None and query in seen:
+            continue
+        if query is not None:
+            seen.append(query)
+        compiled.append((part, query))
+    if whole is not None and whole not in seen:
+        compiled.insert(0, (question, whole))
+    return compiled

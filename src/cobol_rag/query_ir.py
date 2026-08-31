@@ -136,6 +136,17 @@ class CopybookRole:
 
 
 @dataclass(frozen=True)
+class UnusedCode:
+    """Everything unused in one program: paragraphs, copybooks, commented code."""
+
+    program: str
+
+    @property
+    def kind(self) -> str:
+        return "unused_code"
+
+
+@dataclass(frozen=True)
 class CorpusReferences:
     """Which analyzed programs reference a name, and in what role.
 
@@ -153,7 +164,7 @@ class CorpusReferences:
 
 Query = (
     GraphEdges | GraphPredicate | SetRelation | FieldProjection | ScreenField
-    | Inventory | CopybookRole | CorpusReferences
+    | Inventory | CopybookRole | CorpusReferences | UnusedCode
 )
 
 
@@ -183,6 +194,11 @@ _ORIGIN_FIELD = re.compile(
 )
 
 _COPYBOOK_WORD = re.compile(r"(?<![a-z])cop\w*(?![a-z])", re.I)
+_UNUSED_QUESTION = re.compile(
+    r"(?<![a-z])(?:unused|unreferenced|dead|unreachable|never\s+(?:used|reached|called)|"
+    r"left\s+over|leftover|obsolete)(?![a-z])",
+    re.I,
+)
 _SCREEN_WORD = re.compile(r"(?<![a-z])(?:screen|map|bms|display|field)s?(?![a-z])", re.I)
 # Asking what something is for, rather than for a list of them.
 # A question whose subject is the corpus: it asks which programs do something,
@@ -443,6 +459,12 @@ def compile_query(
         for name in sorted({str(c).upper() for c in copybooks}, key=len, reverse=True):
             if re.search(rf"(?<![A-Z0-9-]){re.escape(name)}(?![A-Z0-9-])", upper):
                 return CopybookRole(program=program, copybook=name)
+
+    # "Unused code or copy" is one question spanning three artifacts. Answered
+    # from whichever the planner picked, it reported no unused copybooks while
+    # proven-unreachable paragraphs sat unmentioned in the graph.
+    if _UNUSED_QUESTION.search(question):
+        return UnusedCode(program=program)
 
     predicate = property_filter_named(question)
     scope_paragraph = paragraph_scope(question, graph_nodes, program)

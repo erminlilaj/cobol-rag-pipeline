@@ -36,6 +36,7 @@ from cobol_rag.final_scripts_answers import (
     answer_qualified_inventory,
     answer_copybook_role,
     answer_corpus_references,
+    answer_unused_code,
     analyzed_programs,
     corpus_references,
     corpus_entity_names,
@@ -2077,6 +2078,8 @@ def _execute_typed_query(compiled: Any, plan: Any) -> str | None:
         return answer_inventory(
             compiled.program, compiled.entity_type, compiled.property_filter
         )
+    if compiled.kind == "unused_code":
+        return answer_unused_code(compiled.program)
     if compiled.kind == "corpus_references":
         return answer_corpus_references(compiled.entity, compiled.relation)
     if compiled.kind == "copybook_role":

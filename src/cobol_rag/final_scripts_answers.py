@@ -4436,3 +4436,79 @@ def corpus_entity_names() -> tuple[str, ...]:
             if isinstance(record, dict) and record.get("value"):
                 names.add(str(record["value"]).upper())
     return tuple(sorted(name for name in names if name))
+
+
+def answer_unused_code(program: str) -> str | None:
+    """Everything the analysis can show as unused, in one answer.
+
+    "Is there unused code or copy" is one question about three artifacts:
+    unreferenced copybooks, paragraphs no edge reaches, and code left behind as
+    comments. Answering from whichever one the planner picked reported no
+    unused copybooks while five proven-unreachable paragraphs sat in the graph.
+    """
+    root = find_final_scripts_root()
+    if root is None:
+        return None
+    program_root = find_program_artifact_root(root, program)
+    if program_root is None:
+        return None
+
+    sections: list[str] = []
+    caveats: list[str] = []
+
+    dead = (
+        _read_json(_artifact_path(program_root, "quality.dead_code.json")) or {}
+    ).get("content") or {}
+    reachability = dead.get("cfg_reachability") or {}
+    unreachable = reachability.get("unreachable_nodes") or []
+    if unreachable:
+        sections.append(
+            f"Paragraphs no recorded edge reaches ({len(unreachable)} of "
+            f"{reachability.get('nodes_count')}):\n"
+            + "\n".join(f"- {name}" for name in sorted(unreachable))
+        )
+    elif reachability.get("status") == "computed_from_controlflow_cfg":
+        sections.append("Every paragraph is reached by at least one recorded edge.")
+
+    commented = dead.get("commented_out_code") or []
+    if commented:
+        shown = commented[:8]
+        body = "\n".join(
+            f"- line {item.get('line')}: `{str(item.get('text') or item.get('statement') or '').strip()[:70]}`"
+            if isinstance(item, dict) else f"- {item}"
+            for item in shown
+        )
+        more = f"\n- ... and {len(commented) - len(shown)} more" if len(commented) > len(shown) else ""
+        sections.append(f"Code left behind as comments ({len(commented)}):\n{body}{more}")
+
+    unused = (
+        _read_json(_artifact_path(program_root, "architecture.unused_copybooks.json")) or {}
+    ).get("content") or {}
+    proven = unused.get("unused_copybooks_proven") or []
+    review = unused.get("needs_review_copybooks") or []
+    if proven:
+        sections.append(
+            f"Copybooks proven unused ({len(proven)}):\n"
+            + "\n".join(f"- {name}" for name in proven)
+        )
+    else:
+        sections.append("No copybook is proven unused by the available artifacts.")
+    if review:
+        sections.append(
+            f"Copybooks needing review ({len(review)}):\n"
+            + "\n".join(f"- {name}" for name in review)
+        )
+    if unused.get("proof_level"):
+        caveats.append(str(unused["proof_level"]))
+    for note in (dead.get("limitations") or [])[:2]:
+        caveats.append(str(note))
+
+    if not sections:
+        return None
+    answer = f"Unused code and copybooks in {program}:\n\n" + "\n\n".join(sections)
+    if caveats:
+        answer += "\n\nScope: " + " ".join(dict.fromkeys(caveats))
+    answer += (
+        "\nSource: `quality.dead_code.json`, `architecture.unused_copybooks.json`."
+    )
+    return answer

@@ -20,6 +20,48 @@ from typing import Any, Callable, Iterable, Sequence
 
 # What each capability answers, written as meaning rather than as keywords.
 CAPABILITY_DESCRIPTORS: dict[str, str] = {
+    # The typed capabilities. Described by meaning like every other one, so the
+    # router selects them from what a question means rather than from the words
+    # it happens to use. They were previously reached through hand-written
+    # patterns, which is the failure this module exists to avoid: one pattern
+    # was a single grammatical distinction short and silently answered "which
+    # programs does this one call" with the programs that call it.
+    "corpus_references": (
+        "Which programs across the whole analyzed set refer to a given name: which "
+        "programs call a particular program, which programs include a particular "
+        "copybook, where a name is used anywhere in the corpus rather than inside "
+        "one program. The subject is the set of programs, not a single program's "
+        "own contents, and the name asked about is the thing being referred to "
+        "rather than the one doing the referring."
+    ),
+    "copybook_role": (
+        "What one named copybook is for in a program and why it is included: "
+        "whether it is a data area the program declares, an area passed in from "
+        "whatever started the program, the interface used to talk to another "
+        "program, executable code copied into the procedure, or the screen map. "
+        "Answers the purpose or role of a copy member rather than listing members."
+    ),
+    "unused_code": (
+        "Whatever the analysis can show is not used: paragraphs no recorded edge "
+        "reaches, code left behind as comments, and copybooks that appear "
+        "unreferenced. Answers whether anything is dead, unreachable, obsolete or "
+        "left over."
+    ),
+    "screen_field": (
+        "One named field of the program's screen: which BMS field family it "
+        "belongs to, which copybook declares it, which paragraphs set or read it, "
+        "what values are moved into it, and whether it takes part in deciding "
+        "control flow."
+    ),
+    "graph_edges_between": (
+        "The recorded control-flow edges running from one named paragraph to "
+        "another named paragraph, and the condition guarding each: used when a "
+        "question names both ends of a transfer rather than one."
+    ),
+    "graph_predicate": (
+        "Paragraphs selected by a property of the control-flow graph rather than "
+        "by name, such as those nothing performs or jumps to."
+    ),
     "variable_inventory": (
         "The catalogue of the variables, fields and data items a program declares. "
         "Answers which variables or fields exist, how many of them there are, naming "

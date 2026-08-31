@@ -383,6 +383,7 @@ def compile_query(
     screen_fields: Sequence[str] = (),
     copybooks: Sequence[str] = (),
     corpus_entity: str | None = None,
+    capability: str | None = None,
     entity_type: str | None = None,
     inherited_entity_type: str | None = None,
     allow_inventory: bool = False,
@@ -393,6 +394,32 @@ def compile_query(
     answers keeps its current path; this adds the shapes that had none.
     """
     named_programs = tuple(dict.fromkeys(p for p in programs if p))
+
+    # What the router judged the question to mean, decided by comparing it with
+    # each capability's description rather than with a list of phrasings. It
+    # leads; the patterns below only fill in a query's fields or stand in when
+    # the router had no confident view.
+    if capability == "unused_code" and program:
+        return UnusedCode(program=program)
+    if capability == "copybook_role" and program and copybooks:
+        upper = question.upper()
+        for name in sorted({str(c).upper() for c in copybooks}, key=len, reverse=True):
+            if re.search(rf"(?<![A-Z0-9-]){re.escape(name)}(?![A-Z0-9-])", upper):
+                return CopybookRole(program=program, copybook=name)
+    if capability == "screen_field" and program and screen_fields:
+        upper = question.upper()
+        for name in sorted({str(f).upper() for f in screen_fields}, key=len, reverse=True):
+            if re.search(rf"(?<![A-Z0-9-]){re.escape(name)}(?![A-Z0-9-])", upper):
+                return ScreenField(program=program, field=name)
+    if (
+        capability == "corpus_references"
+        and corpus_entity
+        and len(named_programs) < 2
+        and not _names_the_actor(question, corpus_entity)
+    ):
+        return CorpusReferences(
+            entity=corpus_entity.upper(), relation=corpus_relation_named(question)
+        )
 
     # A question about the corpus is answered from the corpus. Resolving it to
     # one program is what made "which programs use PDRUTI01" a clarification --

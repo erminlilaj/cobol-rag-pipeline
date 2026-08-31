@@ -16,6 +16,7 @@ from cobol_rag.capability_router import (
     confident_aspects,
     CapabilityMatch,
     eligible_capabilities,
+    MIN_CAPABILITY_SCORE,
     router_for,
 )
 from cobol_rag.config import AppConfig
@@ -559,7 +560,7 @@ def answer_query(
     # common variable names are in almost every program, so at any real corpus
     # size this branch would refuse most questions about them.
     if initial_scope.ambiguous:
-        corpus_answer = _typed_query_answer(initial_plan, question)
+        corpus_answer = _typed_query_answer(initial_plan, question, config)
         if corpus_answer:
             return finish(
                 corpus_answer, [], scope=initial_scope, plan=initial_plan,
@@ -2018,7 +2019,7 @@ def _corpus_subject_entity(question: str, plan: Any) -> str | None:
     return candidates[0] if candidates else None
 
 
-def _typed_query_answer(plan: Any, question: str) -> str | None:
+def _typed_query_answer(plan: Any, question: str, config: Any = None) -> str | None:
     """Compile every part of the question and answer each one.
 
     A question with several parts is answered part by part. Anything that
@@ -2030,6 +2031,7 @@ def _typed_query_answer(plan: Any, question: str) -> str | None:
         return None
     try:
         context = _typed_query_context(plan, question)
+        context["capability"] = _routed_capability(question, config, plan)
         compiled = compile_queries(question, **context)
     except Exception:
         return None
@@ -2125,6 +2127,39 @@ def _part_is_covered(part: str, answer: str) -> bool:
     # literal LENGTH" mentions PDCBVC, and so does an answer about who calls a
     # program, while saying nothing about LENGTH.
     return present * 2 >= len(distinctive)
+
+
+
+# The typed capabilities, and the query each one compiles to. Naming the pairing
+# here is what lets the router's semantic choice drive compilation instead of a
+# pattern deciding first and the router never being consulted.
+_TYPED_CAPABILITY_KINDS: dict[str, str] = {
+    "corpus_references": "corpus_references",
+    "copybook_role": "copybook_role",
+    "unused_code": "unused_code",
+    "screen_field": "screen_field",
+    "graph_edges_between": "graph_edges",
+    "graph_predicate": "graph_predicate",
+}
+
+
+def _routed_capability(question: str, config: Any, plan: Any) -> str | None:
+    """The capability the router judges this question to mean.
+
+    Meaning comes first and wording second. Compiling by pattern and never
+    asking the router is how a question landed on a capability that shares its
+    words rather than its sense.
+    """
+    if config is None:
+        return None
+    try:
+        matches = _rank_question_capabilities(question, config, getattr(plan, "scope", None))
+    except Exception:
+        return None
+    for match in matches or ():
+        if match.capability in _TYPED_CAPABILITY_KINDS and match.score >= MIN_CAPABILITY_SCORE:
+            return match.capability
+    return None
 
 
 def _typed_query_context(plan: Any, question: str) -> dict[str, Any]:

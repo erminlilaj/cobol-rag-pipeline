@@ -135,9 +135,25 @@ class CopybookRole:
         return "copybook_role"
 
 
+@dataclass(frozen=True)
+class CorpusReferences:
+    """Which analyzed programs reference a name, and in what role.
+
+    The subject is the corpus rather than one program, so this cannot be
+    answered from any single program's artifacts however complete they are.
+    """
+
+    entity: str
+    relation: str | None = None
+
+    @property
+    def kind(self) -> str:
+        return "corpus_references"
+
+
 Query = (
     GraphEdges | GraphPredicate | SetRelation | FieldProjection | ScreenField
-    | Inventory | CopybookRole
+    | Inventory | CopybookRole | CorpusReferences
 )
 
 
@@ -169,6 +185,33 @@ _ORIGIN_FIELD = re.compile(
 _COPYBOOK_WORD = re.compile(r"(?<![a-z])cop\w*(?![a-z])", re.I)
 _SCREEN_WORD = re.compile(r"(?<![a-z])(?:screen|map|bms|display|field)s?(?![a-z])", re.I)
 # Asking what something is for, rather than for a list of them.
+# A question whose subject is the corpus: it asks which programs do something,
+# or who does something to a named thing. The plural "programs" and the passive
+# or interrogative subject are what mark it, not any particular verb.
+_CORPUS_SUBJECT = re.compile(
+    r"(?<![a-z])(?:which|what|any|all|how\s+many)\s+(?:other\s+)?programs?(?![a-z])"
+    r"|(?<![a-z])who\s+(?:calls|uses|includes|references)(?![a-z])"
+    r"|(?<![a-z])(?:called|used|included|referenced)\s+by\s+(?:which|what)(?![a-z])",
+    re.I,
+)
+
+# The role a corpus question is asking about, named by its own verb.
+_CORPUS_RELATIONS: tuple[tuple[str, str], ...] = (
+    (r"(?<![a-z])call(?:s|ed|ing)?(?![a-z])", "calls"),
+    (r"(?<![a-z])includ(?:e|es|ed|ing)(?![a-z])", "includes"),
+    (r"(?<![a-z])us(?:e|es|ed|ing)(?![a-z])", "includes"),
+    (r"(?<![a-z])declar(?:e|es|ed|ing)(?![a-z])", "declares"),
+    (r"(?<![a-z])defin(?:e|es|ed|ing)(?![a-z])", "defines"),
+)
+
+
+def corpus_relation_named(question: str) -> str | None:
+    for pattern, relation in _CORPUS_RELATIONS:
+        if re.search(pattern, question, re.I):
+            return relation
+    return None
+
+
 _PURPOSE_QUESTION = re.compile(
     r"(?<![a-z])(?:what\s+is\s+\S+\s+(?:for|used\s+for)|purpose|role|why\s+is\s+\S+\s+"
     r"(?:cop\w+|includ\w+|used)|what\s+does\s+\S+\s+do|tell\s+me\s+about)(?![a-z])",
@@ -294,6 +337,7 @@ def compile_query(
     graph_nodes: Sequence[str] = (),
     screen_fields: Sequence[str] = (),
     copybooks: Sequence[str] = (),
+    corpus_entity: str | None = None,
     entity_type: str | None = None,
     inherited_entity_type: str | None = None,
     allow_inventory: bool = False,
@@ -304,6 +348,17 @@ def compile_query(
     answers keeps its current path; this adds the shapes that had none.
     """
     named_programs = tuple(dict.fromkeys(p for p in programs if p))
+
+    # A question about the corpus is answered from the corpus. Resolving it to
+    # one program is what made "which programs use PDRUTI01" a clarification --
+    # the copybook being in several programs is the answer, not an ambiguity --
+    # and what made "which program calls PDCBVC" answer with PDCBVC's own
+    # outgoing calls, the only direction a program-scoped capability has.
+    if corpus_entity and _CORPUS_SUBJECT.search(question):
+        return CorpusReferences(
+            entity=corpus_entity.upper(),
+            relation=corpus_relation_named(question),
+        )
 
     # Whether two programs agree about a field of one named entity is that
     # field, read in each. Routed before the set branch because the subject is

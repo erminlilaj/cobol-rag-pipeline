@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from functools import lru_cache
 from pathlib import Path
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -4303,3 +4304,135 @@ def program_copybooks(program: str | None) -> tuple[str, ...]:
         if item.get("copybook")
     }
     return tuple(sorted(names))
+
+
+# ---------------------------------------------------------------------------
+# The corpus as a subject
+#
+# Every capability above answers "what does this program contain". Some
+# questions are about the corpus instead -- who calls this program, which
+# programs include this copybook -- and those cannot be answered from one
+# program's artifacts no matter how complete they are. The registry already
+# records, per program, every entity it references; inverting that gives the
+# other direction for free, and a program added later joins the index by being
+# registered rather than by anything here changing.
+# ---------------------------------------------------------------------------
+
+# What a program is doing when the registry records an entity of each type.
+_REFERENCE_ROLE: dict[str, str] = {
+    "call": "calls",
+    "copybook": "includes",
+    "variable": "declares",
+    "paragraph": "defines",
+    "map": "uses map",
+    "mapset": "uses mapset",
+}
+
+
+def corpus_references(entity: str) -> dict[str, list[tuple[str, str]]]:
+    """Which programs reference a name, and as what.
+
+    Returns role -> [(program, entity_key)]. Driven entirely by the registry,
+    so it stays correct as programs are added: nothing here knows how many
+    there are or what they are called.
+    """
+    root = find_final_scripts_root()
+    if root is None:
+        return {}
+    registry = _read_json(root / "corpus.registry.json")
+    if not isinstance(registry, dict):
+        return {}
+    wanted = entity.strip().upper()
+    found: dict[str, list[tuple[str, str]]] = {}
+    for item in registry.get("programs") or []:
+        if not isinstance(item, dict):
+            continue
+        program = str(item.get("program") or "").upper()
+        for record in item.get("entities") or []:
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("value") or "").upper() != wanted:
+                continue
+            role = _REFERENCE_ROLE.get(str(record.get("type") or ""), "references")
+            found.setdefault(role, []).append((program, str(record.get("entity_key") or "")))
+    return found
+
+
+def answer_corpus_references(entity: str, relation: str | None = None) -> str | None:
+    """Which analyzed programs reference a name, and how.
+
+    The corpus size is always stated. An answer drawn from the programs that
+    happen to be analyzed is only as complete as that set, and at any corpus
+    size "nothing calls this" reads as a fact about the system unless the
+    boundary is given with it.
+    """
+    entity = entity.strip().upper()
+    programs = analyzed_programs()
+    if not programs:
+        return None
+    found = corpus_references(entity)
+
+    scope_note = (
+        f"{len(programs)} program(s) are analyzed ({', '.join(programs)}), so this "
+        f"covers only references inside that set."
+    )
+
+    if relation:
+        matches = sorted({program for program, _ in found.get(relation, [])})
+        if not matches:
+            # An absence across the corpus is a real finding, but only within
+            # the corpus, and saying so is the difference between a useful
+            # answer and a misleading one.
+            return (
+                f"No analyzed program {relation} `{entity}`.\n{scope_note}\n"
+                f"Source: `corpus.registry.json`."
+            )
+        one = len(matches) == 1
+        subject = "program" if one else "programs"
+        # The relation is stored in its third-person form because that is how a
+        # single program reads; a plural subject takes the bare verb.
+        verb = relation if one else relation.rstrip("s") if relation.endswith("s") else relation
+        lines = [f"{len(matches)} analyzed {subject} {verb} `{entity}`:"]
+        lines.extend(f"- {program}" for program in matches)
+        lines.append(scope_note)
+        lines.append("Source: `corpus.registry.json`.")
+        return "\n".join(lines)
+
+    if not found:
+        return (
+            f"`{entity}` is not recorded in any analyzed program.\n{scope_note}\n"
+            f"Source: `corpus.registry.json`."
+        )
+    lines = [f"`{entity}` across the analyzed corpus:"]
+    for role in sorted(found):
+        matches = sorted({program for program, _ in found[role]})
+        lines.append(f"- {role}: {', '.join(matches)}")
+    lines.append(scope_note)
+    lines.append("Source: `corpus.registry.json`.")
+    return "\n".join(lines)
+
+
+@lru_cache(maxsize=4)
+def corpus_entity_names() -> tuple[str, ...]:
+    """Every name the registry records, across all programs.
+
+    Read independently of scope resolution. A corpus question is often exactly
+    the one scope cannot resolve -- the name is in several programs -- so
+    depending on scope having succeeded would leave those questions unanswered
+    for the same reason they were unanswered before.
+    """
+    root = find_final_scripts_root()
+    if root is None:
+        return ()
+    registry = _read_json(root / "corpus.registry.json")
+    if not isinstance(registry, dict):
+        return ()
+    names: set[str] = set()
+    for item in registry.get("programs") or []:
+        if not isinstance(item, dict):
+            continue
+        names.add(str(item.get("program") or "").upper())
+        for record in item.get("entities") or []:
+            if isinstance(record, dict) and record.get("value"):
+                names.add(str(record["value"]).upper())
+    return tuple(sorted(name for name in names if name))

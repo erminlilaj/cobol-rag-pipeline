@@ -35,6 +35,10 @@ from cobol_rag.final_scripts_answers import (
     answer_inventory,
     answer_qualified_inventory,
     answer_copybook_role,
+    answer_corpus_references,
+    analyzed_programs,
+    corpus_references,
+    corpus_entity_names,
     program_copybooks,
     screen_field_names,
     _graph_payload,
@@ -545,6 +549,24 @@ def answer_query(
     ambiguity_is_about_something_named = bool(
         named_identifiers_in(question) or initial_scope.programs
     )
+    # A name being in several programs is only an ambiguity for a question
+    # about one program. When the question asks which programs do something, or
+    # who does something to a name, that same fact is the answer -- so the
+    # corpus query is tried before deciding the question cannot be resolved.
+    #
+    # This matters more as programs are added, not less: shared copybooks and
+    # common variable names are in almost every program, so at any real corpus
+    # size this branch would refuse most questions about them.
+    if initial_scope.ambiguous:
+        corpus_answer = _typed_query_answer(initial_plan, question)
+        if corpus_answer:
+            return finish(
+                corpus_answer, [], scope=initial_scope, plan=initial_plan,
+                execution_mode="typed_query",
+                debug={"status": "accepted", "validation": {
+                    "stage": "corpus_query", "passed": True, "reasons": []}},
+            )
+
     if initial_scope.ambiguous and (
         initial_plan.intent != "general" or ambiguity_is_about_something_named
     ):
@@ -1965,6 +1987,36 @@ def _deduplicate_retrieval_results(results: list[RetrievalResult]) -> list[Retri
 
 
 
+
+def _corpus_subject_entity(question: str, plan: Any) -> str | None:
+    """The name a corpus question is about.
+
+    Any name the registry records counts, including a program name: a program
+    is a callable target in another program's evidence as well as a subject of
+    its own, and only the second reading existed.
+    """
+    import re as _re
+
+    upper = question.upper()
+    candidates: list[str] = []
+    for entity in getattr(plan, "entities", ()) or ():
+        value = getattr(entity, "value", None)
+        if value:
+            candidates.append(str(value).upper())
+    # Read the name from the question against the registry rather than from the
+    # resolved scope. A corpus question is frequently the one scope could not
+    # resolve, because the name is in several programs, so relying on a
+    # resolved entity would leave exactly those questions unanswered.
+    for name in sorted(corpus_entity_names(), key=len, reverse=True):
+        if _re.search(rf"(?<![A-Z0-9-]){_re.escape(name)}(?![A-Z0-9-])", upper):
+            candidates.append(name)
+            break
+    for candidate in candidates:
+        if corpus_references(candidate):
+            return candidate
+    return candidates[0] if candidates else None
+
+
 def _typed_query_answer(plan: Any, question: str) -> str | None:
     """Compile the question to a typed query and execute it, or return None."""
     if not question:
@@ -1980,6 +2032,7 @@ def _typed_query_answer(plan: Any, question: str) -> str | None:
             graph_nodes=graph_nodes,
             screen_fields=screen_field_names(plan.program) if plan.program else (),
             copybooks=program_copybooks(plan.program) if plan.program else (),
+            corpus_entity=_corpus_subject_entity(question, plan),
             entity_type=_comparison_entity_type(plan),
             inherited_entity_type=_inherited_entity_type(plan),
             # Only where the planner produced no route of its own, so this
@@ -2024,6 +2077,8 @@ def _execute_typed_query(compiled: Any, plan: Any) -> str | None:
         return answer_inventory(
             compiled.program, compiled.entity_type, compiled.property_filter
         )
+    if compiled.kind == "corpus_references":
+        return answer_corpus_references(compiled.entity, compiled.relation)
     if compiled.kind == "copybook_role":
         return answer_copybook_role(compiled.program, compiled.copybook)
     if compiled.kind == "screen_field":

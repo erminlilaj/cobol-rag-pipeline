@@ -4186,3 +4186,120 @@ def answer_qualified_inventory(
         return "\n".join(lines)
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# What a copybook is for, derived from how the program uses it
+#
+# A COPY member's purpose is visible in where it is copied and what the program
+# does with the fields it declares. Read that way the answer is evidence rather
+# than a guess from the member's name, which is what a naming convention gives
+# and what a program that does not follow the convention silently breaks.
+# ---------------------------------------------------------------------------
+
+def _copybook_inclusions(program_root: Path) -> list[dict[str, Any]]:
+    payload = _read_json(_artifact_path(program_root, "architecture.copybooks.json"))
+    content = (payload or {}).get("content") or {}
+    return [item for item in (content.get("inclusions") or []) if isinstance(item, dict)]
+
+
+def answer_copybook_role(program: str, copybook: str) -> str | None:
+    """Why a copybook is included, and what the program does with it."""
+    root = find_final_scripts_root()
+    if root is None:
+        return None
+    program_root = find_program_artifact_root(root, program)
+    if program_root is None:
+        return None
+
+    copybook = copybook.upper()
+    inclusions = [
+        item
+        for item in _copybook_inclusions(program_root)
+        if str(item.get("copybook", "")).upper() == copybook
+    ]
+    if not inclusions:
+        return None
+
+    roles: list[str] = []
+    evidence: list[str] = []
+
+    for item in inclusions:
+        division = str(item.get("division") or "")
+        section = str(item.get("section") or "")
+        line = item.get("line")
+        evidence.append(
+            f"- copied at line {line} in {division}"
+            + (f" / {section}" if section and section != "UNKNOWN" else "")
+            + (f": `{item.get('statement')}`" if item.get("statement") else "")
+        )
+        if division.startswith("PROCEDURE"):
+            # A COPY among the statements brings in code, not a record layout.
+            roles.append("executable code included into the procedure")
+        elif "LINKAGE" in section:
+            roles.append("passed in by whatever started this program (LINKAGE)")
+        elif "WORKING-STORAGE" in section:
+            roles.append("a data area the program declares for itself")
+
+    # An area named on a call is an interface to that program, whatever it is
+    # called. This is read from the call, so it holds for any naming scheme.
+    calls = (
+        _read_json(_artifact_path(program_root, "architecture.call_parameters.json")) or {}
+    ).get("calls") or []
+    interfaces: list[str] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        operands = [str(call.get("commarea") or "")] + [
+            str(value) for value in (call.get("parameters") or [])
+        ]
+        for detail in call.get("parameter_details") or []:
+            if isinstance(detail, dict):
+                operands.append(str(detail.get("field_prefix") or ""))
+        if any(copybook in operand.upper() for operand in operands if operand):
+            interfaces.append(
+                f"- passed to {call.get('target')} as {call.get('call_type')} "
+                f"in {call.get('paragraph')} line {call.get('line_start')}"
+            )
+    if interfaces:
+        roles.append("the interface used to talk to another program")
+
+    # A copybook whose fields the program sends to or receives from a screen is
+    # a map, however it is named.
+    screen_origins = set()
+    lineage = _screen_lineage(program) or {}
+    for field in (lineage.get("content") or {}).get("fields") or []:
+        if isinstance(field, dict) and field.get("origin"):
+            screen_origins.add(str(field["origin"]).upper())
+    if f"COPY:{copybook}" in screen_origins:
+        roles.append("the screen map: it declares the fields sent to and read from the terminal")
+
+    lines = [f"{copybook} in {program}:"]
+    for role in dict.fromkeys(roles):
+        lines.append(f"- {role}")
+    lines.extend(evidence)
+    lines.extend(interfaces)
+    lines.append(
+        "Read from where the copybook is included and how the program uses its "
+        "fields, not from its name."
+    )
+    lines.append("Source: `architecture.copybooks.json`, `architecture.call_parameters.json`.")
+    return "\n".join(lines)
+
+
+def program_copybooks(program: str | None) -> tuple[str, ...]:
+    """Copybook names the program includes, for recognising one in a question."""
+    if not program:
+        return ()
+    root = find_final_scripts_root()
+    if root is None:
+        return ()
+    program_root = find_program_artifact_root(root, program)
+    if program_root is None:
+        return ()
+    names = {
+        str(item.get("copybook", "")).upper()
+        for item in _copybook_inclusions(program_root)
+        if item.get("copybook")
+    }
+    return tuple(sorted(names))

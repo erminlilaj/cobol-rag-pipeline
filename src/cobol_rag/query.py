@@ -34,6 +34,8 @@ from cobol_rag.final_scripts_answers import (
     answer_screen_field,
     answer_inventory,
     answer_qualified_inventory,
+    answer_copybook_role,
+    program_copybooks,
     screen_field_names,
     _graph_payload,
     answer_field_projection,
@@ -1977,6 +1979,7 @@ def _typed_query_answer(plan: Any, question: str) -> str | None:
             variables=plan.entity_values_for("variable"),
             graph_nodes=graph_nodes,
             screen_fields=screen_field_names(plan.program) if plan.program else (),
+            copybooks=program_copybooks(plan.program) if plan.program else (),
             entity_type=_comparison_entity_type(plan),
             inherited_entity_type=_inherited_entity_type(plan),
             # Only where the planner produced no route of its own, so this
@@ -2021,6 +2024,8 @@ def _execute_typed_query(compiled: Any, plan: Any) -> str | None:
         return answer_inventory(
             compiled.program, compiled.entity_type, compiled.property_filter
         )
+    if compiled.kind == "copybook_role":
+        return answer_copybook_role(compiled.program, compiled.copybook)
     if compiled.kind == "screen_field":
         return answer_screen_field(compiled.program, compiled.field)
     if compiled.kind == "graph_predicate":

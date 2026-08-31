@@ -123,8 +123,21 @@ class Inventory:
         return "inventory"
 
 
+@dataclass(frozen=True)
+class CopybookRole:
+    """Why a copybook is included, read from how the program uses it."""
+
+    program: str
+    copybook: str
+
+    @property
+    def kind(self) -> str:
+        return "copybook_role"
+
+
 Query = (
-    GraphEdges | GraphPredicate | SetRelation | FieldProjection | ScreenField | Inventory
+    GraphEdges | GraphPredicate | SetRelation | FieldProjection | ScreenField
+    | Inventory | CopybookRole
 )
 
 
@@ -155,6 +168,12 @@ _ORIGIN_FIELD = re.compile(
 
 _COPYBOOK_WORD = re.compile(r"(?<![a-z])cop\w*(?![a-z])", re.I)
 _SCREEN_WORD = re.compile(r"(?<![a-z])(?:screen|map|bms|display|field)s?(?![a-z])", re.I)
+# Asking what something is for, rather than for a list of them.
+_PURPOSE_QUESTION = re.compile(
+    r"(?<![a-z])(?:what\s+is\s+\S+\s+(?:for|used\s+for)|purpose|role|why\s+is\s+\S+\s+"
+    r"(?:cop\w+|includ\w+|used)|what\s+does\s+\S+\s+do|tell\s+me\s+about)(?![a-z])",
+    re.I,
+)
 
 
 ENTITY_TYPE_NAMES: tuple[str, ...] = (
@@ -274,6 +293,7 @@ def compile_query(
     variables: Sequence[str] = (),
     graph_nodes: Sequence[str] = (),
     screen_fields: Sequence[str] = (),
+    copybooks: Sequence[str] = (),
     entity_type: str | None = None,
     inherited_entity_type: str | None = None,
     allow_inventory: bool = False,
@@ -360,6 +380,15 @@ def compile_query(
     # An inventory of a kind of thing, narrowed by a property if one is named.
     # Offered only where the planner produced no route of its own, so this
     # fills a gap rather than overriding something that already works.
+    # A named copybook the question asks the purpose of. Checked before the
+    # inventory branch, which would otherwise answer "what is PDRTWA2 for" with
+    # the program's list of copybooks.
+    if copybooks and _PURPOSE_QUESTION.search(question):
+        upper = question.upper()
+        for name in sorted({str(c).upper() for c in copybooks}, key=len, reverse=True):
+            if re.search(rf"(?<![A-Z0-9-]){re.escape(name)}(?![A-Z0-9-])", upper):
+                return CopybookRole(program=program, copybook=name)
+
     predicate = property_filter_named(question)
     scope_paragraph = paragraph_scope(question, graph_nodes, program)
     wanted = entity_type_named(question) or inherited_entity_type

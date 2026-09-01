@@ -48,6 +48,37 @@ class ResponseContract:
 
 
 @dataclass(frozen=True)
+class QueryFilter:
+    """One typed evidence predicate selected by the semantic planner.
+
+    Values are still grounded later against the resolved program/entity
+    catalogue.  The model decides what the predicate means; artifact code only
+    executes it.
+    """
+
+    field: str
+    operator: str = "eq"
+    values: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class QuerySpecification:
+    """Canonical meaning of a technical question, independent of phrasing."""
+
+    operator: str
+    capability: str
+    entity_types: tuple[str, ...] = ()
+    entity_values: tuple[str, ...] = ()
+    fields: tuple[str, ...] = ()
+    relation: str | None = None
+    subject_program: str | None = None
+    direction: str | None = None
+    source_entity: str | None = None
+    target_entity: str | None = None
+    filters: tuple[QueryFilter, ...] = ()
+
+
+@dataclass(frozen=True)
 class QueryPlan:
     route: str = "technical"
     category: str = "single_source"
@@ -88,6 +119,7 @@ class QueryPlan:
     authority_confidence: float = 0.0
     planner_source: str = "deterministic"
     subtasks: tuple[EvidenceSubtask, ...] = ()
+    query_spec: QuerySpecification | None = None
     policy_rejections: tuple[str, ...] = ()
 
     @property
@@ -380,6 +412,10 @@ _OUTPUT_FIELD_PATTERNS = {
     "target": (r"\btarget(?: program)?\b",),
     "call_type": (r"\bcall types?\b", r"\btypes? of calls?\b"),
     "paragraph": (r"\bparagraphs?\b",),
+    "paragraph_count": (
+        r"\b(?:how many|number of|count(?: of)?)\b.{0,40}\bparagraphs?\b",
+        r"\bparagraph count\b",
+    ),
     "commarea": (r"\bcommarea\b",),
     # "lines of code" and "how many lines" are size measurements, not a request for
     # the source line where something happens.
@@ -390,7 +426,13 @@ _OUTPUT_FIELD_PATTERNS = {
     ),
     "division": (r"\bdivisions?\b",),
     "section": (r"\bsections?\b",),
-    "exact_statement": (r"\bexact (?:cobol )?statements?\b",),
+    "exact_statement": (
+        r"\bexact (?:cobol )?statements?\b",
+        r"\b(?:cobol )?statements?\b",
+    ),
+    "map": (r"\bmaps?\b",),
+    "mapset": (r"\bmapsets?\b", r"\bmap sets?\b"),
+    "queue": (r"\bqueues?\b", r"\btsq\b", r"\btemporary storage queue\b"),
     "parameters": (r"\bparameters?\b", r"\barguments?\b"),
     "length": (r"\blength\b",),
     "condition": (r"\bconditions?\b",),
@@ -398,16 +440,26 @@ _OUTPUT_FIELD_PATTERNS = {
     "variables": (r"\bvariables?\b",),
     "artifact": (r"\bartifacts?\b", r"\bsource locations?\b"),
     "origin": (r"\borigin\b", r"\bdefined (?:in|where)\b", r"\bdeclaration\b"),
-    "read_sites": (r"\bread(?:s| sites?)?\b", r"\btested\b", r"\binspect(?:s|ed)?\b"),
+    "read_sites": (r"\bread(?:s| sites?)?\b", r"\btested\b"),
     "write_sites": (r"\bwrite(?:s| sites?)?\b", r"\bmodified\b", r"\bchanged\b", r"\bset\b"),
     "control_usage": (
         r"\bcontrols? (?:the )?(?:flow|execution)\b",
         r"\bcontrol usage\b",
     ),
+    "physical_line_count": (
+        r"\bphysical source lines?\b",
+        r"\bphysical lines?\b",
+    ),
     "line_count": (
-        r"\bhow many (?:physical |source |code )?lines?\b",
-        r"\bnumber of (?:physical |source |code )?lines?\b",
+        r"\bhow many (?:(?:physical|source|code)\s+){0,3}lines?\b",
+        r"\bnumber of (?:(?:physical|source|code)\s+){0,3}lines?\b",
         r"\b(?:loc|line count)\b",
+    ),
+    "statement_count": (
+        r"\bhow many (?:executable |cobol )?statements?\b",
+        r"\b(?:number|count) of (?:executable |cobol )?statements?\b",
+        r"\bexecutable statements?\b",
+        r"\bstatement count\b",
     ),
     "item_count": (
         r"\bhow many\b.{0,45}\b(?:variables?|fields?|data items?|calls?|programs?|"
@@ -572,7 +624,8 @@ ALLOWED_PLAN_TASKS = {
 ALLOWED_PLAN_RELATIONS = {
     "referenced_by", "contains", "starts_at", "ends_at", "before", "after",
     "condition_causes", "reads", "writes", "calls", "uses", "compares",
-    "separate_categories", "example_per_item",
+    "separate_categories", "example_per_item", "intersection", "difference",
+    "symmetric_difference", "union", "incoming", "outgoing",
 }
 
 ALLOWED_EVIDENCE_CAPABILITIES = {
@@ -584,6 +637,28 @@ ALLOWED_EVIDENCE_CAPABILITIES = {
     "db2_evidence", "jcl_evidence", "quality_evidence",
     "pagination_evidence", "screen_lineage",
 }
+
+ALLOWED_QUERY_OPERATORS = {
+    "describe", "lookup", "list", "project", "filter", "compare",
+    "intersect", "difference", "symmetric_difference", "union", "traverse",
+    "aggregate",
+}
+
+ALLOWED_QUERY_ENTITY_TYPES = {
+    "program", "variable", "paragraph", "call", "copybook", "cics_operation",
+    "map", "mapset", "queue", "table", "statement", "metric",
+}
+
+ALLOWED_QUERY_DIRECTIONS = {
+    "incoming", "outgoing", "before", "after", "source_to_target",
+}
+
+ALLOWED_QUERY_FILTER_FIELDS = {
+    "call_type", "command", "paragraph", "resource_type", "resource_name",
+    "condition_variable", "condition_operator", "condition_value", "source_file",
+}
+
+ALLOWED_QUERY_FILTER_OPERATORS = {"eq", "neq", "in", "not_in", "contains"}
 
 _CAPABILITY_TASKS = {
     "artifact_inventory": ("artifact_inventory",),
@@ -611,7 +686,7 @@ _CAPABILITY_TASKS = {
 # Entity types that are exact identifiers copied from the user's question, and so
 # must survive into any answer claiming to be about them.
 NAMED_IDENTIFIER_ENTITY_TYPES = frozenset(
-    {"call", "variable", "unknown_identifier", "map", "mapset"}
+    {"call", "variable", "unknown_identifier", "map", "mapset", "queue"}
 )
 
 _CAPABILITY_ENTITY_TYPES = {
@@ -878,10 +953,18 @@ def build_query_plan(
         "dependency": ("dependency", "dependencies"),
         "copy_statement": ("copy statement", "copy statements"),
     }
+    def contains_alias(text: str, alias: str) -> bool:
+        # Treat ontology aliases as words or phrases, never arbitrary
+        # substrings (for example, ``table`` inside ``executable``).
+        return bool(re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(alias)}(?![A-Za-z0-9_])",
+            text,
+        ))
+
     for evidence_type, aliases in type_aliases.items():
-        if any(alias in negative_text for alias in aliases):
+        if any(contains_alias(negative_text, alias) for alias in aliases):
             exclude_types.append(evidence_type)
-        if any(alias in positive_text for alias in aliases):
+        if any(contains_alias(positive_text, alias) for alias in aliases):
             include_types.append(evidence_type)
 
     if resolved_intent == "db2_sql":
@@ -897,6 +980,16 @@ def build_query_plan(
         for field, patterns in _OUTPUT_FIELD_PATTERNS.items()
         if any(re.search(pattern, q) for pattern in patterns)
     )
+    if resolved_intent == "source_metrics" and "paragraph_count" in output_fields:
+        output_fields = tuple(field for field in output_fields if field != "paragraph")
+    if "statement_count" in output_fields:
+        output_fields = tuple(field for field in output_fields if field != "exact_statement")
+    if "line_count" in output_fields:
+        output_fields = tuple(field for field in output_fields if field != "source_line")
+    if "physical_line_count" in output_fields:
+        output_fields = tuple(
+            field for field in output_fields if field not in {"source_line", "line_count"}
+        )
     if resolved_intent == "general" and {"commarea", "length"} & set(output_fields):
         # COMMAREA and LENGTH are recorded by call evidence and nothing else, so
         # asking for one says which evidence the question is about. This fires
@@ -907,7 +1000,8 @@ def build_query_plan(
     only_requested_fields = bool(
         re.search(
             r"(?:return|provide|give|include|show)\s+only\s+(?:their\s+|the\s+)?"
-            r"(?:names?|targets?|call types?|paragraphs?|source|lines?|divisions?|sections?|parameters?|commarea)",
+            r"(?:names?|targets?|call types?|paragraphs?|source|lines?|divisions?|sections?|"
+            r"parameters?|commarea|maps?|mapsets?|queues?|statements?)",
             q,
         )
         or re.search(
@@ -922,7 +1016,11 @@ def build_query_plan(
         )
     )
 
-    condition_terms = _condition_terms(question) if _is_condition_effect_question(q) else ()
+    # Parse explicit COBOL-style condition literals independently from intent.
+    # They become executable filters only when the semantic plan selects a
+    # condition-outcome capability; keeping extraction separate prevents the
+    # router's phrasing sensitivity from silently discarding `FIELD = '1'`.
+    condition_terms = _condition_terms(question)
     negative_condition = bool(
         _is_condition_effect_question(q)
         and re.search(r"\b(?:neither|otherwise|not equal|not equals|is not|isn.t|not =)\b", q)
@@ -1096,6 +1194,105 @@ def plan_needs_semantic_refinement(question: str, plan: QueryPlan) -> bool:
     # The LLM is the primary semantic planner. Deterministic preprocessing only
     # supplies verified program/entity scope and literal constraints.
     return plan.route == "technical" and not plan.requires_clarification
+
+
+_QUERY_SPEC_FIELDS = set(_OUTPUT_FIELD_PATTERNS) | {
+    "statement_count", "resource_type", "resource_name", "map", "mapset",
+    "queue", "body", "incoming_edges", "outgoing_edges", "terminal", "exists",
+}
+
+
+def _parse_query_spec(plan: QueryPlan, raw: Any) -> QuerySpecification | None:
+    """Validate the model's semantic query without letting it invent scope."""
+    if not isinstance(raw, dict):
+        return None
+    operator = str(raw.get("operator") or "").strip().lower()
+    capability = str(raw.get("capability") or "").strip().lower()
+    if operator not in ALLOWED_QUERY_OPERATORS or capability not in ALLOWED_EVIDENCE_CAPABILITIES:
+        return None
+
+    def values(name: str) -> tuple[str, ...]:
+        raw_values = raw.get(name, [])
+        if isinstance(raw_values, str):
+            raw_values = [raw_values]
+        if not isinstance(raw_values, list):
+            return ()
+        return _unique(str(value).strip() for value in raw_values if str(value).strip())
+
+    entity_types = tuple(
+        value for value in (item.lower() for item in values("entity_types"))
+        if value in ALLOWED_QUERY_ENTITY_TYPES
+    )
+    available_entities = {value.upper() for value in plan.entity_values}
+    available_programs = {value.upper() for value in plan.programs}
+    if plan.program:
+        available_programs.add(plan.program.upper())
+    grounded_names = available_entities | available_programs
+    entity_values = tuple(
+        value.upper() for value in values("entity_values")
+        if value.upper() in grounded_names
+    )
+
+    def grounded_optional(name: str) -> str | None:
+        value = str(raw.get(name) or "").strip().upper()
+        return value if value and value in grounded_names else None
+
+    relation = str(raw.get("relation") or "").strip().lower() or None
+    if relation not in {
+        None, "intersection", "difference", "symmetric_difference", "union", "comparison",
+    }:
+        relation = None
+    if relation is None:
+        relation = {
+            "intersect": "intersection",
+            "difference": "difference",
+            "symmetric_difference": "symmetric_difference",
+            "union": "union",
+            "compare": "comparison",
+        }.get(operator)
+    direction = str(raw.get("direction") or "").strip().lower() or None
+    if direction not in ALLOWED_QUERY_DIRECTIONS:
+        direction = None
+    subject_program = str(raw.get("subject_program") or "").strip().upper() or None
+    if subject_program not in available_programs:
+        subject_program = None
+
+    raw_filters = raw.get("filters", [])
+    parsed_filters: list[QueryFilter] = []
+    if isinstance(raw_filters, list):
+        for item in raw_filters[:12]:
+            if not isinstance(item, dict):
+                continue
+            field_name = str(item.get("field") or "").strip().lower()
+            filter_operator = str(item.get("operator") or "eq").strip().lower()
+            raw_values = item.get("values", [])
+            if isinstance(raw_values, str):
+                raw_values = [raw_values]
+            if (
+                field_name not in ALLOWED_QUERY_FILTER_FIELDS
+                or filter_operator not in ALLOWED_QUERY_FILTER_OPERATORS
+                or not isinstance(raw_values, list)
+            ):
+                continue
+            parsed_filters.append(QueryFilter(
+                field=field_name,
+                operator=filter_operator,
+                values=_unique(str(value).strip().upper() for value in raw_values if str(value).strip()),
+            ))
+
+    return QuerySpecification(
+        operator=operator,
+        capability=capability,
+        entity_types=entity_types,
+        entity_values=entity_values,
+        fields=tuple(value for value in values("fields") if value in _QUERY_SPEC_FIELDS),
+        relation=relation,
+        subject_program=subject_program,
+        direction=direction,
+        source_entity=grounded_optional("source_entity"),
+        target_entity=grounded_optional("target_entity"),
+        filters=tuple(parsed_filters),
+    )
 
 
 def merge_semantic_plan(plan: QueryPlan, update: dict[str, Any]) -> QueryPlan:
@@ -1273,7 +1470,12 @@ def merge_semantic_plan(plan: QueryPlan, update: dict[str, Any]) -> QueryPlan:
             else bool(plan.requires_clarification or update.get("requires_clarification"))
         ),
         confidence=(plan.confidence if strict_authority else confidence),
-        planner_source="hybrid_llm",
+        planner_source=(
+            str(update.get("planner_source"))
+            if "query_spec" in str(update.get("planner_source") or "")
+            else "hybrid_llm"
+        ),
+        query_spec=_parse_query_spec(plan, update.get("query_spec")),
         policy_rejections=_unique(policy_rejections),
     )
     semantic_subtasks = (
@@ -2059,6 +2261,16 @@ def _is_condition_effect_question(q: str) -> bool:
         re.search(r"\bwhat (?:happens|occurs) (?:when|if)\b", q)
         or re.search(r"\bresult (?:when|if|of)\b", q)
         or re.search(r"\bwhat does .+ do (?:when|if)\b", q)
+        or re.search(
+            r"\b(?:outcomes?|effects?|consequences?|actions?|branches?|control transfers?)\b"
+            r".{0,70}\b(?:condition|when|if|equals?|equal to)\b",
+            q,
+        )
+        or re.search(
+            r"\b(?:under|for) (?:the )?condition\b.{0,90}"
+            r"\b(?:outcomes?|effects?|consequences?|actions?|branches?|transfers?)\b",
+            q,
+        )
         or "neither" in q
         or "otherwise" in q
     )
@@ -2213,4 +2425,3 @@ def _uncovered_control_flow_claims(plan: Any, answer: str) -> list[str]:
                 reasons.append("unrecorded_condition")
                 break
     return reasons
-

@@ -3,13 +3,20 @@ from __future__ import annotations
 import unittest
 
 from cobol_rag.query_ir import (
+    AccessProjection,
+    EntityMembership,
     FieldProjection,
     Inventory,
     GraphEdges,
     GraphPredicate,
     SetRelation,
+    ScalarComparison,
+    TemporalProjection,
+    SemanticProjection,
+    UnusedCode,
     compile_query,
 )
+from cobol_rag.query_plan import QuerySpecification
 
 
 NODES = ("BROWSE-FASE1", "XCTL-LIV4", "ABEND00", "READ-TAB-SEMAF", "MAIN-PARA")
@@ -80,10 +87,19 @@ class EdgeQueryTest(unittest.TestCase):
         )
         self.assertEqual(q.projection, "condition")
 
-    def test_one_endpoint_is_left_to_the_existing_path(self) -> None:
-        # Single-target questions already have a handler; do not divert them.
-        self.assertIsNone(
-            self.compile("which paragraphs lead to ABEND00", paragraphs=("ABEND00",))
+    def test_one_target_compiles_to_incoming_edges(self) -> None:
+        query = self.compile("which paragraphs lead to ABEND00", paragraphs=("ABEND00",))
+        self.assertIsInstance(query, GraphEdges)
+        self.assertEqual((query.source, query.target, query.direction), (None, "ABEND00", "incoming"))
+
+    def test_one_source_compiles_to_outgoing_edges(self) -> None:
+        query = self.compile(
+            "what transitions leave BROWSE-FASE1", paragraphs=("BROWSE-FASE1",)
+        )
+        self.assertIsInstance(query, GraphEdges)
+        self.assertEqual(
+            (query.source, query.target, query.direction),
+            ("BROWSE-FASE1", None, "outgoing"),
         )
 
     def test_names_absent_from_the_graph_are_not_endpoints(self) -> None:
@@ -153,6 +169,87 @@ class SetQueryTest(unittest.TestCase):
         q = self.compile("I do not recall - which copybooks do PDCBVC and PDB305 share?")
         self.assertEqual(q.relation, "intersection")
 
+    def test_exactly_one_is_a_symmetric_difference(self) -> None:
+        query = self.compile(
+            "Which copybooks occur in exactly one of PDCBVC and PDB305?"
+        )
+        self.assertEqual(query.relation, "symmetric_difference")
+
+    def test_a_named_variable_is_membership_not_an_inventory_comparison(self) -> None:
+        query = compile_query(
+            "Does PDRGCODA-RETURN exist in PDB305 and PDCBVC, and where is it declared?",
+            program="PDB305",
+            programs=("PDB305", "PDCBVC"),
+            variables=("PDRGCODA-RETURN",),
+            entity_type="variable",
+            operations=("exists", "locate"),
+        )
+        self.assertIsInstance(query, EntityMembership)
+        self.assertEqual(query.entity, "PDRGCODA-RETURN")
+        self.assertIn("source_line", query.fields)
+
+    def test_physical_lines_are_a_scalar_metric(self) -> None:
+        query = compile_query(
+            "Which program has more physical source lines, PDB305 or PDCBVC?",
+            program="PDB305",
+            programs=("PDB305", "PDCBVC"),
+            # The context supplies the whole recognition catalogue. None of
+            # these names is explicit in the question and it must not hijack
+            # the metric comparison.
+            copybooks=("DFHAID", "PDRUTI01"),
+            output_fields=("line_count",),
+        )
+        self.assertIsInstance(query, ScalarComparison)
+        self.assertEqual(query.metric, "main_source_physical_lines")
+
+    def test_physical_line_comparison_survives_a_semantic_query_spec(self) -> None:
+        query = compile_query(
+            "Which program has more physical source lines, PDB305 or PDCBVC?",
+            program="PDB305",
+            programs=("PDB305", "PDCBVC"),
+            output_fields=("physical_line_count",),
+            query_spec=QuerySpecification(
+                operator="compare",
+                capability="source_metrics",
+                entity_types=("program", "metric"),
+                fields=("physical_line_count",),
+            ),
+        )
+        self.assertIsInstance(query, ScalarComparison)
+        self.assertEqual(query.metric, "main_source_physical_lines")
+
+    def test_unused_code_preserves_the_planned_quality_categories(self) -> None:
+        query = compile_query(
+            "Is there any unused code in PDCBVC?",
+            program="PDCBVC",
+            quality_categories=("commented_code", "unreachable_code"),
+        )
+        self.assertIsInstance(query, UnusedCode)
+        self.assertEqual(query.categories, ("commented_code", "unreachable_code"))
+
+    def test_unused_code_and_copybooks_keeps_all_requested_categories(self) -> None:
+        categories = (
+            "commented_code", "unreachable_code", "unused_copybooks", "review_copybooks",
+        )
+        query = compile_query(
+            "Is there any unused code or copybook in PDCBVC?",
+            program="PDCBVC",
+            quality_categories=categories,
+        )
+        self.assertIsInstance(query, UnusedCode)
+        self.assertEqual(query.categories, categories)
+
+    def test_catalogue_copybooks_do_not_hijack_a_call_comparison(self) -> None:
+        query = compile_query(
+            "Which external programs are called by both PDB305 and PDCBVC?",
+            program="PDB305",
+            programs=("PDB305", "PDCBVC"),
+            copybooks=("DFHAID", "PDRUTI01"),
+            entity_type="program",
+        )
+        self.assertIsInstance(query, SetRelation)
+        self.assertEqual(query.entity_type, "call")
+
 
 class FieldProjectionTest(unittest.TestCase):
     def test_which_copybook_declares_a_variable(self) -> None:
@@ -172,6 +269,18 @@ class FieldProjectionTest(unittest.TestCase):
             )
         )
 
+    def test_immediate_call_context_is_temporal(self) -> None:
+        query = compile_query(
+            "Which condition is checked immediately after the PD1FS00 call?",
+            program="PDCBVC",
+            calls=("PD1FS00",),
+            graph_nodes=NODES,
+        )
+        self.assertIsInstance(query, TemporalProjection)
+        self.assertEqual((query.anchor, query.direction, query.projection), (
+            "PD1FS00", "after", "condition",
+        ))
+
 
 class NoGuessTest(unittest.TestCase):
     def test_unrelated_questions_compile_to_nothing(self) -> None:
@@ -184,6 +293,45 @@ class NoGuessTest(unittest.TestCase):
                 self.assertIsNone(
                     compile_query(question, program="PDCBVC", graph_nodes=NODES)
                 )
+
+
+class SemanticSpecificationTest(unittest.TestCase):
+    def test_query_spec_is_authoritative_over_wording(self) -> None:
+        spec = QuerySpecification(
+            operator="project",
+            capability="paragraph_evidence",
+            entity_types=("paragraph",),
+            entity_values=("XCTL-LIV4",),
+            fields=("body", "outgoing_edges"),
+            direction="outgoing",
+        )
+        results = [
+            compile_query(
+                wording,
+                program="PDCBVC",
+                programs=("PDCBVC",),
+                query_spec=spec,
+            )
+            for wording in (
+                "What does XCTL-LIV4 execute and where can it go?",
+                "Inspect the body of XCTL-LIV4, then show transfers from it.",
+                "This wording is deliberately unrelated to compiler phrase tables.",
+            )
+        ]
+        self.assertTrue(all(isinstance(item, SemanticProjection) for item in results))
+        self.assertTrue(all(item == results[0] for item in results[1:]))
+
+    def test_semantic_multi_type_projection_preserves_both_types(self) -> None:
+        spec = QuerySpecification(
+            operator="project",
+            capability="cics_evidence",
+            entity_types=("map", "mapset"),
+            fields=("map", "mapset", "source_line"),
+        )
+        query = compile_query(
+            "screen resources", program="PDCBVC", programs=("PDCBVC",), query_spec=spec,
+        )
+        self.assertEqual(query.entity_types, ("map", "mapset"))
 
 
 if __name__ == "__main__":
@@ -255,3 +403,12 @@ class InventoryQueryTest(unittest.TestCase):
             paragraphs=("BROWSE-FASE1", "XCTL-LIV4"),
         )
         self.assertIsInstance(q, GraphEdges)
+
+    def test_access_role_is_part_of_the_query(self) -> None:
+        query = self.compile(
+            "Which variables does MAIN-PARA modify?",
+            variables=(),
+            output_fields=("write_sites",),
+        )
+        self.assertIsInstance(query, AccessProjection)
+        self.assertEqual(query.access_kind, "write")

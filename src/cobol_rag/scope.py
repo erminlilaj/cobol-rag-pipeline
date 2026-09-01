@@ -474,7 +474,7 @@ def resolve_query_scope(
 # and B" is a comparison; requiring the word "compare" rejected it and answered
 # "ask for a comparison or choose one program", which is what it had just asked.
 _SET_RELATION_WORDS: tuple[tuple[str, str], ...] = (
-    (r"\b(?:shared|common|in both|both programs|same in both)\b", "intersection"),
+    (r"\b(?:shared|common|both|in both|both programs|same in both)\b", "intersection"),
     (r"\b(?:only in|unique to|specific to|not in|absent from|missing from)\b", "difference"),
     (r"\b(?:compare|comparison|difference|differences|versus|vs\.?)\b", "comparison"),
     (r"\b(?:across both|combined|together|in total across)\b", "union"),
@@ -619,6 +619,13 @@ def source_addresses_in(question: str) -> tuple[dict[str, Any], ...]:
             # "3 lines of context" states a window, not an address to fetch.
             continue
         cursor = anchor.end()
+        # Natural range syntax may place a grammatical preposition between the
+        # address noun and its first number: "lines from 10 through 20".  The
+        # address grammar, not a separate phrase rule, consumes that optional
+        # preposition before reading the same numeric span.
+        from_marker = re.match(r"from\s+", text[cursor:], re.IGNORECASE)
+        if from_marker:
+            cursor += from_marker.end()
         while True:
             span = _ADDRESS_SPAN.match(text, cursor)
             if not span:
@@ -876,6 +883,19 @@ def _catalogue(root_text: str) -> tuple[tuple[str, ...], tuple[EntityReference, 
             operations = content.get("operations") or []
             for operation in operations if isinstance(operations, list) else []:
                 if not isinstance(operation, dict):
+                    continue
+                structured = operation.get("resources") or []
+                for resource in structured if isinstance(structured, list) else []:
+                    if not isinstance(resource, dict):
+                        continue
+                    resource_type = str(resource.get("resource_type") or "").strip().lower()
+                    value = str(resource.get("resource") or "").strip().upper()
+                    if resource_type in {"map", "mapset", "queue"} and value:
+                        _add_entity(
+                            entities, program, resource_type, value,
+                            f"{program}|{resource_type.upper()}|{value}",
+                        )
+                if structured:
                     continue
                 statement = str(operation.get("statement", ""))
                 for entity_type, pattern in (("map", _MAP_NAME), ("mapset", _MAPSET_NAME)):

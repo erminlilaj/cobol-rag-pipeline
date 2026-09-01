@@ -1283,6 +1283,24 @@ def _cics_statement_resources(statement: str) -> set[str]:
     return {match.group(1).strip().upper() for match in _CICS_MAP_NAME.finditer(statement)}
 
 
+def _operation_resources(operation: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """Structured analysis resources, with raw-statement compatibility fallback."""
+    structured = [
+        (
+            str(item.get("resource_type") or "").upper(),
+            str(item.get("resource") or "").upper(),
+        )
+        for item in operation.get("resources") or []
+        if isinstance(item, dict) and item.get("resource_type") and item.get("resource")
+    ]
+    if structured:
+        return structured
+    return [
+        (match.group(1).upper(), match.group(2).upper())
+        for match in _CICS_RESOURCE.finditer(str(operation.get("statement") or ""))
+    ]
+
+
 def _answer_cics_operations(
     root: Path,
     program: str,
@@ -1315,7 +1333,7 @@ def _answer_cics_operations(
     if requested_resources:
         matched = [
             item for item in operations
-            if requested_resources & _cics_statement_resources(str(item.get("statement", "")))
+            if requested_resources & {name for _kind, name in _operation_resources(item)}
         ]
         if matched:
             operations = matched
@@ -1446,6 +1464,48 @@ def _render_control_flow_edge(edge: dict[str, Any], direction: str) -> str:
     return detail
 
 
+def _rich_control_flow_edges(program_root: Path) -> list[dict[str, Any]]:
+    """Normalize cobol-rekt paragraph flow chunks into the canonical edge shape.
+
+    MAPA remains authoritative where it has an edge.  Rich edges supplement
+    absent pairs and carry their provenance; they never overwrite an exact
+    condition or line from the primary graph.
+    """
+    payload = _read_json(
+        program_root / "controlflow.cfg.rich" / "controlflow.cfg.rich.json"
+    )
+    chunks = (payload or {}).get("chunks") or []
+    edges: list[dict[str, Any]] = []
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        source = str(chunk.get("paragraph") or "").upper()
+        preview = " ".join(str(chunk.get("text_preview") or "").split())
+        if not source or not preview:
+            continue
+        perform = re.search(
+            r"\bPERFORM calls:\s*(.*?)(?=\s+GO TO|\s+Branch condition:|$)", preview, re.I
+        )
+        jumps = re.search(
+            r"\bGO TO \(unconditional\):\s*(.*?)(?=\s+Branch condition:|$)", preview, re.I
+        )
+        for match, edge_type, verb in (
+            (perform, "EXTERNAL_CALL", "PERFORM"),
+            (jumps, "EXTERNAL_JUMP", "GO TO"),
+        ):
+            if not match:
+                continue
+            for target in re.findall(r"[A-Z][A-Z0-9-]*", match.group(1).upper()):
+                edges.append({
+                    "from": source,
+                    "to": target,
+                    "type": edge_type,
+                    "evidence": f"{verb} {target}",
+                    "source_system": "cobol_rekt",
+                })
+    return edges
+
+
 def answer_control_flow_edges(
     program: str | None,
     target: str,
@@ -1470,6 +1530,16 @@ def answer_control_flow_edges(
     if not isinstance(payload, dict):
         return None
     edges = [item for item in payload.get("edges", []) if isinstance(item, dict)]
+    rich_edges = _rich_control_flow_edges(program_root)
+    recorded_pairs = {
+        (str(item.get("from") or "").upper(), str(item.get("to") or "").upper())
+        for item in edges
+    }
+    edges.extend(
+        item for item in rich_edges
+        if (str(item.get("from") or "").upper(), str(item.get("to") or "").upper())
+        not in recorded_pairs
+    )
     if not edges:
         return None
     target = target.upper()
@@ -1507,8 +1577,225 @@ def answer_control_flow_edges(
             f"{uncited} edge(s) have no source line: they are implied by program "
             "structure rather than written as a statement."
         )
-    lines.append("Source: `controlflow.cfg.json`.")
+    sources = ["`controlflow.cfg.json`"]
+    if any(edge.get("source_system") == "cobol_rekt" for edge in matched):
+        sources.append("`controlflow.cfg.rich.json` (cobol-rekt supplement)")
+    lines.append("Sources: " + ", ".join(sources) + ".")
     return "\n".join(lines)
+
+
+def answer_access_projection(
+    program: str,
+    paragraph: str,
+    access_kind: str,
+) -> str | None:
+    """Project variable accesses in one paragraph without widening the role.
+
+    The evidence is stored per variable, so this is a reverse join over the
+    catalogue.  `access_kind` is part of the query contract: a read request can
+    never silently become a read-and-write inventory.
+    """
+    root = find_final_scripts_root()
+    if root is None:
+        return None
+    program_root = find_program_artifact_root(root, program)
+    if program_root is None:
+        return None
+    payload = _read_json(_artifact_path(program_root, "dataflow.used_variables.json"))
+    variables = (payload.get("variables") if isinstance(payload, dict) else payload) or []
+    selected: dict[str, list[str]] = {}
+    wanted_buckets = {
+        "read": ("read_sites",),
+        "write": ("write_sites", "read_write_sites"),
+        "read_write": ("read_write_sites",),
+        "all": ("write_sites", "read_write_sites", "read_sites"),
+    }.get(access_kind)
+    if wanted_buckets is None:
+        return None
+    paragraph = paragraph.upper()
+    for variable in variables:
+        if not isinstance(variable, dict):
+            continue
+        name = str(variable.get("variable") or "").upper()
+        evidence = variable.get("evidence") or {}
+        for bucket in wanted_buckets:
+            for site in evidence.get(bucket) or []:
+                if str(site.get("paragraph") or "").upper() != paragraph:
+                    continue
+                line = site.get("line_start") or site.get("line")
+                statement = " ".join(str(site.get("statement") or "").split())
+                rendered = f"line {line}: `{statement}`"
+                if rendered not in selected.setdefault(name, []):
+                    selected[name].append(rendered)
+    if not selected:
+        return (
+            f"No variable {access_kind} access is recorded in {paragraph} in {program}.\n"
+            "Source: `dataflow.used_variables.json`."
+        )
+    noun = {"read": "read", "write": "modified", "read_write": "read and modified", "all": "accessed"}[access_kind]
+    lines = [f"Variables {noun} in {paragraph} ({program}) ({len(selected)}):"]
+    for name in sorted(selected):
+        lines.append(f"- {name} — {'; '.join(selected[name])}")
+    lines.append("Source: `dataflow.used_variables.json`.")
+    return "\n".join(lines)
+
+
+def answer_entity_membership(
+    programs: Sequence[str],
+    entity: str,
+    entity_type: str,
+    fields: Sequence[str] = ("exists",),
+) -> str | None:
+    """Read one named entity in each program instead of comparing inventories."""
+    root = find_final_scripts_root()
+    if root is None:
+        return None
+    entity = entity.upper()
+    requested = set(fields) | {"exists"}
+    lines = [f"{entity} {entity_type} membership:"]
+    found_any = False
+    for program in dict.fromkeys(str(value).upper() for value in programs if value):
+        program_root = find_program_artifact_root(root, program)
+        if program_root is None:
+            lines.append(f"- {program}: program artifacts unavailable")
+            continue
+        details: list[str] = []
+        present = False
+        if entity_type == "variable":
+            payload = _read_json(_artifact_path(program_root, "dataflow.used_variables.json"))
+            variables = (payload.get("variables") if isinstance(payload, dict) else payload) or []
+            record = next((
+                item for item in variables
+                if isinstance(item, dict)
+                and str(item.get("variable") or "").upper() == entity
+            ), None)
+            present = record is not None
+            if record:
+                if "origin" in requested and record.get("origin"):
+                    details.append(f"origin {record['origin']}")
+                declarations = ((record.get("relationships") or {}).get("declarations") or [])
+                if "source_line" in requested and declarations:
+                    locations = ", ".join(
+                        f"{item.get('source_file') or '?'} line {item.get('line_start') or '?'}"
+                        for item in declarations if isinstance(item, dict)
+                    )
+                    if locations:
+                        details.append(locations)
+        elif entity_type == "copybook":
+            payload = _read_json(_artifact_path(program_root, "architecture.copybooks.json"))
+            content = (payload or {}).get("content") or {}
+            present = entity in {str(value).upper() for value in content.get("all") or []}
+            if present and "source_line" in requested:
+                inclusions = [
+                    item for item in content.get("inclusions") or []
+                    if isinstance(item, dict)
+                    and str(item.get("copybook") or "").upper() == entity
+                ]
+                locations = ", ".join(
+                    f"{item.get('source_file') or '?'} line {item.get('line') or item.get('line_start') or '?'}"
+                    for item in inclusions
+                )
+                if locations:
+                    details.append(locations)
+        else:
+            return None
+        found_any = found_any or present
+        suffix = f"; {'; '.join(details)}" if details else ""
+        lines.append(f"- {program}: {'present' if present else 'not present'}{suffix}")
+    lines.append(
+        "Sources: `dataflow.used_variables.json` or `architecture.copybooks.json` per program."
+    )
+    return "\n".join(lines) if found_any or len(lines) > 2 else None
+
+
+def answer_scalar_comparison(programs: Sequence[str], metric: str) -> str | None:
+    """Compare a scalar whose definition is carried by the typed query."""
+    if metric != "main_source_physical_lines":
+        return None
+    root = find_final_scripts_root()
+    if root is None:
+        return None
+    values: dict[str, int] = {}
+    for program in dict.fromkeys(str(value).upper() for value in programs if value):
+        program_root = find_program_artifact_root(root, program)
+        if program_root is None:
+            continue
+        payload = _read_json(_artifact_path(program_root, "program.source_lines.meta.json"))
+        files = (payload or {}).get("files") or []
+        main = next((item for item in files if isinstance(item, dict) and item.get("is_main")), None)
+        if main and isinstance(main.get("line_count"), int):
+            values[program] = main["line_count"]
+    if not values:
+        return None
+    lines = ["Main-source physical line counts:"]
+    lines.extend(f"- {program}: {count}" for program, count in values.items())
+    if len(values) >= 2:
+        highest = max(values, key=values.get)
+        lowest = min(values, key=values.get)
+        difference = values[highest] - values[lowest]
+        if difference:
+            lines.append(f"{highest} has {difference} more physical lines than {lowest}.")
+        else:
+            lines.append("The programs have the same main-source physical line count.")
+    lines.append("Source: `program.source_lines.meta.json` per program (`is_main=true`).")
+    return "\n".join(lines)
+
+
+def answer_temporal_projection(
+    program: str,
+    anchor: str,
+    anchor_type: str,
+    direction: str,
+    projection: str = "statement",
+) -> str | None:
+    """Read the nearest source statement relative to a structured anchor."""
+    if anchor_type != "call" or direction not in {"before", "after"}:
+        return None
+    root = find_final_scripts_root()
+    if root is None:
+        return None
+    program_root = find_program_artifact_root(root, program)
+    if program_root is None:
+        return None
+    payload = _read_json(_artifact_path(program_root, "architecture.call_parameters.json"))
+    calls = (payload or {}).get("calls") or []
+    call = next((
+        item for item in calls
+        if isinstance(item, dict) and str(item.get("target") or "").upper() == anchor.upper()
+    ), None)
+    if not call:
+        return None
+    source_file = str(call.get("source_file") or f"{program}.CBL")
+    line = int(call.get("line_end") or call.get("line_start") or 0)
+    records = [
+        item for item in _read_source_lines(program_root, program)
+        if str(item.get("source_file") or "").upper() == source_file.upper()
+        and not item.get("is_blank") and not item.get("is_comment")
+    ]
+    records.sort(key=lambda item: int(item.get("line") or 0))
+    candidates = [
+        item for item in records
+        if (int(item.get("line") or 0) > line if direction == "after" else int(item.get("line") or 0) < line)
+    ]
+    if direction == "before":
+        candidates.reverse()
+    if projection == "condition":
+        conditional = [
+            item for item in candidates[:12]
+            if re.match(r"\s*(?:IF|EVALUATE|WHEN)\b", str(item.get("normalized") or item.get("text") or ""), re.I)
+        ]
+        candidates = conditional or candidates
+    if not candidates:
+        return None
+    nearest = candidates[0]
+    text = str(nearest.get("normalized") or nearest.get("text") or "").strip()
+    return (
+        f"{anchor} is called in {call.get('paragraph')} at {source_file} "
+        f"lines {call.get('line_start')}-{call.get('line_end') or call.get('line_start')}: "
+        f"`{call.get('statement')}`\n"
+        f"Nearest {projection} {direction} the call is at line {nearest.get('line')}: `{text}`\n"
+        "Sources: `architecture.call_parameters.json`, `program.source_lines.jsonl`."
+    )
 
 
 # What "the same thing" means for each comparable capability: the artifact to
@@ -1521,10 +1808,15 @@ _COMPARABLE_CAPABILITIES: dict[str, tuple[str, str, str, str]] = {
     "copybook_evidence": ("architecture.copybooks.json", "content.all", "", "copybook"),
     "variable_inventory": ("dataflow.used_variables.json", "variables", "variable", "variable"),
     "cics_evidence": ("architecture.cics_operations.json", "content.commands", "", "CICS command"),
+    "map_evidence": ("architecture.cics_operations.json", "", "", "BMS map"),
+    "mapset_evidence": ("architecture.cics_operations.json", "", "", "BMS mapset"),
+    "db2_table_evidence": ("architecture.db2_table/", "", "", "DB2 table"),
     "paragraph_evidence": ("controlflow.cfg.json", "nodes", "", "paragraph"),
 }
 
-_SET_RELATIONS = ("intersection", "difference", "union", "comparison")
+_SET_RELATIONS = (
+    "intersection", "difference", "symmetric_difference", "union", "comparison",
+)
 
 # Which capability an intent is asking to compare. Intents absent here have no
 # set-shaped evidence, so a comparison of them is declined rather than faked.
@@ -1562,6 +1854,27 @@ def _comparable_keys(program: str, capability: str) -> set[str] | None:
     program_root = find_program_artifact_root(root, program)
     if program_root is None:
         return None
+    if capability == "db2_table_evidence":
+        directory = program_root / "architecture.db2_table"
+        if not directory.exists():
+            return set()
+        keys: set[str] = set()
+        for path_item in directory.glob("*.json"):
+            item = _read_json(path_item)
+            content = (item or {}).get("content") or {}
+            table = str(content.get("table") or "").strip().upper()
+            if table:
+                keys.add(table)
+        return keys
+    if capability in {"map_evidence", "mapset_evidence"}:
+        payload = _read_json(_artifact_path(program_root, "architecture.cics_operations.json"))
+        operations = ((payload or {}).get("content") or {}).get("operations") or []
+        pattern = _CICS_MAP_NAME_ONLY if capability == "map_evidence" else _MAPSET_NAME
+        return {
+            match.group(1).upper()
+            for operation in operations if isinstance(operation, dict)
+            for match in pattern.finditer(str(operation.get("statement") or ""))
+        }
     payload = _read_json(_artifact_path(program_root, artifact))
     if not isinstance(payload, dict):
         return None
@@ -1628,6 +1941,9 @@ _RELATION_THEN_NAME = re.compile(
 # comparison, so it cannot steer an ordinary question.
 _COMPARISON_SUBJECT_WORDS: tuple[tuple[str, str], ...] = (
     (r"\bcopybooks?\b|\bcopy members?\b", "copybook_evidence"),
+    (r"\bmaps?\b", "map_evidence"),
+    (r"\bmapsets?\b", "mapset_evidence"),
+    (r"\b(?:db2\s+)?tables?\b", "db2_table_evidence"),
     (r"\bcics (?:commands?|operations?)\b", "cics_evidence"),
     (r"\bparagraphs?\b", "paragraph_evidence"),
     (r"\bvariables?\b|\bfields?\b|\bdata items?\b", "variable_inventory"),
@@ -1674,6 +1990,7 @@ def answer_program_comparison(
     programs: Sequence[str],
     capability: str,
     relation: str,
+    subject_program: str | None = None,
 ) -> str | None:
     """Compare one capability across programs by joining on identifying names.
 
@@ -1730,7 +2047,11 @@ def answer_program_comparison(
             f"({len(shared)}): {', '.join(sorted(shared)) or 'none'}"
         )
     if relation in {"difference", "comparison"}:
-        for program in named:
+        difference_programs = named
+        if relation == "difference" and subject_program:
+            subject = subject_program.upper()
+            difference_programs = [subject] if subject in sets else []
+        for program in difference_programs:
             others = set.union(*[v for k, v in sets.items() if k != program])
             only = sorted(sets[program] - others)
             lines.append(
@@ -1739,6 +2060,16 @@ def answer_program_comparison(
     if relation == "union":
         every = sorted(set.union(*sets.values()))
         lines.append(f"{noun.capitalize()}s across {', '.join(named)} ({len(every)}): {', '.join(every)}")
+    if relation == "symmetric_difference":
+        occurrences: dict[str, int] = {}
+        for values in sets.values():
+            for value in values:
+                occurrences[value] = occurrences.get(value, 0) + 1
+        exclusive = sorted(value for value, count in occurrences.items() if count == 1)
+        lines.append(
+            f"{noun.capitalize()}s recorded in exactly one of {', '.join(named)} "
+            f"({len(exclusive)}): {', '.join(exclusive) or 'none'}"
+        )
     counts = ", ".join(f"{p} {len(v)}" for p, v in sets.items())
     lines.append(f"Recorded per program: {counts}.")
     lines.append(
@@ -1775,7 +2106,7 @@ def _answer_counts(
     # of its own, from the plan it inherited: "list them" after a paragraph
     # count is a request to enumerate paragraphs.
     about_paragraphs = "paragraph" in q or (
-        plan is not None and "paragraph" in set(plan.output_fields)
+        plan is not None and {"paragraph", "paragraph_count"} & set(plan.output_fields)
     )
     if intent == "source_metrics" and about_paragraphs and _ENUMERATE.search(q):
         # Only when the planner decided this is a metrics question. Reached from
@@ -1813,19 +2144,9 @@ def _answer_counts(
         # as the count would be a guess wearing a citation, and generation was
         # previously asked to produce a single number and could not ground it.
         # Every recorded count is reported with the artifact that recorded it.
-        counted = _paragraph_counts(program, summary, controlflow, comments)
-        if counted:
-            lines = [
-                f"Analyzers disagree on the paragraph count for {program}; "
-                f"{len(counted)} artifact(s) record one:"
-            ]
-            lines.extend(f"- {source}: {value}" for source, value in counted)
-            lines.append(
-                "These count different things -- a MAPA record, control-flow graph "
-                "nodes, and paragraphs seen while scanning source -- so no single "
-                "number is authoritative."
-            )
-            return "\n".join(lines)
+        rendered = _render_paragraph_counts(program, root)
+        if rendered:
+            return rendered
 
     if comments and any(term in q for term in ("line", "lines", "loc", "code")):
         total_lines = comments.get("metrics", {}).get("total_lines")
@@ -1834,6 +2155,19 @@ def _answer_counts(
         approx_loc = _extract_approx_loc(summary)
         paragraphs = _extract_paragraph_count(summary)
         parts: list[str] = []
+        requested_fields = set(plan.output_fields) if plan is not None else set()
+        if requested_fields & {"physical_line_count", "line_count", "statement_count"}:
+            if requested_fields & {"physical_line_count", "line_count"} and total_lines is not None:
+                parts.append(f"{program} has {total_lines} total physical source lines.")
+                if "line_count" in requested_fields and "physical_line_count" not in requested_fields and approx_loc is not None:
+                    parts.append(f"`program.summary.json` estimates about {approx_loc} LOC.")
+            if "statement_count" in requested_fields:
+                statements = (summary.get("meta") or {}).get("statements") \
+                    if isinstance(summary, dict) else None
+                if statements is not None:
+                    parts.append(f"It records {statements} executable statements.")
+            if parts:
+                return " ".join(parts)
         if total_lines is not None:
             parts.append(f"{program} has {total_lines} total physical source lines.")
         if approx_loc is not None:
@@ -1889,6 +2223,31 @@ def _paragraph_counts(
         if isinstance(scanned, int):
             counted.append(("`program.comments.json` (procedure paragraphs)", scanned))
     return counted
+
+
+def _render_paragraph_counts(program: str, root: Path) -> str | None:
+    """Render every paragraph-count observation through one evidence policy."""
+    summary = _read_json(_artifact_path(root, "program.summary.json"))
+    controlflow = _read_json(_artifact_path(root, "controlflow.cfg.json"))
+    comments = _read_json(_artifact_path(root, "program.comments.json"))
+    counted = _paragraph_counts(program, summary, controlflow, comments)
+    if not counted:
+        return None
+    values = {value for _, value in counted}
+    heading = (
+        f"Analyzers disagree on the paragraph count for {program}; "
+        if len(values) > 1
+        else f"Recorded paragraph count for {program}; "
+    )
+    lines = [heading + f"{len(counted)} artifact(s) record one:"]
+    lines.extend(f"- {source}: {value}" for source, value in counted)
+    if len(values) > 1:
+        lines.append(
+            "These count different things -- a MAPA record, control-flow graph "
+            "nodes, and paragraphs seen while scanning source -- so no single "
+            "number is authoritative."
+        )
+    return "\n".join(lines)
 
 
 def _extract_approx_loc(summary: dict[str, Any] | None) -> int | None:
@@ -3679,6 +4038,555 @@ def _deduplicate_simple_or_terms(condition: str) -> str:
 # right chunk or on generation producing citable text.
 # ---------------------------------------------------------------------------
 
+_MOVE_EDGE = re.compile(
+    r"\bMOVE\s+([A-Z][A-Z0-9-]*)(?:\s*\([^)]*\))?\s+TO\s+"
+    r"([A-Z][A-Z0-9-]*)(?:\s*\([^)]*\))?",
+    re.IGNORECASE,
+)
+_CICS_RESOURCE = re.compile(
+    r"\b(MAPSET|MAP|QUEUE|FILE|TRANSID)\s*\(\s*['\"]?([A-Z0-9$#@-]+)",
+    re.IGNORECASE,
+)
+
+
+def _semantic_program_roots(query: Any) -> list[tuple[str, Path]]:
+    root = find_final_scripts_root()
+    if root is None:
+        return []
+    programs = tuple(dict.fromkeys(
+        str(value).upper() for value in (query.programs or ()) if value
+    )) or ((str(query.program).upper(),) if query.program else ())
+    found: list[tuple[str, Path]] = []
+    for program in programs:
+        program_root = find_program_artifact_root(root, program)
+        if program_root is not None:
+            found.append((program, program_root))
+    return found
+
+
+def _semantic_filters(query: Any, field: str) -> list[tuple[str, tuple[str, ...]]]:
+    return [
+        (operator, tuple(values))
+        for name, operator, values in query.filters
+        if name == field
+    ]
+
+
+def _filter_value(value: str, predicates: Sequence[tuple[str, Sequence[str]]]) -> bool:
+    normalized = str(value or "").upper()
+    for operator, values in predicates:
+        wanted = {str(item).upper() for item in values}
+        if operator in {"eq", "in"} and normalized not in wanted:
+            return False
+        if operator in {"neq", "not_in"} and normalized in wanted:
+            return False
+        if operator == "contains" and not any(item in normalized for item in wanted):
+            return False
+    return True
+
+
+def _semantic_lineage_answer(query: Any, program: str, root: Path) -> str | None:
+    payload = _read_json(_artifact_path(root, "dataflow.used_variables.json")) or {}
+    records = [item for item in payload.get("variables", []) if isinstance(item, dict)]
+    by_name = {str(item.get("variable") or "").upper(): item for item in records}
+    source = str(query.source_entity or (query.entity_values[0] if query.entity_values else "")).upper()
+    target = str(query.target_entity or "").upper()
+    if not source or source not in by_name:
+        return None
+
+    edges: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    seen_sites: set[tuple[int, str]] = set()
+    for record in records:
+        evidence = record.get("evidence") or {}
+        for bucket in ("write_sites", "read_sites", "read_write_sites"):
+            for site in evidence.get(bucket) or []:
+                statement = " ".join(str(site.get("statement") or "").split())
+                line = int(site.get("line_start") or -1)
+                key = (line, statement.upper())
+                if key in seen_sites:
+                    continue
+                seen_sites.add(key)
+                match = _MOVE_EDGE.search(statement)
+                if not match:
+                    continue
+                origin, destination = match.group(1).upper(), match.group(2).upper()
+                edges.setdefault(origin, []).append((destination, site))
+
+    queue: list[tuple[str, list[tuple[str, str, dict[str, Any]]]]] = [(source, [])]
+    visited = {source}
+    terminal_paths: list[list[tuple[str, str, dict[str, Any]]]] = []
+    selected: list[tuple[str, str, dict[str, Any]]] | None = None
+    while queue:
+        node, path = queue.pop(0)
+        if len(path) >= 8:
+            continue
+        for destination, site in edges.get(node, []):
+            next_path = [*path, (node, destination, site)]
+            if target and destination == target:
+                selected = next_path
+                queue.clear()
+                break
+            destination_record = by_name.get(destination) or {}
+            origin = str(destination_record.get("origin") or "")
+            if not target and (
+                origin.upper().startswith("COPY:")
+                or not edges.get(destination)
+            ):
+                terminal_paths.append(next_path)
+            if destination not in visited:
+                visited.add(destination)
+                queue.append((destination, next_path))
+    if selected is None and target:
+        return (
+            f"No direct MOVE path from {source} to {target} is recorded in {program}.\n"
+            "Source: `dataflow.used_variables.json`."
+        )
+    if selected is None and terminal_paths:
+        terminal_paths.sort(key=lambda path: (
+            0 if str((by_name.get(path[-1][1]) or {}).get("origin") or "").upper().startswith("COPY:") else 1,
+            len(path),
+        ))
+        selected = terminal_paths[0]
+    if not selected:
+        return None
+    destination = selected[-1][1]
+    title = f"Direct MOVE path from {source} to {target or destination} in {program}:"
+    lines = [title]
+    for index, (origin, destination, site) in enumerate(selected, start=1):
+        lines.append(
+            f"- hop {index}: {origin} -> {destination} in "
+            f"{site.get('paragraph') or 'unknown paragraph'}, line "
+            f"{site.get('line_start') or '?'}: `{str(site.get('statement') or '').strip()}`"
+        )
+    final_origin = str((by_name.get(destination) or {}).get("origin") or "")
+    if final_origin:
+        lines.append(f"- Terminal recorded origin: {final_origin}.")
+    lines.append("Source: `dataflow.used_variables.json`.")
+    return "\n".join(lines)
+
+
+def _semantic_paragraph_answer(query: Any, program: str, root: Path) -> str | None:
+    paragraphs = [
+        value for value in query.entity_values
+        if value and value not in {program}
+    ]
+    paragraph = paragraphs[0] if paragraphs else None
+    paragraph_filters = _semantic_filters(query, "paragraph")
+    if not paragraph and paragraph_filters:
+        paragraph = paragraph_filters[0][1][0] if paragraph_filters[0][1] else None
+    if not paragraph:
+        return None
+    paragraph = paragraph.upper()
+    fields = set(query.fields) or {"body"}
+    lines: list[str] = [f"{paragraph} in {program}:"]
+    if "body" in fields or "exact_statement" in fields:
+        source_records = [
+            item for item in _read_source_lines(root, program)
+            if str(item.get("paragraph") or "").upper() == paragraph
+            and not item.get("is_blank") and not item.get("is_comment")
+        ]
+        if source_records:
+            lines.append("Statements:")
+            lines.extend(
+                f"- line {item.get('line')}: `{str(item.get('normalized') or item.get('text') or '').strip()}`"
+                for item in source_records
+            )
+    graph = _read_json(_artifact_path(root, "controlflow.cfg.json")) or {}
+    edges = [item for item in graph.get("edges", []) if isinstance(item, dict)]
+    if "outgoing_edges" in fields or query.direction == "outgoing":
+        outgoing = [item for item in edges if str(item.get("from") or "").upper() == paragraph]
+        lines.append("Outgoing transfers:")
+        lines.extend(_render_control_flow_edge(item, "outgoing") for item in outgoing)
+        if not outgoing:
+            lines.append("- none recorded")
+    if "incoming_edges" in fields or query.direction == "incoming":
+        incoming = [item for item in edges if str(item.get("to") or "").upper() == paragraph]
+        lines.append("Incoming references:")
+        lines.extend(_render_control_flow_edge(item, "incoming") for item in incoming)
+        if not incoming:
+            lines.append("- none recorded")
+    lines.append("Sources: `program.source_lines.jsonl`, `controlflow.cfg.json`.")
+    return "\n".join(lines) if len(lines) > 2 else None
+
+
+def _semantic_condition_answer(query: Any, program: str, root: Path) -> str | None:
+    variables = [value for value in query.entity_values if value != program]
+    variable_filters = _semantic_filters(query, "condition_variable")
+    variable = (variables[0] if variables else (
+        variable_filters[0][1][0] if variable_filters and variable_filters[0][1] else ""
+    )).upper()
+    value_filters = _semantic_filters(query, "condition_value")
+    wanted_values = {
+        value.strip("'\"").upper()
+        for _, values in value_filters for value in values
+    }
+    if not variable:
+        return None
+
+    def condition_is_possible(condition: str) -> bool:
+        """Reject a negated OR made false by the requested equality itself."""
+        if not wanted_values:
+            return True
+        upper = " ".join(condition.upper().split())
+        if not upper.startswith("NOT ("):
+            return True
+        inner = upper[5:-1] if upper.endswith(")") else upper[5:]
+        if " OR " not in inner:
+            return True
+        return not any(
+            re.search(
+                rf"(?<![A-Z0-9-]){re.escape(variable)}\s*=\s*['\"]?"
+                rf"{re.escape(value)}['\"]?(?![A-Z0-9-])",
+                inner,
+                re.I,
+            )
+            for value in wanted_values
+        )
+
+    def normalized_condition(condition: str) -> str:
+        normalized = re.sub(r"^\s*IF\s+", "", condition, flags=re.I)
+        normalized = re.sub(r"\s+THEN\s*$", "", normalized, flags=re.I)
+        return re.sub(r"[^A-Z0-9='\"-]+", " ", normalized.upper()).strip()
+
+    matches: list[dict[str, Any]] = []
+    decision_paths = [
+        path
+        for directory_name in ("business_rule", "condition_outcome")
+        for path in sorted((root / directory_name).glob("*.json"))
+        if (root / directory_name).exists()
+    ]
+    for path in decision_paths:
+        payload = _read_json(path) or {}
+        content = payload.get("content") or {}
+        condition = str(content.get("condition") or "")
+        if variable not in condition.upper():
+            continue
+        if wanted_values and not any(
+            re.search(rf"(?<![A-Z0-9-])['\"]?{re.escape(value)}['\"]?(?![A-Z0-9-])", condition, re.I)
+            for value in wanted_values
+        ):
+            continue
+        if not condition_is_possible(condition):
+            continue
+        evidence = content.get("evidence") or {}
+        matches.append({
+            "condition": condition,
+            "action": content.get("action"),
+            "paragraph": content.get("scope") or evidence.get("from"),
+            "line": evidence.get("line_start"),
+            "statement": evidence.get("raw_evidence"),
+            "source": path.name,
+        })
+
+    # Business-rule extraction intentionally omits some technical compound
+    # conditions. Complete the decision projection from exact control sites and
+    # the immediately governed source statements instead of returning a partial
+    # rule list.
+    variables_payload = _read_json(_artifact_path(root, "dataflow.used_variables.json")) or {}
+    record = next((
+        item for item in variables_payload.get("variables", [])
+        if isinstance(item, dict) and str(item.get("variable") or "").upper() == variable
+    ), None)
+    main_lines = [
+        item for item in _read_source_lines(root, program)
+        if str(item.get("source_file") or "").upper() == f"{program}.CBL"
+    ]
+    line_by_number = {int(item.get("line") or -1): item for item in main_lines}
+    if record:
+        for site in (record.get("evidence") or {}).get("control_sites") or []:
+            line = int(site.get("line_start") or -1)
+            statement = " ".join(str(site.get("statement") or "").split())
+            if line < 0 or variable not in statement.upper():
+                continue
+            if wanted_values and not any(
+                re.search(rf"['\"]?{re.escape(value)}['\"]?", statement, re.I)
+                for value in wanted_values
+            ):
+                continue
+            if not condition_is_possible(statement):
+                continue
+            same_paragraph_conditions = [
+                str(item.get("condition") or "")
+                for item in matches
+                if str(item.get("paragraph") or "").upper()
+                == str(site.get("paragraph") or "").upper()
+            ]
+            raw_condition = normalized_condition(statement)
+            if any(
+                raw_condition
+                and (
+                    normalized_condition(existing).startswith(raw_condition)
+                    or raw_condition.startswith(normalized_condition(existing))
+                )
+                for existing in same_paragraph_conditions
+            ):
+                continue
+            governed: list[str] = []
+            for offset in range(1, 5):
+                following = line_by_number.get(line + offset)
+                if not following or str(following.get("paragraph") or "").upper() != str(site.get("paragraph") or "").upper():
+                    break
+                text = " ".join(str(following.get("normalized") or following.get("text") or "").split())
+                if re.match(r"^(?:IF|EVALUATE|WHEN)\b", text, re.I):
+                    break
+                if text and text.upper() != "SKIP1":
+                    governed.append(f"line {line + offset}: `{text}`")
+                if text.endswith("."):
+                    break
+            key = (str(site.get("paragraph") or ""), line)
+            if any((str(item.get("paragraph") or ""), int(item.get("line") or -1)) == key for item in matches):
+                continue
+            matches.append({
+                "condition": statement,
+                "action": "; ".join(governed) or "no governed statement captured",
+                "paragraph": site.get("paragraph"),
+                "line": line,
+                "statement": statement,
+                "source": "dataflow.used_variables.json + program.source_lines.jsonl",
+            })
+    unique_matches: list[dict[str, Any]] = []
+    seen_matches: set[tuple[str, str, str, int]] = set()
+    for item in matches:
+        key = (
+            str(item.get("paragraph") or "").upper(),
+            normalized_condition(str(item.get("condition") or "")),
+            str(item.get("action") or "").upper(),
+            int(item.get("line") or -1),
+        )
+        if key in seen_matches:
+            continue
+        seen_matches.add(key)
+        unique_matches.append(item)
+    matches = unique_matches
+    if not matches:
+        return (
+            f"No direct condition outcome for {variable}"
+            + (f" with value(s) {', '.join(sorted(wanted_values))}" if wanted_values else "")
+            + f" is recorded in {program}."
+        )
+    matches.sort(key=lambda item: int(item.get("line") or 10**9))
+    lines = [f"Direct condition outcomes for {variable} in {program} ({len(matches)}):"]
+    for item in matches:
+        lines.append(
+            f"- {item.get('paragraph')}, line {item.get('line')}: "
+            f"if `{item.get('condition')}`, then {item.get('action')}."
+        )
+    lines.append("Sources: `business_rule/`, `dataflow.used_variables.json`, `program.source_lines.jsonl`.")
+    return "\n".join(lines)
+
+
+def _semantic_call_answer(query: Any, roots: Sequence[tuple[str, Path]]) -> str | None:
+    target_names = {
+        value for value in query.entity_values
+        if value not in {program for program, _ in roots}
+    }
+    type_filters = _semantic_filters(query, "call_type")
+    paragraph_filters = _semantic_filters(query, "paragraph")
+    lines: list[str] = []
+    for program, root in roots:
+        payload = _read_json(_artifact_path(root, "architecture.call_parameters.json")) or {}
+        calls = [item for item in payload.get("calls", []) if isinstance(item, dict)]
+        if target_names:
+            calls = [item for item in calls if str(item.get("target") or "").upper() in target_names]
+        if type_filters:
+            def call_type(item: dict[str, Any]) -> str:
+                value = str(item.get("call_type") or "").upper()
+                return {"CICSLINK": "LINK", "CICSXCTL": "XCTL"}.get(value, value)
+            calls = [item for item in calls if _filter_value(call_type(item), type_filters)]
+        if paragraph_filters:
+            calls = [item for item in calls if _filter_value(str(item.get("paragraph") or ""), paragraph_filters)]
+        lines.append(f"{program} matching calls ({len(calls)}):")
+        for item in calls:
+            details = [str(item.get("call_type") or "unknown type")]
+            if not query.fields or "paragraph" in query.fields:
+                details.append(f"paragraph {item.get('paragraph') or '?'}")
+            if not query.fields or "source_line" in query.fields:
+                details.append(f"line {item.get('line_start') or '?'}")
+            if "parameters" in query.fields or "commarea" in query.fields or not query.fields:
+                parameters = ", ".join(str(value) for value in item.get("parameters") or []) or "none"
+                details.append(f"parameters {parameters}")
+                if item.get("commarea"):
+                    details.append(f"COMMAREA {item['commarea']}")
+            lines.append(f"- {item.get('target')}: " + "; ".join(details))
+    lines.append("Source: `architecture.call_parameters.json` per program.")
+    return "\n".join(lines) if len(lines) > 1 else None
+
+
+def _semantic_cics_answer(query: Any, program: str, root: Path) -> str | None:
+    payload = _read_json(_artifact_path(root, "architecture.cics_operations.json")) or {}
+    operations = [
+        item for item in (payload.get("content") or {}).get("operations", [])
+        if isinstance(item, dict)
+    ]
+    command_filters = _semantic_filters(query, "command")
+    paragraph_filters = _semantic_filters(query, "paragraph")
+    resource_type_filters = _semantic_filters(query, "resource_type")
+    resource_name_filters = _semantic_filters(query, "resource_name")
+    if command_filters:
+        operations = [item for item in operations if _filter_value(str(item.get("command") or ""), command_filters)]
+    if paragraph_filters:
+        operations = [item for item in operations if _filter_value(str(item.get("paragraph") or ""), paragraph_filters)]
+    rows: list[tuple[dict[str, Any], list[tuple[str, str]]]] = []
+    for item in operations:
+        resources = _operation_resources(item)
+        if resource_type_filters and not any(_filter_value(kind, resource_type_filters) for kind, _ in resources):
+            continue
+        if resource_name_filters and not any(_filter_value(name, resource_name_filters) for _, name in resources):
+            continue
+        rows.append((item, resources))
+    requested_types = {value.upper() for value in query.entity_types}
+    if requested_types & {"MAP", "MAPSET", "QUEUE"} or set(query.fields) & {"map", "mapset", "queue", "resource_name", "resource_type"}:
+        kinds = {value.upper() for value in query.entity_types if value.upper() in {"MAP", "MAPSET", "QUEUE"}}
+        if not kinds:
+            kinds = {value.upper() for value in query.fields if value.upper() in {"MAP", "MAPSET", "QUEUE"}}
+        resources = sorted({
+            (
+                kind,
+                name,
+                str(item.get("paragraph") or "?"),
+                item.get("line_start"),
+                str(item.get("statement") or ""),
+            )
+            for item, item_resources in rows for kind, name in item_resources
+            if not kinds or kind in kinds
+        })
+        lines = [f"CICS resources in {program} ({len(resources)}):"]
+        for kind, name, paragraph, line, statement in resources:
+            details = [f"{kind} {name}"]
+            if not query.fields or "paragraph" in query.fields:
+                details.append(f"paragraph {paragraph}")
+            if not query.fields or "source_line" in query.fields:
+                details.append(f"line {line}")
+            rendered = "; ".join(details)
+            if not query.fields or "exact_statement" in query.fields:
+                rendered += f": `{statement}`"
+            lines.append(f"- {rendered}")
+    else:
+        lines = [f"Matching CICS operations in {program} ({len(rows)}):"]
+        lines.extend(
+            f"- {item.get('command')} in {item.get('paragraph')}, line {item.get('line_start')}: `{item.get('statement')}`"
+            for item, _ in rows
+        )
+    lines.append("Source: `architecture.cics_operations.json`.")
+    return "\n".join(lines)
+
+
+def _semantic_metrics_answer(query: Any, roots: Sequence[tuple[str, Path]]) -> str | None:
+    fields = set(query.fields)
+    if fields & {"paragraph", "paragraph_count"}:
+        paragraph_answers = [
+            answer for program, root in roots
+            if (answer := _render_paragraph_counts(program, root))
+        ]
+        remaining = fields - {"paragraph", "paragraph_count"}
+        if not remaining:
+            return "\n\n".join(paragraph_answers) if paragraph_answers else None
+    else:
+        paragraph_answers = []
+    lines: list[str] = []
+    for program, root in roots:
+        summary = _read_json(_artifact_path(root, "program.summary.json")) or {}
+        meta = summary.get("meta") or {}
+        comments = _read_json(_artifact_path(root, "program.comments.json")) or {}
+        metrics = comments.get("metrics") or {}
+        values: list[str] = []
+        if "physical_line_count" in fields:
+            physical = metrics.get("total_lines")
+            if physical is not None:
+                values.append(f"physical source lines {physical}")
+        elif not fields or "line_count" in fields:
+            physical = metrics.get("total_lines")
+            if physical is not None:
+                values.append(f"physical source lines {physical}")
+            if meta.get("loc") is not None:
+                values.append(f"MAPA LOC {meta['loc']}")
+        if "statement_count" in fields:
+            values.append(f"executable statements {meta.get('statements', 'not recorded')}")
+        if values:
+            lines.append(f"- {program}: " + "; ".join(values))
+    if lines:
+        lines.append("Sources: `program.summary.json`, `program.comments.json` per program.")
+    blocks = (["\n".join(lines)] if lines else []) + paragraph_answers
+    return "\n\n".join(blocks) if blocks else None
+
+
+def _semantic_quality_answer(query: Any, program: str, root: Path) -> str | None:
+    paragraph_filters = _semantic_filters(query, "paragraph")
+    paragraph = paragraph_filters[0][1][0] if paragraph_filters and paragraph_filters[0][1] else None
+    if not paragraph:
+        paragraphs = [value for value in query.entity_values if value != program]
+        paragraph = paragraphs[0] if paragraphs else None
+    tasks = set(query.fields)
+    if paragraph and ("body" in tasks or "exact_statement" in tasks or "statement" in query.entity_types):
+        payload = _read_json(_artifact_path(root, "program.comments.json")) or {}
+        comments = [
+            item for item in payload.get("comments", [])
+            if isinstance(item, dict)
+            and str(item.get("paragraph") or "").upper() == paragraph.upper()
+            and str(item.get("classification") or "") == "commented_out_code"
+        ]
+        lines = [f"Commented-out COBOL statements in {paragraph} ({program}) ({len(comments)}):"]
+        lines.extend(
+            f"- line {item.get('line')}: `{item.get('normalized_text') or item.get('text')}`"
+            for item in comments
+        )
+        lines.append("Source: `program.comments.json`.")
+        return "\n".join(lines)
+    categories = tuple(
+        value for value in ("commented_code", "unreachable_code", "unused_copybooks", "review_copybooks")
+        if not tasks or value in tasks
+    )
+    return answer_unused_code(program, categories)
+
+
+def answer_semantic_projection(query: Any) -> str | None:
+    """Execute the planner's canonical QuerySpec without re-reading English."""
+    roots = _semantic_program_roots(query)
+    if not roots:
+        return None
+    program, root = roots[0]
+    capability = query.capability
+    if capability in {"variable_lineage", "screen_lineage"} and query.operator == "traverse":
+        return _semantic_lineage_answer(query, program, root)
+    if capability == "paragraph_evidence":
+        return _semantic_paragraph_answer(query, program, root)
+    if capability == "condition_outcome":
+        return _semantic_condition_answer(query, program, root)
+    if capability == "call_evidence":
+        program_names = {name for name, _ in roots}
+        constrained_targets = {
+            value for value in query.entity_values if value not in program_names
+        }
+        if len(roots) > 1 and query.relation and not constrained_targets:
+            return answer_program_comparison(
+                tuple(name for name, _ in roots), "call_evidence", query.relation,
+                query.subject_program,
+            )
+        return _semantic_call_answer(query, roots)
+    if capability == "cics_evidence":
+        if len(roots) > 1 and query.relation:
+            return answer_program_comparison(
+                tuple(name for name, _ in roots), "cics_evidence", query.relation,
+                query.subject_program,
+            )
+        return _semantic_cics_answer(query, program, root)
+    if capability == "copybook_evidence" and len(roots) > 1 and query.relation:
+        return answer_program_comparison(
+            tuple(name for name, _ in roots), "copybook_evidence", query.relation,
+            query.subject_program,
+        )
+    if capability == "db2_evidence" and len(roots) > 1 and query.relation:
+        return answer_program_comparison(
+            tuple(name for name, _ in roots), "db2_table_evidence", query.relation,
+            query.subject_program,
+        )
+    if capability == "source_metrics":
+        return _semantic_metrics_answer(query, roots)
+    if capability == "quality_evidence":
+        return _semantic_quality_answer(query, program, root)
+    return None
+
+
 def _graph_payload(program: str | None) -> dict[str, Any] | None:
     if not program:
         return None
@@ -4159,6 +5067,30 @@ def answer_qualified_inventory(
         lines.append("Source: `architecture.cics_operations.json`.")
         return "\n".join(lines)
 
+    if entity_type in {"map", "mapset"}:
+        operations = _cics_operations(program_root)
+        pattern = _CICS_MAP_NAME_ONLY if entity_type == "map" else _MAPSET_NAME
+        selected: list[tuple[str, dict[str, Any]]] = []
+        for operation in operations:
+            if in_paragraph and str(operation.get("paragraph") or "").upper() != in_paragraph:
+                continue
+            statement = str(operation.get("statement") or "")
+            selected.extend((match.group(1).upper(), operation) for match in pattern.finditer(statement))
+        if not selected:
+            where = f" in {in_paragraph}" if in_paragraph else ""
+            return (
+                f"No {entity_type} reference is recorded in {program}{where}.\n"
+                "Source: `architecture.cics_operations.json`."
+            )
+        lines = [f"{entity_type.capitalize()} references in {program}" + (f" / {in_paragraph}:" if in_paragraph else ":")]
+        for name, operation in selected:
+            lines.append(
+                f"- {name}: {operation.get('command')} in {operation.get('paragraph')} "
+                f"line {operation.get('line_start')}: `{operation.get('statement')}`"
+            )
+        lines.append("Source: `architecture.cics_operations.json`.")
+        return "\n".join(lines)
+
     if entity_type == "variable" and in_paragraph:
         # The reverse join. Evidence is recorded per variable, so a question
         # about one paragraph had to be answered by scanning every variable --
@@ -4454,7 +5386,12 @@ def corpus_entity_names() -> tuple[str, ...]:
     return tuple(sorted(name for name in names if name))
 
 
-def answer_unused_code(program: str) -> str | None:
+def answer_unused_code(
+    program: str,
+    categories: Sequence[str] = (
+        "commented_code", "unreachable_code", "unused_copybooks", "review_copybooks",
+    ),
+) -> str | None:
     """Everything the analysis can show as unused, in one answer.
 
     "Is there unused code or copy" is one question about three artifacts:
@@ -4469,6 +5406,7 @@ def answer_unused_code(program: str) -> str | None:
     if program_root is None:
         return None
 
+    requested = set(categories)
     sections: list[str] = []
     caveats: list[str] = []
 
@@ -4477,17 +5415,17 @@ def answer_unused_code(program: str) -> str | None:
     ).get("content") or {}
     reachability = dead.get("cfg_reachability") or {}
     unreachable = reachability.get("unreachable_nodes") or []
-    if unreachable:
+    if "unreachable_code" in requested and unreachable:
         sections.append(
             f"Paragraphs no recorded edge reaches ({len(unreachable)} of "
             f"{reachability.get('nodes_count')}):\n"
             + "\n".join(f"- {name}" for name in sorted(unreachable))
         )
-    elif reachability.get("status") == "computed_from_controlflow_cfg":
+    elif "unreachable_code" in requested and reachability.get("status") == "computed_from_controlflow_cfg":
         sections.append("Every paragraph is reached by at least one recorded edge.")
 
     commented = dead.get("commented_out_code") or []
-    if commented:
+    if "commented_code" in requested and commented:
         shown = commented[:8]
         body = "\n".join(
             f"- line {item.get('line')}: `{str(item.get('text') or item.get('statement') or '').strip()[:70]}`"
@@ -4502,31 +5440,36 @@ def answer_unused_code(program: str) -> str | None:
     ).get("content") or {}
     proven = unused.get("unused_copybooks_proven") or []
     review = unused.get("needs_review_copybooks") or []
-    if proven:
+    if "unused_copybooks" in requested and proven:
         sections.append(
             f"Copybooks proven unused ({len(proven)}):\n"
             + "\n".join(f"- {name}" for name in proven)
         )
-    else:
+    elif "unused_copybooks" in requested:
         sections.append("No copybook is proven unused by the available artifacts.")
-    if review:
+    if "review_copybooks" in requested and review:
         sections.append(
             f"Copybooks needing review ({len(review)}):\n"
             + "\n".join(f"- {name}" for name in review)
         )
-    if unused.get("proof_level"):
+    if requested & {"unused_copybooks", "review_copybooks"} and unused.get("proof_level"):
         caveats.append(str(unused["proof_level"]))
-    for note in (dead.get("limitations") or [])[:2]:
-        caveats.append(str(note))
+    if requested & {"commented_code", "unreachable_code"}:
+        for note in (dead.get("limitations") or [])[:2]:
+            caveats.append(str(note))
 
     if not sections:
         return None
-    answer = f"Unused code and copybooks in {program}:\n\n" + "\n\n".join(sections)
+    subject = "Unused-code evidence" if requested != {"unused_copybooks", "review_copybooks"} else "Unused copybook evidence"
+    answer = f"{subject} in {program}:\n\n" + "\n\n".join(sections)
     if caveats:
         answer += "\n\nScope: " + " ".join(dict.fromkeys(caveats))
-    answer += (
-        "\nSource: `quality.dead_code.json`, `architecture.unused_copybooks.json`."
-    )
+    source_names: list[str] = []
+    if requested & {"commented_code", "unreachable_code"}:
+        source_names.append("`quality.dead_code.json`")
+    if requested & {"unused_copybooks", "review_copybooks"}:
+        source_names.append("`architecture.unused_copybooks.json`")
+    answer += "\nSource: " + ", ".join(source_names) + "."
     return answer
 
 

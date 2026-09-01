@@ -66,12 +66,93 @@ class SetRelation:
     """A set operation over the same entity type in several programs."""
 
     programs: tuple[str, ...]
-    relation: str                    # intersection | difference | union | comparison
+    relation: str                    # intersection | difference | symmetric_difference | union | comparison
     entity_type: str | None = None
 
     @property
     def kind(self) -> str:
         return "set_relation"
+
+
+@dataclass(frozen=True)
+class EntityMembership:
+    """Presence and recorded fields of one named entity across programs."""
+
+    programs: tuple[str, ...]
+    entity: str
+    entity_type: str
+    fields: tuple[str, ...] = ("exists",)
+
+    @property
+    def kind(self) -> str:
+        return "entity_membership"
+
+
+@dataclass(frozen=True)
+class ScalarComparison:
+    """Compare one scalar metric with an explicit meaning across programs."""
+
+    programs: tuple[str, ...]
+    metric: str
+
+    @property
+    def kind(self) -> str:
+        return "scalar_comparison"
+
+
+@dataclass(frozen=True)
+class AccessProjection:
+    """Variables accessed in one paragraph, restricted by operand role."""
+
+    program: str
+    paragraph: str
+    access_kind: str                 # read | write | read_write | all
+
+    @property
+    def kind(self) -> str:
+        return "access_projection"
+
+
+@dataclass(frozen=True)
+class TemporalProjection:
+    """A source-backed fact immediately before or after a named anchor."""
+
+    program: str
+    anchor: str
+    anchor_type: str                 # call | source_address
+    direction: str                   # before | after
+    projection: str = "statement"   # statement | condition
+
+    @property
+    def kind(self) -> str:
+        return "temporal_projection"
+
+
+@dataclass(frozen=True)
+class SemanticProjection:
+    """Executable query meaning supplied by the semantic planner.
+
+    Unlike the legacy compiler, this object never infers roles or filters from
+    wording. Exact names have already been grounded by scope resolution.
+    """
+
+    programs: tuple[str, ...]
+    program: str | None
+    operator: str
+    capability: str
+    entity_types: tuple[str, ...] = ()
+    entity_values: tuple[str, ...] = ()
+    fields: tuple[str, ...] = ()
+    relation: str | None = None
+    subject_program: str | None = None
+    direction: str | None = None
+    source_entity: str | None = None
+    target_entity: str | None = None
+    filters: tuple[tuple[str, str, tuple[str, ...]], ...] = ()
+
+    @property
+    def kind(self) -> str:
+        return "semantic_projection"
 
 
 @dataclass(frozen=True)
@@ -137,9 +218,17 @@ class CopybookRole:
 
 @dataclass(frozen=True)
 class UnusedCode:
-    """Everything unused in one program: paragraphs, copybooks, commented code."""
+    """Requested quality-evidence categories for one program.
+
+    Plain ``unused code`` means inactive/commented code plus static CFG
+    reachability candidates.  Copybook usage is a separate evidence family and
+    is included only when the plan explicitly asks for it.
+    """
 
     program: str
+    categories: tuple[str, ...] = (
+        "commented_code", "unreachable_code",
+    )
 
     @property
     def kind(self) -> str:
@@ -163,7 +252,8 @@ class CorpusReferences:
 
 
 Query = (
-    GraphEdges | GraphPredicate | SetRelation | FieldProjection | ScreenField
+    GraphEdges | GraphPredicate | SetRelation | EntityMembership | ScalarComparison
+    | AccessProjection | TemporalProjection | SemanticProjection | FieldProjection | ScreenField
     | Inventory | CopybookRole | CorpusReferences | UnusedCode
 )
 
@@ -241,7 +331,8 @@ _PURPOSE_QUESTION = re.compile(
 
 
 ENTITY_TYPE_NAMES: tuple[str, ...] = (
-    "paragraph", "variable", "copybook", "call", "map", "mapset", "field", "program",
+    "paragraph", "variable", "copybook", "call", "map", "mapset", "table",
+    "field", "program",
 )
 
 
@@ -285,6 +376,9 @@ def _relation_between(question: str, first_end: int, second_start: int) -> str |
     tail = question[second_start:]
     boundary = re.search(r"[.?!;]", tail)
     span = question[first_end : second_start + (boundary.end() if boundary else len(tail))]
+    whole = question.lower()
+    if re.search(r"\b(?:exactly|only)\s+(?:one|1)\b", whole):
+        return "symmetric_difference"
     if _NEGATION.search(span):
         return "difference"
     if re.search(r"(?<![a-z])(?:both|and|same|also|shared|common)(?![a-z])", span, re.I):
@@ -314,7 +408,10 @@ _PROPERTY_FILTERS: tuple[tuple[str, str], ...] = (
 _OPERATION_WORD = re.compile(
     r"(?<![a-z])(?:cics\s+)?(?:command|operation|statement)s?(?![a-z])", re.I
 )
-_CALL_WORD = re.compile(r"(?<![a-z])(?:call|link|xctl)s?(?![a-z])", re.I)
+_CALL_WORD = re.compile(
+    r"(?<![a-z])(?:call(?:s|ed|ing)?|link(?:s|ed|ing)?|xctl)(?![a-z])",
+    re.I,
+)
 
 
 def property_filter_named(question: str) -> str | None:
@@ -322,6 +419,22 @@ def property_filter_named(question: str) -> str | None:
         if re.search(pattern, question, re.I):
             return field
     return None
+
+
+def unused_categories_named(question: str) -> tuple[str, ...]:
+    """Which quality evidence families the subject of the question permits."""
+    copybook_requested = entity_type_named(question) == "copybook"
+    code_requested = bool(re.search(r"(?<![a-z])(?:unused|dead)\s+code(?![a-z])", question, re.I))
+    if copybook_requested and not code_requested:
+        return ("unused_copybooks", "review_copybooks")
+    if re.search(r"(?<![a-z])unreachable(?![a-z])", question, re.I):
+        return ("unreachable_code",)
+    if re.search(r"(?<![a-z])comment(?:ed)?(?![a-z])", question, re.I):
+        return ("commented_code",)
+    code_categories = UnusedCode("").categories
+    if copybook_requested:
+        return (*code_categories, "unused_copybooks", "review_copybooks")
+    return code_categories
 
 
 
@@ -382,6 +495,7 @@ def compile_query(
     programs: Sequence[str] = (),
     paragraphs: Sequence[str] = (),
     variables: Sequence[str] = (),
+    calls: Sequence[str] = (),
     graph_nodes: Sequence[str] = (),
     screen_fields: Sequence[str] = (),
     copybooks: Sequence[str] = (),
@@ -389,6 +503,10 @@ def compile_query(
     capability: str | None = None,
     entity_type: str | None = None,
     inherited_entity_type: str | None = None,
+    output_fields: Sequence[str] = (),
+    operations: Sequence[str] = (),
+    quality_categories: Sequence[str] = (),
+    query_spec: Any = None,
     allow_inventory: bool = False,
 ) -> Query | None:
     """Compile a question into a typed query, or None to leave it alone.
@@ -397,31 +515,50 @@ def compile_query(
     answers keeps its current path; this adds the shapes that had none.
     """
     named_programs = tuple(dict.fromkeys(p for p in programs if p))
+    requested_fields = tuple(dict.fromkeys(str(value) for value in output_fields if value))
+    requested_operations = {str(value) for value in operations if value}
+    requested_quality = tuple(dict.fromkeys(
+        str(value) for value in quality_categories
+        if str(value) in {
+            "commented_code", "unreachable_code", "unused_copybooks", "review_copybooks",
+        }
+    ))
 
-    # What the router judged the question to mean, decided by comparing it with
-    # each capability's description rather than with a list of phrasings. It
-    # leads; the patterns below only fill in a query's fields or stand in when
-    # the router had no confident view.
-    if capability == "unused_code" and program:
-        return UnusedCode(program=program)
-    if capability == "copybook_role" and program and copybooks:
-        upper = question.upper()
-        for name in sorted({str(c).upper() for c in copybooks}, key=len, reverse=True):
-            if re.search(rf"(?<![A-Z0-9-]){re.escape(name)}(?![A-Z0-9-])", upper):
-                return CopybookRole(program=program, copybook=name)
-    if capability == "screen_field" and program and screen_fields:
-        upper = question.upper()
-        for name in sorted({str(f).upper() for f in screen_fields}, key=len, reverse=True):
-            if re.search(rf"(?<![A-Z0-9-]){re.escape(name)}(?![A-Z0-9-])", upper):
-                return ScreenField(program=program, field=name)
-    if (
-        capability == "corpus_references"
-        and corpus_entity
-        and len(named_programs) < 2
-        and not _names_the_actor(question, corpus_entity)
-    ):
-        return CorpusReferences(
-            entity=corpus_entity.upper(), relation=corpus_relation_named(question)
+    # The semantic planner owns meaning. Once it emitted a validated canonical
+    # query, do not re-interpret the English and accidentally change direction,
+    # set subject, requested fields, or filters.
+    if query_spec is not None:
+        filters = tuple(
+            (item.field, item.operator, tuple(item.values))
+            for item in getattr(query_spec, "filters", ())
+        )
+        semantic_fields = tuple(query_spec.fields)
+        if query_spec.capability == "quality_evidence" and requested_quality:
+            semantic_fields = requested_quality
+        if (
+            query_spec.capability == "source_metrics"
+            and len(named_programs) > 1
+            and set(semantic_fields) & {"line_count", "physical_line_count"}
+            and query_spec.operator == "compare"
+        ):
+            return ScalarComparison(
+                programs=named_programs,
+                metric="main_source_physical_lines",
+            )
+        return SemanticProjection(
+            programs=named_programs,
+            program=program,
+            operator=query_spec.operator,
+            capability=query_spec.capability,
+            entity_types=tuple(query_spec.entity_types),
+            entity_values=tuple(query_spec.entity_values),
+            fields=semantic_fields,
+            relation=query_spec.relation,
+            subject_program=query_spec.subject_program,
+            direction=query_spec.direction,
+            source_entity=query_spec.source_entity,
+            target_entity=query_spec.target_entity,
+            filters=filters,
         )
 
     # A question about the corpus is answered from the corpus. Resolving it to
@@ -453,6 +590,54 @@ def compile_query(
             programs=named_programs,
         )
 
+    # A named entity in several programs is a membership/projection question,
+    # not a comparison of the programs' complete inventories.  The entity comes
+    # from the corpus registry, so this works for every registered name rather
+    # than for a list of question phrasings.
+    membership_entity = None
+    membership_type = None
+    # `copybooks` is the program catalogue used to recognize names in natural
+    # language; it is not a list of entities named by this question.  Treating
+    # the whole catalogue as explicit scope made every two-program question
+    # about the alphabetically first copybook (usually DFHAID).  Membership is
+    # valid only when the identifier actually occurs in the current message.
+    upper_question = question.upper()
+    explicit_copybooks = tuple(
+        name
+        for name in (str(value).upper() for value in copybooks)
+        if re.search(
+            rf"(?<![A-Z0-9-]){re.escape(name)}(?![A-Z0-9-])",
+            upper_question,
+        )
+    )
+    if variables:
+        membership_entity, membership_type = variables[0].upper(), "variable"
+    elif explicit_copybooks:
+        membership_entity, membership_type = explicit_copybooks[0], "copybook"
+    if len(named_programs) > 1 and membership_entity and not _LITERAL_QUESTION.search(question):
+        fields = ["exists"]
+        if "source_line" in requested_fields or "locate" in requested_operations:
+            fields.append("source_line")
+        if "origin" in requested_fields:
+            fields.append("origin")
+        return EntityMembership(
+            programs=named_programs,
+            entity=membership_entity,
+            entity_type=membership_type or "unknown",
+            fields=tuple(fields),
+        )
+
+    # Counts and inventories are sets; source size is a scalar with several
+    # possible meanings.  Carry the exact metric name so MAPA LOC can never be
+    # substituted for physical lines in the main source member.
+    if len(named_programs) > 1 and set(requested_fields) & {
+        "line_count", "physical_line_count",
+    }:
+        return ScalarComparison(
+            programs=named_programs,
+            metric="main_source_physical_lines",
+        )
+
     # Two programs and one entity type is a set question whatever words joined
     # them. Refusing the ones whose phrasing was unrecognised was the single
     # largest source of unanswered comparison questions.
@@ -472,8 +657,9 @@ def compile_query(
             programs=named_programs,
         )
 
+    programs_are_actors = any(_names_the_actor(question, name) for name in named_programs)
     if len(named_programs) > 1 and not _PURPOSE_QUESTION.search(question) and not (
-        corpus_entity and _CORPUS_SUBJECT.search(question)
+        corpus_entity and _CORPUS_SUBJECT.search(question) and not programs_are_actors
     ):
         where = _positions(question, named_programs)
         relation = None
@@ -481,17 +667,38 @@ def compile_query(
             ordered = sorted(where.items(), key=lambda kv: kv[1])
             first, second = ordered[0], ordered[1]
             relation = _relation_between(question, first[1] + len(first[0]), second[1])
+        comparison_type = entity_type or entity_type_named(question)
+        # "external programs called by A and B" names program-shaped results,
+        # but the compared evidence is each actor's outgoing-call set.
+        if comparison_type == "program" and _CALL_WORD.search(question):
+            comparison_type = "call"
         return SetRelation(
             programs=named_programs,
             # A two-program question with no readable relation is still
             # answerable as a comparison, which shows both sides and asserts
             # nothing the evidence does not carry.
             relation=relation or "comparison",
-            entity_type=entity_type or entity_type_named(question),
+            entity_type=comparison_type,
         )
 
     if not program:
         return None
+
+    temporal = re.search(
+        r"\b(?:immediately\s+)?(before|after|afterward|afterwards|following|next|preceding|previous)\b",
+        question,
+        re.I,
+    )
+    if temporal and calls:
+        relation = temporal.group(1).lower()
+        direction = "before" if relation in {"before", "preceding", "previous"} else "after"
+        return TemporalProjection(
+            program=program,
+            anchor=calls[0].upper(),
+            anchor_type="call",
+            direction=direction,
+            projection="condition" if _asks_for_condition(question) else "statement",
+        )
 
     # A named field that the screen artifact records is a screen question, and
     # the corpus decides that rather than the wording: the program's own list of
@@ -527,6 +734,30 @@ def compile_query(
                 projection="condition" if _asks_for_condition(question) else "all",
             )
 
+    # One named node plus a direction is a complete graph query.  Previously
+    # this shape was deliberately left to a legacy handler, which made the
+    # typed path depend on whether another planner happened to choose control
+    # flow.  Direction is grammatical: edges leave/from a source and lead/to a
+    # target.
+    if len(named_nodes) == 1 and _FLOW_RELATION.search(question):
+        node = named_nodes[0]
+        upper = question.upper()
+        position = upper.find(node)
+        before = upper[max(0, position - 40):position]
+        after = upper[position + len(node):position + len(node) + 40]
+        outgoing = bool(
+            re.search(r"(?:LEAVE|EXIT|OUTGOING|FROM|OUT OF)\s*$", before)
+            or re.search(r"\b(?:LEAVE|EXIT|OUTGOING|FROM|OUT OF)\b", after)
+            or re.search(r"\b(?:TRANSITIONS?|EDGES?|FLOW)\s+(?:LEAVE|FROM)\b", upper)
+        )
+        return GraphEdges(
+            program=program,
+            source=node if outgoing else None,
+            target=None if outgoing else node,
+            direction="outgoing" if outgoing else "incoming",
+            projection="condition" if _asks_for_condition(question) else "all",
+        )
+
     # A flow question that names no paragraph but negates the relation is
     # asking for the paragraphs the relation does not hold for.
     if not named_nodes and _FLOW_RELATION.search(question) and _NEGATION.search(question):
@@ -548,7 +779,8 @@ def compile_query(
     # from whichever the planner picked, it reported no unused copybooks while
     # proven-unreachable paragraphs sat unmentioned in the graph.
     if _UNUSED_QUESTION.search(question):
-        return UnusedCode(program=program)
+        categories = requested_quality or unused_categories_named(question)
+        return UnusedCode(program=program, categories=categories)
 
     predicate = property_filter_named(question)
     scope_paragraph = paragraph_scope(question, graph_nodes, program)
@@ -563,6 +795,17 @@ def compile_query(
     # exists to prevent, and it looks like a successful answer.
     if wanted and (predicate or scope_paragraph):
         # A paragraph that is the subject of a flow question is not a scope.
+        if scope_paragraph and wanted == "variable" and {
+            "read_sites", "write_sites"
+        } & set(requested_fields):
+            reads = "read_sites" in requested_fields
+            writes = "write_sites" in requested_fields
+            access_kind = "all" if reads and writes else "read" if reads else "write"
+            return AccessProjection(
+                program=program,
+                paragraph=scope_paragraph,
+                access_kind=access_kind,
+            )
         if not (scope_paragraph and wanted == "paragraph"):
             return Inventory(
                 program=program,
@@ -570,6 +813,17 @@ def compile_query(
                 property_filter=predicate,
                 in_paragraph=scope_paragraph,
             )
+
+    # Literal values of one named variable are the same projection whether one
+    # or several programs are named.  The earlier special case covered only the
+    # multi-program form and let a single-program question expand into the full
+    # variable lifecycle.
+    if variables and _LITERAL_QUESTION.search(question):
+        return FieldProjection(
+            program=program,
+            entity=variables[0].upper(),
+            field="literals",
+        )
 
     if allow_inventory and wanted:
         return Inventory(
@@ -635,6 +889,8 @@ def compile_queries(question: str, **context: Any) -> list[tuple[str, Query | No
     that had answered everything asked.
     """
     whole = compile_query(question, **context)
+    if context.get("query_spec") is not None:
+        return [(question, whole)] if whole else []
     parts = split_question(question)
     if len(parts) < 2:
         return [(question, whole)] if whole else []

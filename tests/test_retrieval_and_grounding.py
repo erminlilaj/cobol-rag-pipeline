@@ -681,7 +681,7 @@ class PromptGroundingTest(unittest.TestCase):
         self.assertEqual(decision.source_domains, ("dataflow.variable",))
         self.assertEqual(decision.output_fields, ("origin", "read_sites"))
         self.assertTrue(decision.requires_comparison)
-        self.assertEqual(decision.planner_source, "semantic_llm")
+        self.assertTrue(decision.planner_source.startswith("semantic_llm"))
 
     def test_router_parses_hierarchical_tasks_relations_language_and_exclusions(self) -> None:
         decision = _parse_routing_decision(json.dumps({
@@ -1298,8 +1298,187 @@ class PromptGroundingTest(unittest.TestCase):
                 preliminary_scope=QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="general"),
             )
         self.assertEqual(decision.intent, "variable_dataflow")
-        self.assertEqual(decision.planner_source, "semantic_llm")
+        self.assertTrue(decision.planner_source.startswith("semantic_llm_query_spec_missing_"))
+        self.assertIsNone(decision.query_spec)
         self.assertEqual(decision.tasks, ("variable_definition",))
+
+    def test_missing_query_spec_is_repaired_by_a_focused_semantic_pass(self) -> None:
+        outer = type("Response", (), {"text": json.dumps({
+            "route": "technical", "intent": "variable_dataflow",
+            "category": "single_source", "domain": "dataflow",
+            "tasks": ["variable_lineage"], "relations": [],
+            "operations": ["trace"], "source_domains": ["dataflow.variable"],
+            "confidence": 0.95, "reply": "",
+        })})()
+        specification = type("Response", (), {"text": json.dumps({
+            "operator": "traverse",
+            "entity_types": ["variable"],
+            "entity_values": ["WCTPAG", "NPG"],
+            "fields": ["source_line", "exact_statement"],
+            "relation": "lineage",
+            "subject_program": "PDCBVC",
+            "direction": "source_to_target",
+            "source_entity": "WCTPAG",
+            "target_entity": "NPG",
+            "filters": [],
+        })})()
+        preliminary = QueryPlan(
+            intent="variable_dataflow", program="PDCBVC", programs=("PDCBVC",),
+            tasks=("variable_lineage",), confidence=0.95,
+        )
+        with patch("cobol_rag.query.build_llm") as build:
+            build.return_value.complete.side_effect = [outer, specification]
+            decision = _route_query(
+                "Trace WCTPAG only until NPG.",
+                AppConfig(),
+                preliminary_plan=preliminary,
+                preliminary_scope=QueryScope(
+                    program="PDCBVC", programs=("PDCBVC",),
+                    intent="variable_dataflow", program_source="question",
+                    entities=(
+                        EntityReference(
+                            program="PDCBVC", entity_type="variable", value="WCTPAG",
+                            entity_key="PDCBVC|VARIABLE|WCTPAG",
+                        ),
+                        EntityReference(
+                            program="PDCBVC", entity_type="variable", value="NPG",
+                            entity_key="PDCBVC|VARIABLE|NPG",
+                        ),
+                    ),
+                ),
+            )
+        self.assertIsNotNone(decision.query_spec)
+        assert decision.query_spec is not None
+        self.assertEqual(decision.query_spec["operator"], "traverse")
+        self.assertEqual(decision.query_spec["capability"], "variable_lineage")
+        self.assertEqual(decision.query_spec["source_entity"], "WCTPAG")
+        self.assertEqual(decision.query_spec["target_entity"], "NPG")
+        self.assertEqual(decision.planner_source, "semantic_llm_query_spec_repair")
+
+    def test_inconsistent_bounded_traversal_is_retried_with_typed_feedback(self) -> None:
+        outer = type("Response", (), {"text": json.dumps({
+            "route": "technical", "intent": "variable_dataflow",
+            "category": "single_source", "domain": "dataflow",
+            "tasks": ["variable_lineage"], "relations": ["writes"],
+            "operations": ["trace"], "source_domains": ["dataflow.variable"],
+            "output_fields": ["source_line"], "confidence": 0.95, "reply": "",
+        })})()
+        incomplete = type("Response", (), {"text": json.dumps({
+            "operator": "traverse", "capability": "variable_access",
+            "entity_types": ["variable"], "entity_values": ["WCTPAG", "NPG"],
+            "fields": ["source_line"], "direction": "outgoing", "filters": [],
+        })})()
+        corrected = type("Response", (), {"text": json.dumps({
+            "operator": "traverse", "capability": "variable_lineage",
+            "entity_types": ["variable"], "entity_values": ["WCTPAG", "NPG"],
+            "fields": ["source_line"], "direction": "source_to_target",
+            "source_entity": "WCTPAG", "target_entity": "NPG", "filters": [],
+        })})()
+        preliminary = QueryPlan(
+            intent="variable_dataflow", program="PDCBVC", programs=("PDCBVC",),
+            tasks=("variable_lineage",), output_fields=("source_line",), confidence=0.95,
+        )
+        with patch("cobol_rag.query.build_llm") as build:
+            build.return_value.complete.side_effect = [outer, incomplete, corrected]
+            decision = _route_query(
+                "Trace WCTPAG to NPG.", AppConfig(), preliminary_plan=preliminary,
+                preliminary_scope=QueryScope(
+                    program="PDCBVC", programs=("PDCBVC",), intent="variable_dataflow",
+                    program_source="question", entities=(
+                        EntityReference(
+                            program="PDCBVC", entity_type="variable", value="WCTPAG",
+                            entity_key="PDCBVC|VARIABLE|WCTPAG",
+                        ),
+                        EntityReference(
+                            program="PDCBVC", entity_type="variable", value="NPG",
+                            entity_key="PDCBVC|VARIABLE|NPG",
+                        ),
+                    ),
+                ),
+            )
+        assert decision.query_spec is not None
+        self.assertEqual(decision.query_spec["capability"], "variable_lineage")
+        self.assertEqual(decision.query_spec["source_entity"], "WCTPAG")
+        self.assertEqual(decision.query_spec["target_entity"], "NPG")
+        self.assertEqual(build.return_value.complete.call_count, 3)
+
+    def test_grounded_paragraph_is_compiled_to_an_operation_filter(self) -> None:
+        outer = type("Response", (), {"text": json.dumps({
+            "route": "technical", "intent": "cics_operations",
+            "category": "single_source", "domain": "integration",
+            "tasks": ["cics_operations"], "relations": [],
+            "operations": ["describe"], "source_domains": ["architecture.cics_operations"],
+            "output_fields": ["paragraph", "source_line", "exact_statement"],
+            "confidence": 0.95, "reply": "",
+        })})()
+        specification = type("Response", (), {"text": json.dumps({
+            "operator": "describe", "capability": "cics_evidence",
+            "entity_types": ["queue"], "entity_values": ["SAVE-TWA"],
+            "fields": ["paragraph"], "filters": [],
+        })})()
+        preliminary = QueryPlan(
+            intent="cics_operations", program="PDCBVC", programs=("PDCBVC",),
+            tasks=("cics_operations",),
+            output_fields=("paragraph", "source_line", "exact_statement"),
+            only_requested_fields=True, confidence=0.95,
+        )
+        scope = QueryScope(
+            program="PDCBVC", programs=("PDCBVC",), intent="cics_operations",
+            program_source="question", entities=(EntityReference(
+                program="PDCBVC", entity_type="paragraph", value="SAVE-TWA",
+                entity_key="PDCBVC|PARAGRAPH|SAVE-TWA",
+            ),),
+        )
+        with patch("cobol_rag.query.build_llm") as build:
+            build.return_value.complete.side_effect = [outer, specification]
+            decision = _route_query(
+                "Which queue is written by SAVE-TWA? Give only the paragraph, statement, and line.",
+                AppConfig(), preliminary_plan=preliminary, preliminary_scope=scope,
+            )
+        assert decision.query_spec is not None
+        self.assertEqual(decision.query_spec["entity_values"], [])
+        self.assertEqual(decision.query_spec["fields"], [
+            "paragraph", "source_line", "exact_statement",
+        ])
+        self.assertEqual(decision.query_spec["filters"], [{
+            "field": "paragraph", "operator": "in", "values": ["SAVE-TWA"],
+        }])
+
+    def test_multi_program_relation_gets_a_focused_semantic_repair(self) -> None:
+        outer = type("Response", (), {"text": json.dumps({
+            "route": "technical", "intent": "external_programs",
+            "category": "multi_source_comparison", "domain": "integration",
+            "tasks": ["external_calls"], "relations": [],
+            "operations": ["compare"], "source_domains": ["architecture.call_parameters"],
+            "requires_comparison": True, "confidence": 0.95, "reply": "",
+        })})()
+        incomplete = type("Response", (), {"text": json.dumps({
+            "operator": "describe", "capability": "cics_evidence",
+            "entity_types": ["queue"], "entity_values": [], "fields": [], "filters": [],
+        })})()
+        relation = type("Response", (), {"text": json.dumps({
+            "operator": "difference", "subject_program": "PDB305",
+        })})()
+        preliminary = QueryPlan(
+            intent="external_programs", program="PDB305", programs=("PDB305", "PDCBVC"),
+            tasks=("external_calls",), requires_comparison=True, confidence=0.95,
+        )
+        with patch("cobol_rag.query.build_llm") as build:
+            build.return_value.complete.side_effect = [outer, incomplete, relation]
+            decision = _route_query(
+                "Which external calls exist only in PDB305, compared with PDCBVC?",
+                AppConfig(), preliminary_plan=preliminary,
+                preliminary_scope=QueryScope(
+                    program="PDB305", programs=("PDB305", "PDCBVC"),
+                    intent="external_programs", program_source="question",
+                ),
+            )
+        assert decision.query_spec is not None
+        self.assertEqual(decision.query_spec["operator"], "difference")
+        self.assertEqual(decision.query_spec["capability"], "call_evidence")
+        self.assertEqual(decision.query_spec["entity_types"], ["call"])
+        self.assertEqual(decision.query_spec["subject_program"], "PDB305")
+        self.assertEqual(build.return_value.complete.call_count, 3)
 
     def test_unclear_llm_decision_is_not_rewritten_by_keyword_similarity(self) -> None:
         response = type("Response", (), {"text": json.dumps({
@@ -1474,6 +1653,72 @@ class PromptGroundingTest(unittest.TestCase):
             "How big is PDCBVC in terms of lines of code?", scope, intent="program_summary",
         )
         self.assertNotIn("source_line", plan.output_fields)
+
+    def test_singular_statement_is_preserved_as_a_response_field(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="cics_operations")
+        plan = build_query_plan(
+            "Give only the queue, paragraph, statement, and source line.",
+            scope,
+            intent="cics_operations",
+        )
+        self.assertIn("exact_statement", plan.output_fields)
+        self.assertIn("paragraph", plan.output_fields)
+        self.assertIn("source_line", plan.output_fields)
+        self.assertTrue(plan.only_requested_fields)
+
+    def test_statement_count_is_not_misread_as_exact_statement_text(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="source_metrics")
+        plan = build_query_plan(
+            "How many executable statements are in PDCBVC?", scope, intent="source_metrics",
+        )
+        self.assertIn("statement_count", plan.output_fields)
+        self.assertNotIn("exact_statement", plan.output_fields)
+
+    def test_compound_physical_source_lines_is_a_count_projection(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="source_metrics")
+        plan = build_query_plan(
+            "How many physical source lines and executable statements does PDCBVC have?",
+            scope,
+            intent="source_metrics",
+        )
+        self.assertIn("physical_line_count", plan.output_fields)
+        self.assertNotIn("line_count", plan.output_fields)
+        self.assertIn("statement_count", plan.output_fields)
+        self.assertNotIn("source_line", plan.output_fields)
+        self.assertNotIn("exact_statement", plan.output_fields)
+        self.assertNotIn("db2_table", plan.include_types)
+
+    def test_map_and_mapset_are_typed_resource_projection_fields(self) -> None:
+        scope = QueryScope(program="PDCBVC", programs=("PDCBVC",), intent="cics_operations")
+        plan = build_query_plan(
+            "Which map and mapset are used by this paragraph?", scope, intent="cics_operations",
+        )
+        self.assertIn("map", plan.output_fields)
+        self.assertIn("mapset", plan.output_fields)
+
+    def test_explicit_condition_literal_survives_before_intent_refinement(self) -> None:
+        scope = QueryScope(program="PDB305", programs=("PDB305",), intent="general")
+        plan = build_query_plan(
+            "Under the condition PDRGCODA-RETURN = '1', list every direct outcome.",
+            scope,
+            intent="general",
+        )
+        self.assertEqual(plan.condition_terms, ("1",))
+        self.assertEqual(plan.intent, "business_rules")
+        self.assertEqual(plan.tasks, ("condition_outcome",))
+
+    def test_set_operator_populates_the_executable_relation(self) -> None:
+        base = QueryPlan(
+            program="PDB305", programs=("PDB305", "PDCBVC"),
+            intent="external_programs", requires_comparison=True,
+        )
+        merged = merge_semantic_plan(base, {"query_spec": {
+            "operator": "difference", "capability": "call_evidence",
+            "entity_types": ["program"], "entity_values": ["PDB305"],
+            "subject_program": "PDB305", "fields": [], "filters": [],
+        }})
+        assert merged.query_spec is not None
+        self.assertEqual(merged.query_spec.relation, "difference")
 
     def test_program_level_answers_are_not_required_to_cite_a_source_line(self) -> None:
         plan = QueryPlan(
@@ -2830,6 +3075,7 @@ class ProgramComparisonTest(unittest.TestCase):
     def test_set_relations_are_read_from_the_question(self) -> None:
         for question, expected in (
             ("Which copybooks are shared by PDB305 and PDCBVC?", "intersection"),
+            ("Which CICS commands are used by both PDB305 and PDCBVC?", "intersection"),
             ("What do PDCBVC and PDB305 have in common?", "intersection"),
             ("Compare the external calls of PDB305 and PDCBVC.", "comparison"),
             ("Which calls are only in PDCBVC?", "difference"),

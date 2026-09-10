@@ -18,7 +18,21 @@ def quality_tasks_for_plan(plan: object) -> tuple[str, ...]:
     for claim in getattr(plan, "subtasks", ()) or ():
         if getattr(claim, "required", True):
             tasks.update(getattr(claim, "tasks", ()) or ())
-    return tuple(category for category in QUALITY_CATEGORIES if category in tasks)
+    named = tuple(category for category in QUALITY_CATEGORIES if category in tasks)
+    # A request quantified over the whole subject -- "summarize everything
+    # unused or unreachable" -- asks for the taxonomy, not for whichever
+    # category the planner happened to name first. Both signals already exist
+    # on the plan: result_scope is the contract that defeats truncation
+    # elsewhere, and a summarize operation is a request for the whole picture.
+    # Reading them here is what separates covering these phrasings from
+    # covering the concept; a request that names its categories is unaffected,
+    # because the categories are additive and it already asked for them.
+    if named and (
+        getattr(plan, "result_scope", None) == "all"
+        or "summarize" in set(getattr(plan, "operations", ()) or ())
+    ):
+        return QUALITY_CATEGORIES
+    return named
 
 
 def quality_categories_named(question: str) -> tuple[str, ...]:

@@ -154,3 +154,63 @@ def test_empty_and_missing_categories_are_explicit_and_distinct(artifacts, missi
         assert "unavailable" not in answer
         assert "No commented-out code" in answer
         assert "No copybooks needing review" in answer
+
+
+# --------------------------------------------------------------------------
+# A quantified request covers the taxonomy, not the category named first.
+#
+# "Summarize everything unused or unreachable" returned only unreachable
+# paragraphs: the planner named one category and the resolver faithfully kept
+# it. Questions that spell the categories out worked, so the coverage tracked
+# the phrasing rather than the concept. Both signals needed already existed on
+# the plan -- the quantifier contract that defeats truncation, and a summarize
+# operation -- so neither is a new wording rule.
+# --------------------------------------------------------------------------
+from types import SimpleNamespace
+
+from cobol_rag.quality_scope import quality_tasks_for_plan
+from cobol_rag.query_plan import _requests_exhaustive_results
+
+
+def _plan(tasks, *, result_scope="default", operations=()):
+    return SimpleNamespace(
+        tasks=tuple(tasks), subtasks=(), result_scope=result_scope,
+        operations=tuple(operations),
+    )
+
+
+@pytest.mark.parametrize("question, expected", [
+    ("Summarize everything unused or unreachable in PDCBVC.", True),
+    ("list every paragraph", True),
+    ("list all dead code", True),
+    ("Which paragraphs are unreachable in PDCBVC?", False),
+])
+def test_everything_is_a_universal_quantifier(question, expected):
+    """\\bevery\\b cannot match "everything", so the commonest phrasing of an
+    exhaustive request was read as a default one and truncated."""
+    assert _requests_exhaustive_results(question) is expected
+
+
+def test_a_quantified_quality_request_covers_every_category():
+    for plan in (
+        _plan(["unreachable_code"], result_scope="all"),
+        _plan(["unreachable_code", "program_summary"], operations=["summarize"]),
+    ):
+        assert quality_tasks_for_plan(plan) == QUALITY_CATEGORIES
+
+
+def test_a_narrow_quality_request_stays_narrow():
+    """One named category with no quantifier is a request for that category."""
+    assert quality_tasks_for_plan(_plan(["unreachable_code"])) == ("unreachable_code",)
+
+
+def test_a_request_that_names_its_categories_is_unchanged():
+    named = ["commented_code", "unreachable_code", "unused_copybooks", "review_copybooks"]
+    assert quality_tasks_for_plan(_plan(named)) == QUALITY_CATEGORIES
+
+
+def test_a_quantifier_does_not_make_a_non_quality_request_into_one():
+    """"list every variable" is exhaustive but is not a quality question, and
+    must not acquire dead-code obligations from the quantifier alone."""
+    plan = _plan(["variable_inventory"], result_scope="all", operations=["summarize"])
+    assert quality_tasks_for_plan(plan) == ()

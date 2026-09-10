@@ -2365,7 +2365,11 @@ def _is_explicit_followup(q: str, question: str = "") -> bool:
 def _requests_exhaustive_results(q: str) -> bool:
     return bool(
         re.search(
-            r"\b(?:all|every|every single|complete list|entire list|the rest|remaining)\b",
+            # "everything" is the commonest of these and \bevery\b cannot
+            # match it, so an exhaustive request was read as a default one
+            # and became subject to the 25-item truncation it was asking to
+            # defeat.
+            r"\b(?:all|every(?:thing)?|complete list|entire list|the rest|remaining)\b",
             q,
         )
         or re.match(r"^(?:and\s+)?(?:there (?:is|are) more|more\b|continue\b|you missed\b)", q)

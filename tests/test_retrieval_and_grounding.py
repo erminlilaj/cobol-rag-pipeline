@@ -47,10 +47,14 @@ from cobol_rag.query import (
     _retrieve_for_plan,
     _render_verified_candidate_to_contract,
     _repair_conversational_reply,
+    _render_verified_answer_in_italian,
     _route_query,
     _resolve_weak_technical_route,
     _routing_conflicts_with_verified_scope,
+    _safe_translation,
     _try_structured_plan_answer,
+    _translate_complete_answer_lines,
+    _translate_masked_line_fragments,
     _semantic_route_hint,
     answer_query,
     QueryAnswer,
@@ -552,6 +556,24 @@ class PromptGroundingTest(unittest.TestCase):
         self.assertEqual(italian_plan.response_language, "it")
         self.assertEqual(italian_plan.response_language_source, "message")
 
+    def test_language_adapter_preserves_evidence_tokens_and_layout(self) -> None:
+        source = (
+            "PD1VOCI-RETURN direct evidence:\n"
+            "- LINK-PD1VOCI, line 489: `IF PD1VOCI-RETURN EQUAL 'E'` [Source 1]"
+        )
+        translated = (
+            "Evidenza diretta per PD1VOCI-RETURN:\n"
+            "- LINK-PD1VOCI, riga 489: `IF PD1VOCI-RETURN EQUAL 'E'` [Source 1]"
+        )
+        self.assertTrue(_safe_translation(source, translated, preserve_layout=True))
+
+    def test_language_adapter_rejects_changed_evidence(self) -> None:
+        source = "- PDCBVC line 489: `IF PD1VOCI-RETURN EQUAL 'E'` [Source 1]"
+        changed_line = "- PDCBVC riga 490: `IF PD1VOCI-RETURN EQUAL 'E'` [Source 1]"
+        changed_code = "- PDCBVC riga 489: `IF PD1VOCI-RETURN EQUAL '0'` [Source 1]"
+        self.assertFalse(_safe_translation(source, changed_line, preserve_layout=True))
+        self.assertFalse(_safe_translation(source, changed_code, preserve_layout=True))
+
     def test_explicit_language_request_overrides_the_message_language(self) -> None:
         self.assertEqual(
             resolve_response_language("Can you answer in Italian?", SessionState()),
@@ -562,6 +584,75 @@ class PromptGroundingTest(unittest.TestCase):
             ("en", "explicit_request"),
         )
         self.assertEqual(detect_message_language("Why are you replying in Italian?"), "en")
+
+    def test_italian_answer_adapter_repairs_an_invariant_mismatch(self) -> None:
+        source = "PDCBVC is a CICS program with 5 outgoing calls."
+        rejected = type("Response", (), {"text": json.dumps({
+            "lines": ["[[P0]] è un programma COBOL [[P1]] con [[P2]] chiamate in uscita."],
+        })})()
+        repaired = type("Response", (), {"text": json.dumps({
+            "lines": ["[[P0]] è un programma [[P1]] con [[P2]] chiamate in uscita."],
+        })})()
+        with patch("cobol_rag.query.build_llm") as build:
+            build.return_value.complete.side_effect = [rejected, repaired]
+            answer, status = _render_verified_answer_in_italian(source, AppConfig())
+        self.assertEqual(answer, "PDCBVC è un programma CICS con 5 chiamate in uscita.")
+        self.assertEqual(status, "translated_after_retry")
+        self.assertEqual(build.return_value.complete.call_count, 2)
+
+    def test_italian_answer_adapter_preserves_exact_sentence_count(self) -> None:
+        source = "PDCBVC is online.\nIt has 5 outgoing calls."
+        translated = type("Response", (), {"text": json.dumps({
+            "lines": [
+                "[[P0]] è online.",
+                "Ha [[P0]] chiamate in uscita.",
+            ],
+        })})()
+        with patch("cobol_rag.query.build_llm") as build:
+            build.return_value.complete.return_value = translated
+            answer, status = _render_verified_answer_in_italian(source, AppConfig())
+        self.assertEqual(
+            answer.splitlines(),
+            ["PDCBVC è online.", "Ha 5 chiamate in uscita."],
+        )
+        self.assertEqual(status, "translated")
+
+    def test_italian_answer_adapter_does_not_accept_unchanged_english(self) -> None:
+        source = "PDCBVC is a CICS program."
+        unchanged = type("Response", (), {"text": json.dumps({
+            "lines": ["[[P0]] is a [[P1]] program."],
+        })})()
+        repaired = type("Response", (), {"text": json.dumps({
+            "lines": ["[[P0]] è un programma [[P1]]."],
+        })})()
+        with patch("cobol_rag.query.build_llm") as build:
+            build.return_value.complete.side_effect = [unchanged, repaired]
+            answer, status = _render_verified_answer_in_italian(source, AppConfig())
+        self.assertEqual(answer, "PDCBVC è un programma CICS.")
+        self.assertEqual(status, "translated_after_retry")
+
+    def test_fragment_translation_stitches_protected_facts_in_code(self) -> None:
+        translated = [
+            type("Response", (), {"text": "è un programma"})(),
+            type("Response", (), {"text": "con"})(),
+            type("Response", (), {"text": "chiamate."})(),
+        ]
+        with patch("cobol_rag.query.build_llm") as build:
+            build.return_value.complete.side_effect = translated
+            answer = _translate_masked_line_fragments(
+                "[[P0]] is a [[P1]] program with [[P2]] calls.", AppConfig(),
+            )
+        self.assertEqual(answer, "[[P0]] è un programma [[P1]] con [[P2]] chiamate.")
+
+    def test_complete_line_translation_preserves_verified_facts(self) -> None:
+        source = "PDCBVC is a CICS program with 5 calls."
+        translated = type("Response", (), {
+            "text": "PDCBVC è un programma CICS con 5 chiamate.",
+        })()
+        with patch("cobol_rag.query.build_llm") as build:
+            build.return_value.complete.return_value = translated
+            answer = _translate_complete_answer_lines(source, AppConfig())
+        self.assertEqual(answer, "PDCBVC è un programma CICS con 5 chiamate.")
 
     def test_a_language_switch_is_recognised_without_enumerating_verbs(self) -> None:
         # Observed production failure: "no facciamo in englese" left the session

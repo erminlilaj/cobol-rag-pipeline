@@ -47,6 +47,11 @@ def build_llm(
         request_timeout=config.llm.request_timeout,
         temperature=config.llm.temperature if temperature is None else temperature,
         json_mode=json_mode,
+        # Granite 4.2 thinks by default. Router calls often allow only 40-260
+        # output tokens, so an unbounded reasoning trace can consume the entire
+        # budget and leave an empty content response. Keep RAG calls concise and
+        # machine-parseable unless a deployment explicitly opts into thinking.
+        thinking=config.llm.thinking,
         additional_kwargs={
             "num_predict": max_output_tokens or config.llm.max_output_tokens
         },

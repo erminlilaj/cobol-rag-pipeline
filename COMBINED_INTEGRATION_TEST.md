@@ -64,7 +64,7 @@ Run Ollama and the UI:
 
 ```bash
 ollama serve
-ollama pull granite-code:8b-instruct
+ollama pull granite4.2:8b
 ollama pull mxbai-embed-large:latest
 python -m uvicorn cobol_rag.api:app --host 127.0.0.1 --port 8000
 ```

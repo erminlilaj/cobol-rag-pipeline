@@ -75,10 +75,13 @@ Current default LLM:
 
 ```yaml
 llm:
-  model: "granite-code:8b-instruct"
+  model: "granite4.2:8b"
 ```
 
 Future adjustment point: change `llm.model` in config or override it with `COBOL_RAG_LLM_MODEL`.
+Granite 4.2 thinking is disabled by default so short routing and JSON calls keep
+their output budget for the actual result. Set `COBOL_RAG_LLM_THINKING=true`
+only when deliberately evaluating reasoning mode.
 
 ### 8. Answer Includes Citations
 
@@ -318,7 +321,7 @@ cobol-rag query "What is in the JSON document?" --top-k 2
 
 The answer is generated from retrieved context only. The CLI always prints a `Sources` table after the answer so you can check which indexed documents supported it.
 
-If retrieval works but `query` fails, check the configured local LLM. The default config pins `context_window: 4096` for `granite-code:8b-instruct`, matching the normal Ollama CLI context size and avoiding oversized API context requests.
+If retrieval works but `query` fails, check the configured local LLM. The default runtime keeps `context_window: 4096` for predictable local memory use even though `granite4.2:8b` supports a larger context window.
 
 Current answer shape:
 
@@ -347,6 +350,8 @@ Query handling uses a hybrid deterministic + LLM + semantic routing plan. The co
 Exact multiple identifiers are preserved as a set. Direct artifact roots and returned sources are checked against the selected program so same-named artifacts from different programs cannot be mixed. A new explicit intent clears incompatible entity memory. Technical continuations such as `there is more`, `continue`, and `show the rest` retain the prior program and intent. Ambiguous identifier prefixes request the exact COBOL name instead of silently selecting a candidate. Qualifiers such as source line, division, section, `only`, exhaustive scope, excluded evidence types, condition values, and CICS operation types are plan fields rather than special-case answer strings.
 
 The semantic router classifies meaning using the current message and recent technical questions. Technical intents include artifact inventory, variable inventory, variable dataflow, copybooks, business rules, external programs, control flow, CICS operations, static values, dead code, DB2/SQL, datasets, UI navigation, source metrics, program summary, and general COBOL analysis.
+
+Italian support is an adapter around this English evidence pipeline, not a second routing implementation. An Italian request is translated to canonical English while preserving program names, COBOL identifiers, literals, numbers, and source addresses. The normal English planner, artifact handlers, retrieval, and validators then produce a trusted answer. Only after validation is its prose rendered in Italian; code spans, identifiers, values, citations, bullets, and line structure are restored outside the model and checked for exact preservation. If localization changes an evidence-bearing token, the trusted English answer is returned instead. English requests never enter this adapter.
 
 A semantic capability router sits underneath the LLM planner as its deterministic floor. Every evidence capability carries a natural-language description of what it answers in `src/cobol_rag/capability_router.py`; a question is embedded with the same model that indexes the corpus and ranked against those descriptions. When the planner returns an unusable plan, or returns `technical` with no intent and no task, the top-ranked capability supplies the missing one instead of the system degrading into generic retrieval with no handler. A match is used only when it clears both a similarity and a margin threshold, so a question that belongs to no capability stays unrouted rather than being forced into the nearest one. Deterministic entity scope still gates which capabilities are eligible: entity-scoped capabilities are dropped when no identifier was resolved, and a named variable removes the whole-program catalogue from the ranking so exact evidence always wins. Adding a capability means adding a description, never a question pattern; ranking accuracy is measurable independently of the planner.
 

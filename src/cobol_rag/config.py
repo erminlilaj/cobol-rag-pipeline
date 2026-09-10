@@ -31,12 +31,13 @@ class PathConfig:
 @dataclass(frozen=True)
 class LlmConfig:
     provider: str = "ollama"
-    model: str = "granite-code:8b-instruct"
+    model: str = "granite4.2:8b"
     base_url: str = "http://localhost:11434"
     context_window: int = 4096
     request_timeout: int = 300
     temperature: float = 0.1
     max_output_tokens: int = 256
+    thinking: bool = False
 
 
 @dataclass(frozen=True)
@@ -123,6 +124,8 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
     _set_nested(result, ("index", "collection"), os.getenv("COBOL_RAG_COLLECTION"))
     _set_nested(result, ("llm", "model"), os.getenv("COBOL_RAG_LLM_MODEL"))
     _set_nested(result, ("llm", "base_url"), os.getenv("COBOL_RAG_LLM_BASE_URL"))
+    if thinking := os.getenv("COBOL_RAG_LLM_THINKING"):
+        _set_nested(result, ("llm", "thinking"), thinking.strip().lower() in {"1", "true", "yes", "on"})
     _set_nested(result, ("embedding", "model"), os.getenv("COBOL_RAG_EMBEDDING_MODEL"))
     _set_nested(result, ("embedding", "base_url"), os.getenv("COBOL_RAG_EMBEDDING_BASE_URL"))
 

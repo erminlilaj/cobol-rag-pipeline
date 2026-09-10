@@ -191,7 +191,7 @@ HTML = """
   <main>
     <header>
       <h1>COBOL RAG</h1>
-      <div class="status">collection: cobol-dev | llm: granite-code:8b-instruct</div>
+      <div class="status">collection: cobol-dev | llm: granite4.2:8b</div>
     </header>
     <section id="log">
       <div class="turn">

@@ -200,7 +200,7 @@ elif [[ -f ".venv/bin/activate" ]]; then
 fi
 
 if [[ "$PULL_MODELS" -eq 1 ]]; then
-  ollama pull granite-code:8b-instruct
+  ollama pull granite4.2:8b
   ollama pull mxbai-embed-large:latest
 fi
 

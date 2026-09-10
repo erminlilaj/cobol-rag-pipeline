@@ -9,12 +9,13 @@ paths:
 
 llm:
   provider: "ollama"
-  model: "granite-code:8b-instruct"
+  model: "granite4.2:8b"
   base_url: "http://localhost:11434"
   context_window: 4096
   request_timeout: 300
   temperature: 0.1
   max_output_tokens: 256
+  thinking: false
 
 embedding:
   provider: "ollama"

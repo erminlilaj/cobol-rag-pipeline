@@ -170,5 +170,53 @@ class RoutingWithoutAVerbListTest(unittest.TestCase):
         self.assertNotIsInstance(self.compile("what is SUBPGM for?"), CorpusReferences)
 
 
+class SpecDirectionIsCompletedTest(unittest.TestCase):
+    """A planner specification that sets no direction has not chosen one.
+
+    The specification outranks the deterministic corpus compile, so a null
+    direction on a call question left the executor reading the outgoing side:
+    "which analyzed program calls PDCBVC" answered with PDCBVC's own calls.
+    Filling a null is not overriding a decision -- a direction the planner did
+    set is passed through untouched.
+    """
+
+    def spec(self, direction=None, capability="call_evidence"):
+        return SimpleNamespace(
+            operator="describe", capability=capability, entity_types=("call",),
+            entity_values=(), fields=(), relation=None, subject_program=None,
+            direction=direction, source_entity=None, target_entity=None, filters=(),
+        )
+
+    def compile(self, question, spec):
+        return compile_query(question, program="PDCBVC", corpus_entity="PDCBVC",
+                             graph_nodes=(), query_spec=spec)
+
+    def test_a_null_direction_is_read_from_the_question(self) -> None:
+        compiled = self.compile(
+            "which analyzed program calls PDCBVC, and what parameter does it pass?",
+            self.spec(),
+        )
+        self.assertEqual(compiled.direction, "incoming")
+
+    def test_the_named_actor_is_left_outgoing(self) -> None:
+        """"which programs does PDCBVC call" names PDCBVC as the actor, so the
+        null must not be filled -- that would invert a working question."""
+        compiled = self.compile("which external programs does PDCBVC call?", self.spec())
+        self.assertIsNone(compiled.direction)
+
+    def test_a_direction_the_planner_set_is_untouched(self) -> None:
+        for given in ("outgoing", "incoming"):
+            with self.subTest(direction=given):
+                compiled = self.compile(
+                    "which analyzed program calls PDCBVC?", self.spec(direction=given)
+                )
+                self.assertEqual(compiled.direction, given)
+
+    def test_only_call_questions_are_completed(self) -> None:
+        compiled = self.compile("which analyzed program calls PDCBVC?",
+                                self.spec(capability="copybook_evidence"))
+        self.assertIsNone(compiled.direction)
+
+
 if __name__ == "__main__":
     unittest.main()

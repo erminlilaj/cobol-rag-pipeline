@@ -549,6 +549,23 @@ def compile_query(
                 programs=named_programs,
                 metric="main_source_physical_lines",
             )
+        # The planner owns direction when it sets one.  When it leaves it null
+        # on a call question the direction is still determined -- by whether
+        # the named program is the actor or the object of the verb -- and an
+        # unset direction makes the executor read the outgoing side, which is
+        # how "which analyzed program calls PDCBVC" answered with PDCBVC's own
+        # calls.  Filling a null is not re-interpreting a decision the planner
+        # made; a direction it did set is left exactly as given.
+        spec_direction = query_spec.direction
+        if (
+            spec_direction is None
+            and query_spec.capability == "call_evidence"
+            and corpus_entity
+            and _CORPUS_SUBJECT.search(question)
+            and not _names_the_actor(question, corpus_entity)
+        ):
+            spec_direction = "incoming"
+
         return SemanticProjection(
             programs=named_programs,
             program=program,
@@ -559,7 +576,7 @@ def compile_query(
             fields=semantic_fields,
             relation=query_spec.relation,
             subject_program=query_spec.subject_program,
-            direction=query_spec.direction,
+            direction=spec_direction,
             source_entity=query_spec.source_entity,
             target_entity=query_spec.target_entity,
             filters=filters,

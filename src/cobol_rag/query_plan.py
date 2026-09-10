@@ -332,6 +332,14 @@ def _is_named_program_overview_request(question: str, program: str) -> bool:
         for part in re.split(r"\s+and\s+", tail, flags=re.IGNORECASE)
     )
 
+# dataflow.literal_assignments records "literal and forced value assignments",
+# and this names that same thing. It is the request for a capability, not a
+# phrasing of a question: whichever intent a literal request lands in, the
+# restriction it carries has to be applied or reported, never dropped.
+_REQUESTS_LITERAL_VALUES = re.compile(
+    r"\bliterals?\b|\bforced\s+values?\b|\bhard[-\s]?coded\b", re.I,
+)
+
 _VARIABLE_PRODUCTION_CUE_PATTERN = (
     r"\b(?:writ(?:e|es|ing|ten)|modif(?:y|ies|ied|ying|ication|ications)|"
     r"set|sets|setting|assign(?:s|ed|ing)?|values?|"
@@ -797,7 +805,16 @@ def build_query_plan(
         )
     ):
         resolved_intent = "program_summary"
-    elif resolved_intent == "general" and re.search(r"\bliteral assignments?\b", q):
+    elif (
+        resolved_intent in {"general", "variable_inventory"}
+        and _REQUESTS_LITERAL_VALUES.search(q)
+    ):
+        # A literal request names a capability, and dataflow.literal_assignments
+        # records exactly it. Reaching this only from the general intent, and
+        # only for the exact words "literal assignments", left "which variables
+        # receive forced literal values" resolved as an inventory question --
+        # and the inventory is a superset that contains the answer, conceals
+        # it, and reads as an answer, so nothing signalled the loss.
         resolved_intent = "static_values"
     elif _COPY_CONSTRUCT_QUESTION.search(q) and any(
         entity.entity_type == "copybook" for entity in scope.entities
@@ -2085,8 +2102,20 @@ def validate_plan_answer(plan: QueryPlan, answer: str) -> PlanContractValidation
     named_types = {
         entity.entity_type for entity in plan.entities if getattr(entity, "entity_type", None)
     }
+    # One task can discharge another's obligation when it reports the same
+    # evidence in a stronger form. Every literal assignment is a write, and the
+    # literal rendering names the receiving variable, the value, the paragraph
+    # and the line -- strictly more than a write-sites list. Requiring a
+    # separately labelled section here discarded a correct and complete answer:
+    # all six literals moved into WABEND-CODE, each with its statement.
+    literal_rendering = "literal_assignments" in plan.tasks and any(
+        marker in lowered
+        for marker in ("literal value", "literal assignment", "dataflow.literal_assignments")
+    )
+    discharged_by_literals = {"variable_writes"} if literal_rendering else set()
+
     for task, markers in required_sections.items():
-        if task not in plan.tasks:
+        if task not in plan.tasks or task in discharged_by_literals:
             continue
         subject = section_subject.get(task)
         if subject and named_types and subject not in named_types:
@@ -2205,7 +2234,15 @@ def _fallback_tasks_and_relations(q: str, intent: str) -> tuple[tuple[str, ...],
         if not tasks:
             tasks.extend(["variable_definition", "variable_reads", "variable_writes"])
     elif intent == "variable_inventory":
-        tasks.append("variable_inventory")
+        # "Which variables receive forced literal values" restricts the
+        # inventory. Answering with the inventory returns a superset that
+        # contains the answer and conceals it, and reads as an answer, so
+        # nothing signals the restriction was dropped. The literal request is
+        # an obligation in its own right, whichever bucket the intent landed in.
+        if _REQUESTS_LITERAL_VALUES.search(q):
+            tasks.append("literal_assignments")
+        else:
+            tasks.append("variable_inventory")
     elif intent == "static_values":
         tasks.append("literal_assignments")
     elif intent == "external_programs":

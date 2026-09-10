@@ -303,7 +303,13 @@ _CORPUS_SUBJECT = re.compile(
     # Adjectives may sit between the determiner and "programs" -- "which other
     # analyzed programs" -- so allow a few words rather than one fixed one.
     r"(?<![a-z])(?:which|what|any|all|how\s+many)\s+(?:\w+\s+){0,3}programs?(?![a-z])"
-    r"|(?<![a-z])who\s+(?:calls|uses|includes|references)(?![a-z])"
+    # "who" asks for an agent, so whatever verb follows is a relation to be
+    # read in reverse.  Enumerating the verbs meant "who invokes PDCBVC"
+    # matched nothing, fell through to a program-scoped capability -- which
+    # knows only the outgoing direction -- and answered with PDCBVC's own
+    # calls.  The guards that follow (a resolved corpus entity that is not
+    # the grammatical actor) are what make this safe without a verb list.
+    r"|(?<![a-z])whom?\s+[a-z]+(?![a-z])"
     r"|(?<![a-z])(?:called|used|included|referenced)\s+by\s+(?:which|what)(?![a-z])",
     re.I,
 )

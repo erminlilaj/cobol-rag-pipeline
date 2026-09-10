@@ -4611,6 +4611,20 @@ def answer_semantic_projection(query: Any) -> str | None:
     if capability == "condition_outcome":
         return _semantic_condition_answer(query, program, root)
     if capability == "call_evidence":
+        # An incoming request cannot be served from this program's own calls:
+        # its artifact records only what it calls.  Reading direction here is
+        # what stops "who invokes X" returning X's outgoing calls -- a true
+        # statement about the opposite relation.
+        if str(getattr(query, "direction", "") or "").strip().lower() == "incoming":
+            target = next(
+                (
+                    str(value).strip().upper()
+                    for value in query.entity_values
+                    if str(value).strip().upper() != program.strip().upper()
+                ),
+                program.strip().upper(),
+            )
+            return answer_incoming_calls(target)
         program_names = {name for name, _ in roots}
         constrained_targets = {
             value for value in query.entity_values if value not in program_names
@@ -5368,6 +5382,94 @@ def corpus_references(entity: str) -> dict[str, list[tuple[str, str]]]:
     return found
 
 
+def incoming_calls(target: str) -> tuple[dict[str, Any], ...]:
+    """Every recorded call whose target is this name, across the corpus.
+
+    A program's own artifact records only what it calls, so the callers cannot
+    be read from the target's own file.  They are found by reading every
+    analyzed program's call records and selecting those naming this target --
+    the same relation as an outgoing call, read in the opposite direction.
+    """
+    root = find_final_scripts_root()
+    if root is None:
+        return ()
+    wanted = target.strip().upper()
+    if not wanted:
+        return ()
+    found: list[dict[str, Any]] = []
+    for program in analyzed_programs():
+        program_root = find_program_artifact_root(root, program)
+        if program_root is None:
+            continue
+        payload = _read_json(
+            _artifact_path(program_root, "architecture.call_parameters.json")
+        )
+        if not isinstance(payload, dict):
+            continue
+        for record in payload.get("calls", []):
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("target") or "").strip().upper() != wanted:
+                continue
+            found.append({
+                "caller": str(record.get("caller") or program).strip().upper(),
+                "target": wanted,
+                "call_type": record.get("call_type"),
+                "paragraph": record.get("paragraph"),
+                "line_start": record.get("line_start"),
+                "commarea": record.get("commarea"),
+                "length": record.get("length"),
+                "parameters": tuple(
+                    str(value).strip()
+                    for value in record.get("parameters") or []
+                    if str(value).strip()
+                ),
+            })
+    return tuple(sorted(found, key=lambda item: (item["caller"], item["line_start"] or 0)))
+
+
+def answer_incoming_calls(target: str) -> str | None:
+    """Which analyzed programs call this one, and across what interface."""
+    target = target.strip().upper()
+    programs = analyzed_programs()
+    if not programs:
+        return None
+    records = incoming_calls(target)
+    scope_note = (
+        f"{len(programs)} program(s) are analyzed ({', '.join(programs)}), so this "
+        f"covers only calls made inside that set."
+    )
+    if not records:
+        return (
+            f"No analyzed program calls `{target}`.\n{scope_note}\n"
+            f"Source: `architecture.call_parameters.json`."
+        )
+    plural = "" if len(records) == 1 else "s"
+    lines = [f"{len(records)} analyzed call{plural} target `{target}`:"]
+    for record in records:
+        where = record["caller"]
+        if record.get("paragraph"):
+            where += f" - {record['paragraph']}"
+        if record.get("line_start"):
+            where += f", line {record['line_start']}"
+        lines.append(f"- {where} ({record.get('call_type') or 'call'})")
+        if record.get("commarea"):
+            detail = f"COMMAREA {record['commarea']}"
+            if record.get("length"):
+                detail += f", LENGTH {record['length']}"
+            lines.append(f"  {detail}")
+        elif record.get("parameters"):
+            lines.append(f"  parameters: {', '.join(record['parameters'])}")
+        else:
+            # A call that passes nothing is not a call we failed to read.  XCTL
+            # routinely carries no COMMAREA, and saying so is the difference
+            # between a recorded absence and a gap in the analysis.
+            lines.append("  no COMMAREA or parameter recorded for this call")
+    lines.append(scope_note)
+    lines.append("Source: `architecture.call_parameters.json`.")
+    return "\n".join(lines)
+
+
 def answer_corpus_references(entity: str, relation: str | None = None) -> str | None:
     """Which analyzed programs reference a name, and how.
 
@@ -5386,6 +5488,16 @@ def answer_corpus_references(entity: str, relation: str | None = None) -> str | 
         f"{len(programs)} program(s) are analyzed ({', '.join(programs)}), so this "
         f"covers only references inside that set."
     )
+
+    # A name reached as the object of a call is a question about the call, and
+    # the call records carry what the registry cannot: call type, paragraph,
+    # line, COMMAREA and parameters.  They refine the registry answer, they do
+    # not replace it: with no readable call artifact this must fall through to
+    # the registry rather than report an absence the records cannot support.
+    if relation in {None, "calls"} and incoming_calls(entity):
+        detailed = answer_incoming_calls(entity)
+        if detailed is not None:
+            return detailed
 
     if relation:
         matches = sorted({program for program, _ in found.get(relation, [])})

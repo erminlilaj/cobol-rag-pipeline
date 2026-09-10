@@ -557,6 +557,7 @@ def compile_query(
         # calls.  Filling a null is not re-interpreting a decision the planner
         # made; a direction it did set is left exactly as given.
         spec_direction = query_spec.direction
+        spec_entity_values = tuple(query_spec.entity_values)
         if (
             spec_direction is None
             and query_spec.capability == "call_evidence"
@@ -565,6 +566,13 @@ def compile_query(
             and not _names_the_actor(question, corpus_entity)
         ):
             spec_direction = "incoming"
+            # The target of an incoming call is the name the question asked
+            # about.  A specification carrying no entity leaves the executor
+            # falling back to the scoped program, which under a two-program
+            # scope is merely the first of them: that is how "who invokes
+            # PD0UTI01" came back about PDB305.
+            if not spec_entity_values:
+                spec_entity_values = (corpus_entity.strip().upper(),)
 
         return SemanticProjection(
             programs=named_programs,
@@ -572,7 +580,7 @@ def compile_query(
             operator=query_spec.operator,
             capability=query_spec.capability,
             entity_types=tuple(query_spec.entity_types),
-            entity_values=tuple(query_spec.entity_values),
+            entity_values=spec_entity_values,
             fields=semantic_fields,
             relation=query_spec.relation,
             subject_program=query_spec.subject_program,

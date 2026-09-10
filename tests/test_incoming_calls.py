@@ -212,6 +212,25 @@ class SpecDirectionIsCompletedTest(unittest.TestCase):
                 )
                 self.assertEqual(compiled.direction, given)
 
+    def test_the_target_comes_from_the_question_not_the_scope(self) -> None:
+        """A specification with no entity must not fall back to the scoped
+        program: under a two-program scope that is merely the first of them,
+        which turned "who invokes PD0UTI01" into an answer about PDB305."""
+        compiled = compile_query(
+            "who invokes PD0UTI01, and what COMMAREA or parameter is used?",
+            program="PDB305", programs=("PDB305", "PDCBVC"),
+            corpus_entity="PD0UTI01", graph_nodes=(), query_spec=self.spec(),
+        )
+        self.assertEqual(compiled.direction, "incoming")
+        self.assertIn("PD0UTI01", compiled.entity_values)
+        self.assertNotIn("PDB305", compiled.entity_values)
+
+    def test_an_entity_the_planner_supplied_is_kept(self) -> None:
+        spec = self.spec()
+        spec.entity_values = ("PDPRED",)
+        compiled = self.compile("who invokes PDPRED?", spec)
+        self.assertEqual(compiled.entity_values, ("PDPRED",))
+
     def test_only_call_questions_are_completed(self) -> None:
         compiled = self.compile("which analyzed program calls PDCBVC?",
                                 self.spec(capability="copybook_evidence"))

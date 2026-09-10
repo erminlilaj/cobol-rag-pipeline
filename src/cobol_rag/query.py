@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Sequence
@@ -93,6 +94,7 @@ from cobol_rag.query_plan import (
     merge_semantic_plan,
     plan_needs_semantic_refinement,
     plan_for_subtask,
+    resolve_response_language,
     validate_evidence_answer,
     validate_plan_answer,
 )
@@ -452,6 +454,481 @@ def _semantic_route_hint(question: str) -> tuple[str, float] | None:
     return best_intent, min(0.9, 0.55 + best_score / 2)
 
 
+_CANONICAL_QUERY_PROMPT = """Translate this Italian user request into concise English for a COBOL query planner.
+Do not answer the request. Preserve every program name, COBOL identifier, number, quoted literal, and source-line reference exactly.
+Return JSON only: {{\"text\":\"English request\"}}
+
+Italian request:
+<request>
+{question}
+</request>
+"""
+
+_ITALIAN_RENDER_PROMPT = """Translate each English line below into natural Italian for a technical COBOL answer.
+Return exactly one translated line for every input line, in the same order. Preserve the number of sentences in each line. Do not combine, omit, summarize, or add facts. Do not introduce new numbers, uppercase acronyms, program names, or technical identifiers. Tokens such as [[P0]] are protected evidence; preserve each token exactly once, but place it naturally in the translated sentence. The program will restore code, identifiers, values, citations, bullets, and line breaks afterward.
+Return JSON only: {{\"lines\":[\"translated line\"]}}
+
+Lines:
+{lines_json}
+"""
+
+_ITALIAN_RENDER_REPAIR_PROMPT = """Repair an Italian translation of English technical COBOL text.
+Return exactly one Italian line for every English input line, in the same order, with the same number of sentences. Translate only the English prose. Do not add, omit, infer, or summarize facts. Do not introduce new numbers, uppercase acronyms, program names, or technical identifiers. Preserve every token such as [[P0]] exactly once; these tokens contain immutable verified evidence.
+
+The previous translation was rejected for these reasons:
+{validation_errors}
+
+English lines:
+{lines_json}
+
+Rejected Italian lines:
+{previous_json}
+
+Return JSON only: {{\"lines\":[\"repaired Italian line\"]}}
+"""
+
+_ITALIAN_PLAIN_FRAGMENT_PROMPT = """Translate this English prose fragment into natural Italian.
+It is part of a technical COBOL answer. Preserve its meaning and punctuation. Do not add facts, numbers, acronyms, program names, technical identifiers, quotes, or explanations.
+Return only the translated fragment:
+<fragment>{fragment}</fragment>
+"""
+
+_ITALIAN_COMPLETE_LINE_PROMPT = """Translate this complete technical COBOL answer line into natural Italian.
+Preserve every program name, uppercase technical identifier, number, quoted literal, code span, citation, bullet marker, and punctuation exactly. Do not add, omit, infer, or summarize facts. Return only one translated line without tags, quotes, labels, or explanation.
+
+English line:
+{line}
+"""
+
+_TRANSLATION_PROTECTED_SPAN = re.compile(
+    r"`[^`]*`|\[Source\s+\d+\]|'(?:[^'\n]|'')*'|\"(?:[^\"\n]|\"\")*\"|"
+    r"(?<![A-Za-z0-9-])(?:[A-Z][A-Z0-9]{2,}|[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+)(?![A-Za-z0-9-])|"
+    r"(?<![A-Za-z0-9])-?\d+(?:\.\d+)?(?![A-Za-z0-9])"
+)
+
+
+def _json_text(value: str) -> str | None:
+    """Read one text field from a strict translation response."""
+    try:
+        payload = json.loads(value.strip())
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    text = payload.get("text")
+    return str(text).strip() if isinstance(text, str) and text.strip() else None
+
+
+def _json_lines(value: str, expected: int) -> list[str] | None:
+    try:
+        payload = json.loads(value.strip())
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    lines = payload.get("lines") if isinstance(payload, dict) else None
+    if not isinstance(lines, list) or len(lines) != expected:
+        return None
+    return [str(line) for line in lines]
+
+
+def _separate_translation_lines(
+    answer: str,
+) -> tuple[list[str], list[tuple[str, str, tuple[str, ...], int | None]]]:
+    """Replace evidence inside each line while leaving the model enough grammar."""
+    translatable: list[str] = []
+    templates: list[tuple[str, str, tuple[str, ...], int | None]] = []
+    for original in answer.splitlines(keepends=True):
+        newline = "\n" if original.endswith("\n") else ""
+        line = original[:-1] if newline else original
+        prefix_match = re.match(r"^[ \t]*(?:[-*][ \t]+)?", line)
+        prefix = prefix_match.group(0) if prefix_match else ""
+        body = line[len(prefix):]
+        protected: list[str] = []
+
+        def replace_protected(match: re.Match[str]) -> str:
+            token = f"[[P{len(protected)}]]"
+            protected.append(match.group(0))
+            return token
+
+        masked = _TRANSLATION_PROTECTED_SPAN.sub(replace_protected, body)
+        prose_only = re.sub(r"\[\[P\d+\]\]", "", masked)
+        if re.search(r"[A-Za-z]", prose_only):
+            index = len(translatable)
+            translatable.append(masked)
+            templates.append((prefix, newline, tuple(protected), index))
+        else:
+            templates.append((line, newline, (), None))
+    return translatable, templates
+
+
+def _restore_translation_lines(
+    translated: list[str],
+    templates: list[tuple[str, str, tuple[str, ...], int | None]],
+) -> str | None:
+    rendered: list[str] = []
+    for prefix, newline, protected, index in templates:
+        if index is None:
+            rendered.append(prefix + newline)
+            continue
+        line = translated[index]
+        expected_tokens = Counter(f"[[P{position}]]" for position in range(len(protected)))
+        if Counter(re.findall(r"\[\[P\d+\]\]", line)) != expected_tokens:
+            return None
+        for position, value in enumerate(protected):
+            line = line.replace(f"[[P{position}]]", value)
+        rendered.append(prefix + line + newline)
+    return "".join(rendered)
+
+
+def _translation_invariants(text: str) -> tuple[Counter[str], Counter[str], Counter[str], Counter[str]]:
+    """Facts whose spelling and multiplicity a language adapter may never alter."""
+    identifiers = Counter(re.findall(
+        r"(?<![A-Za-z0-9-])(?:[A-Z][A-Z0-9]{2,}|[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+)(?![A-Za-z0-9-])",
+        text,
+    ))
+    numbers = Counter(re.findall(r"(?<![A-Za-z0-9])-?\d+(?:\.\d+)?(?![A-Za-z0-9])", text))
+    code_spans = Counter(re.findall(r"`[^`]*`", text))
+    citations = Counter(re.findall(r"\[Source\s+\d+\]", text, flags=re.IGNORECASE))
+    return identifiers, numbers, code_spans, citations
+
+
+def _translation_validation_reasons(
+    source: str, translated: str, *, preserve_layout: bool,
+) -> tuple[str, ...]:
+    """Explain exactly which immutable facts or shape constraints changed."""
+    reasons: list[str] = []
+    labels = ("identifier", "number", "code_span", "citation")
+    source_invariants = _translation_invariants(source)
+    translated_invariants = _translation_invariants(translated)
+    for label, expected, actual in zip(labels, source_invariants, translated_invariants):
+        for value, count in (expected - actual).items():
+            reasons.append(f"missing_{label}:{value}:{count}")
+        for value, count in (actual - expected).items():
+            reasons.append(f"extra_{label}:{value}:{count}")
+    quoted = re.findall(r"'(?:[^'\n]|'')*'|\"(?:[^\"\n]|\"\")*\"", source)
+    for value in set(quoted):
+        expected_count = source.count(value)
+        actual_count = translated.count(value)
+        if actual_count != expected_count:
+            reasons.append(f"quoted_literal_count:{value}:{expected_count}/{actual_count}")
+    if preserve_layout:
+        if len(source.splitlines()) != len(translated.splitlines()):
+            reasons.append(
+                f"line_count:{len(source.splitlines())}/{len(translated.splitlines())}"
+            )
+        if Counter(re.findall(r"(?m)^\s*[-*]\s+", source)) != Counter(
+            re.findall(r"(?m)^\s*[-*]\s+", translated)
+        ):
+            reasons.append("bullet_shape_changed")
+        source_sentences = len(re.findall(r"[.!?](?=\s|$)", source))
+        translated_sentences = len(re.findall(r"[.!?](?=\s|$)", translated))
+        if source_sentences != translated_sentences:
+            reasons.append(f"sentence_count:{source_sentences}/{translated_sentences}")
+    return tuple(reasons)
+
+
+def _safe_translation(source: str, translated: str, *, preserve_layout: bool) -> bool:
+    """Reject a translation that changes evidence-bearing tokens or answer shape."""
+    return not _translation_validation_reasons(
+        source, translated, preserve_layout=preserve_layout,
+    )
+
+
+def _italian_translation_validation_reasons(
+    source: str, translated: str, *, preserve_layout: bool,
+) -> tuple[str, ...]:
+    """Validate both evidence invariants and that prose was actually localized."""
+    reasons = list(_translation_validation_reasons(
+        source, translated, preserve_layout=preserve_layout,
+    ))
+    source_prose = _TRANSLATION_PROTECTED_SPAN.sub("", source)
+    translated_prose = _TRANSLATION_PROTECTED_SPAN.sub("", translated)
+    normalized_source = " ".join(re.findall(
+        r"[^\W\d_]+", source_prose.casefold(), flags=re.UNICODE,
+    ))
+    normalized_translation = " ".join(re.findall(
+        r"[^\W\d_]+", translated_prose.casefold(), flags=re.UNICODE,
+    ))
+    if normalized_source and normalized_source == normalized_translation:
+        reasons.append("untranslated_prose")
+    english_score, italian_score = language_marker_scores(translated_prose)
+    if english_score > italian_score:
+        reasons.append(f"wrong_language:en={english_score}:it={italian_score}")
+    return tuple(reasons)
+
+
+def _request_italian_lines(
+    lines: list[str],
+    config: AppConfig,
+    *,
+    validation_errors: tuple[str, ...] = (),
+    previous: list[str] | None = None,
+) -> list[str] | None:
+    """Ask the model for a shape-preserving translation or targeted repair."""
+    lines_payload = json.dumps(lines, ensure_ascii=False)
+    token_budget = min(4096, max(256, len(lines_payload) // 2 + 128))
+    if validation_errors and previous is not None:
+        prompt = _ITALIAN_RENDER_REPAIR_PROMPT.format(
+            validation_errors="\n".join(f"- {reason}" for reason in validation_errors),
+            lines_json=lines_payload,
+            previous_json=json.dumps(previous, ensure_ascii=False),
+        )
+    else:
+        prompt = _ITALIAN_RENDER_PROMPT.format(lines_json=lines_payload)
+    response = build_llm(
+        config, json_mode=True, max_output_tokens=token_budget, temperature=0.0,
+    ).complete(prompt)
+    return _json_lines(str(response.text), len(lines))
+
+
+def _source_line_for_template(
+    masked: str, template: tuple[str, str, tuple[str, ...], int | None],
+) -> str:
+    prefix, _, protected, _ = template
+    restored = masked
+    for position, value in enumerate(protected):
+        restored = restored.replace(f"[[P{position}]]", value)
+    return prefix + restored
+
+
+def _translate_masked_line_fragments(
+    masked: str, config: AppConfig,
+) -> str | None:
+    """Translate prose around placeholders while stitching facts deterministically."""
+    parts = re.split(r"(\[\[P\d+\]\])", masked)
+    prose_indexes = [
+        index for index, part in enumerate(parts)
+        if part.strip() and re.fullmatch(r"\[\[P\d+\]\]", part) is None
+    ]
+    if not prose_indexes:
+        return masked
+    fragments = [parts[index] for index in prose_indexes]
+
+    # Granite is considerably more reliable when an incomplete fragment is
+    # requested as plain text rather than as an element in a JSON array.
+    translated_fragments: list[str] = []
+    for fragment in fragments:
+        translated_fragment: str | None = None
+        leading_space = re.match(r"^\s*", fragment).group(0)
+        trailing_space = re.search(r"\s*$", fragment).group(0)
+        for _ in range(3):
+            response = build_llm(
+                config, json_mode=False,
+                max_output_tokens=max(64, min(512, len(fragment) * 3)),
+                temperature=0.0,
+            ).complete(_ITALIAN_PLAIN_FRAGMENT_PROMPT.format(fragment=fragment))
+            candidate = str(response.text).strip()
+            if (
+                candidate
+                and "\n" not in candidate
+                and not re.search(r"\[\[P\d+\]\]", candidate)
+                and not any(_translation_invariants(candidate))
+                and len(candidate) <= max(80, len(fragment) * 4)
+            ):
+                translated_fragment = leading_space + candidate + trailing_space
+                break
+        if translated_fragment is None:
+            return None
+        translated_fragments.append(translated_fragment)
+    for index, value in zip(prose_indexes, translated_fragments):
+        parts[index] = value
+    return "".join(parts)
+
+
+def _translate_complete_answer_lines(
+    answer: str, config: AppConfig,
+) -> str | None:
+    """Last-resort natural translation whose result still passes every invariant."""
+    rendered: list[str] = []
+    for source_line in answer.splitlines():
+        if not re.search(r"[A-Za-z]", _TRANSLATION_PROTECTED_SPAN.sub("", source_line)):
+            rendered.append(source_line)
+            continue
+        accepted: str | None = None
+        for _ in range(3):
+            response = build_llm(
+                config, json_mode=False,
+                max_output_tokens=max(96, min(1024, len(source_line) * 3)),
+                temperature=0.0,
+            ).complete(_ITALIAN_COMPLETE_LINE_PROMPT.format(line=source_line))
+            candidate = str(response.text).strip()
+            if (
+                candidate
+                and "\n" not in candidate
+                and "<" not in candidate
+                and ">" not in candidate
+                and not _italian_translation_validation_reasons(
+                    source_line, candidate, preserve_layout=True,
+                )
+            ):
+                accepted = candidate
+                break
+        if accepted is None:
+            return None
+        rendered.append(accepted)
+    translated = "\n".join(rendered)
+    if answer.endswith("\n"):
+        translated += "\n"
+    if _italian_translation_validation_reasons(
+        answer, translated, preserve_layout=True,
+    ):
+        return None
+    return translated
+
+
+def _canonicalize_italian_question(question: str, config: AppConfig) -> tuple[str, str]:
+    """Translate only at the input boundary; all evidence reasoning stays English."""
+    started = time.perf_counter()
+    try:
+        response = build_llm(
+            config, json_mode=True, max_output_tokens=256, temperature=0.0,
+        ).complete(_CANONICAL_QUERY_PROMPT.format(question=question))
+        translated = _json_text(str(response.text))
+    except Exception as error:
+        _log_stage_latency(
+            "italian_query_adapter", time.perf_counter() - started,
+            f"ERROR={type(error).__name__}",
+        )
+        return question, f"translation_error:{type(error).__name__}"
+    if not translated or not _safe_translation(question, translated, preserve_layout=False):
+        _log_stage_latency(
+            "italian_query_adapter", time.perf_counter() - started,
+            "rejected=invariant_mismatch",
+        )
+        return question, "translation_rejected"
+    _log_stage_latency(
+        "italian_query_adapter", time.perf_counter() - started, "accepted=true",
+    )
+    return translated, "translated"
+
+
+def _render_verified_answer_in_italian(answer: str, config: AppConfig) -> tuple[str, str]:
+    """Localize after validation and fall back to the proven English answer on drift."""
+    english_score, italian_score = language_marker_scores(answer)
+    if italian_score > english_score:
+        return answer, "already_italian"
+    lines, templates = _separate_translation_lines(answer)
+    if not lines:
+        return answer, "no_prose_to_translate"
+    started = time.perf_counter()
+    translated_lines: list[str] | None = None
+    translated: str | None = None
+    validation_errors: tuple[str, ...] = ("translation_not_attempted",)
+    try:
+        for attempt in range(2):
+            translated_lines = _request_italian_lines(
+                lines,
+                config,
+                validation_errors=validation_errors if attempt else (),
+                previous=translated_lines if attempt else None,
+            )
+            if translated_lines is None:
+                validation_errors = ("invalid_json_or_line_count",)
+                continue
+            translated = _restore_translation_lines(translated_lines, templates)
+            if translated is None:
+                validation_errors = ("protected_token_mismatch",)
+                continue
+            validation_errors = _italian_translation_validation_reasons(
+                answer, translated, preserve_layout=True,
+            )
+            if not validation_errors:
+                status = "translated" if attempt == 0 else "translated_after_retry"
+                _log_stage_latency(
+                    "italian_answer_adapter", time.perf_counter() - started,
+                    f"accepted=true attempt={attempt + 1}",
+                )
+                return translated, status
+
+        direct_translation = _translate_complete_answer_lines(answer, config)
+        if direct_translation is not None:
+            _log_stage_latency(
+                "italian_answer_adapter", time.perf_counter() - started,
+                "accepted=true mode=complete_line_repair",
+            )
+            return direct_translation, "translated_after_complete_line_repair"
+
+        # Repair one line at a time so a single formatting error does not
+        # discard a valid translation of the complete answer.
+        repaired_lines = list(translated_lines or lines)
+        template_by_index = {
+            index: template
+            for template in templates
+            for index in (template[3],)
+            if index is not None
+        }
+        for index, masked_source in enumerate(lines):
+            template = template_by_index[index]
+            source_line = _source_line_for_template(masked_source, template)
+            candidate = repaired_lines[index]
+            for _ in range(3):
+                rendered_line = _restore_translation_lines(
+                    [candidate], [(template[0], "", template[2], 0)],
+                )
+                line_errors = (
+                    _italian_translation_validation_reasons(
+                        source_line, rendered_line, preserve_layout=False,
+                    )
+                    if rendered_line is not None
+                    else ("protected_token_mismatch",)
+                )
+                if not line_errors:
+                    break
+                response_lines = _request_italian_lines(
+                    [masked_source],
+                    config,
+                    validation_errors=line_errors,
+                    previous=[candidate],
+                )
+                if response_lines is not None:
+                    candidate = response_lines[0]
+            rendered_line = _restore_translation_lines(
+                [candidate], [(template[0], "", template[2], 0)],
+            )
+            remaining_errors = (
+                _italian_translation_validation_reasons(
+                    source_line, rendered_line, preserve_layout=False,
+                )
+                if rendered_line is not None
+                else ("protected_token_mismatch",)
+            )
+            if remaining_errors:
+                fragment_candidate = _translate_masked_line_fragments(
+                    masked_source, config,
+                )
+                if fragment_candidate is not None:
+                    candidate = fragment_candidate
+            repaired_lines[index] = candidate
+
+        translated = _restore_translation_lines(repaired_lines, templates)
+        validation_errors = (
+            _italian_translation_validation_reasons(
+                answer, translated, preserve_layout=True,
+            )
+            if translated is not None
+            else ("protected_token_mismatch",)
+        )
+        if not validation_errors and translated is not None:
+            _log_stage_latency(
+                "italian_answer_adapter", time.perf_counter() - started,
+                "accepted=true mode=line_repair",
+            )
+            return translated, "translated_after_line_repair"
+
+    except Exception as error:
+        _log_stage_latency(
+            "italian_answer_adapter", time.perf_counter() - started,
+            f"ERROR={type(error).__name__}",
+        )
+        return answer, f"translation_error:{type(error).__name__}"
+    _log_stage_latency(
+        "italian_answer_adapter", time.perf_counter() - started,
+        "rejected=" + "|".join(validation_errors[:8]),
+    )
+    return answer, "translation_rejected_fallback_english:" + "|".join(
+        validation_errors[:4]
+    )
+
+
 def answer_query(
     question: str,
     config: AppConfig,
@@ -462,6 +939,15 @@ def answer_query(
     target_program: str | None = None,
 ) -> QueryAnswer:
     started = time.perf_counter()
+    original_question = question
+    requested_language, requested_language_source = resolve_response_language(
+        original_question, session_state,
+    )
+    language_adapter_status = "not_needed"
+    if detect_message_language(original_question) == "it":
+        question, language_adapter_status = _canonicalize_italian_question(
+            original_question, config,
+        )
     detected_intent, detected_intent_basis = detect_intent_with_basis(question)
     initial_scope = resolve_query_scope(
         question,
@@ -511,26 +997,45 @@ def answer_query(
     ) -> QueryAnswer:
         effective_scope = scope or initial_scope
         effective_plan = plan or initial_plan
+        presentation_plan = replace(
+            effective_plan,
+            response_language=requested_language,
+            response_language_source=requested_language_source,
+        )
         effective_guard_status = guard_status_override or (
             outcome.guard.status if outcome else "not_applicable"
         )
+        presented_answer = answer
+        answer_adapter_status = "not_needed"
+        if requested_language == "it":
+            presented_answer, answer_adapter_status = _render_verified_answer_in_italian(
+                answer, config,
+            )
+        debug_details = dict(debug or {})
+        if requested_language == "it" or language_adapter_status != "not_needed":
+            debug_details["language_adapter"] = {
+                "canonical_language": "en",
+                "requested_language": requested_language,
+                "query_status": language_adapter_status,
+                "answer_status": answer_adapter_status,
+            }
         debug_payload = _answer_debug_payload(
-            plan=effective_plan,
+            plan=presentation_plan,
             sources=sources,
             outcome=outcome,
             execution_mode=execution_mode,
             guard_status=effective_guard_status,
-            details=debug,
+            details=debug_details,
         )
         trace_id = write_answer_trace(
             config,
             _trace_payload(
-                question=question,
-                answer=answer,
+                question=original_question,
+                answer=presented_answer,
                 sources=sources,
                 route=route,
                 scope=effective_scope,
-                plan=effective_plan,
+                plan=presentation_plan,
                 outcome=outcome,
                 latency_ms=round((time.perf_counter() - started) * 1000, 2),
                 execution_mode=execution_mode,
@@ -538,14 +1043,14 @@ def answer_query(
             ),
         )
         return QueryAnswer(
-            question=question,
-            answer=answer,
+            question=original_question,
+            answer=presented_answer,
             sources=sources,
             route=route,
             scope=effective_scope,
             trace_id=trace_id,
             guard_status=effective_guard_status,
-            plan=effective_plan,
+            plan=presentation_plan,
             execution_mode=execution_mode,
             debug=debug_payload,
         )
@@ -580,6 +1085,16 @@ def answer_query(
     # reason to reject it before its meaning has been classified.
     # A token that is absent from the corpus is different: semantics cannot
     # make an unknown exact identifier real, so fail at the grounding boundary.
+    unresolved_names = initial_plan.entity_values_for("unknown_identifier")
+    if unresolved_names:
+        return finish(
+            "I could not resolve " + ", ".join(f"`{name}`" for name in unresolved_names)
+            + " in the selected analyzed scope. Please check the identifier or the available analysis. "
+            "I have not substituted a full inventory for this lookup.",
+            [], route="unclear", scope=initial_scope,
+            plan=replace(initial_plan, requires_clarification=True),
+            execution_mode="clarification",
+        )
     if (
         initial_scope.ambiguous
         and initial_scope.entity_source == "question_unresolved"
@@ -787,9 +1302,31 @@ def answer_query(
         # broader semantic executor.
         refined_typed_answer = _typed_query_answer(initial_plan, question)
         if refined_typed_answer:
+            typed_sources = []
+            for target_program in initial_plan.programs or (initial_plan.program,):
+                typed_sources.extend(_final_script_sources(refined_typed_answer, target_program, initial_plan))
+            contract = validate_plan_answer(initial_plan, refined_typed_answer)
+            if not contract.passed:
+                return finish(
+                    "Evidence was found, but the answer did not satisfy the requested output contract.",
+                    typed_sources,
+                    scope=initial_scope,
+                    plan=initial_plan,
+                    execution_mode="typed_query",
+                    guard_status_override="insufficient",
+                    debug={
+                        "status": "rejected",
+                        "candidate_answer": refined_typed_answer,
+                        "validation": {
+                            "stage": "post_refinement_typed_query",
+                            "passed": False,
+                            "reasons": list(contract.reasons),
+                        },
+                    },
+                )
             return finish(
                 refined_typed_answer,
-                [],
+                typed_sources,
                 scope=initial_scope,
                 plan=initial_plan,
                 execution_mode="typed_query",
@@ -2073,7 +2610,14 @@ def _typed_query_answer(plan: Any, question: str, config: Any = None) -> str | N
         return None
     try:
         context = _typed_query_context(plan, question)
-        context["capability"] = _routed_capability(question, config, plan)
+        planned_capabilities = {
+            item.capability for item in getattr(plan, "subtasks", ())
+            if getattr(item, "required", True)
+        }
+        context["capability"] = (
+            next(iter(planned_capabilities)) if len(planned_capabilities) == 1
+            else _routed_capability(question, config, plan)
+        )
         compiled = compile_queries(question, **context)
     except Exception:
         return None
@@ -2205,6 +2749,8 @@ def _routed_capability(question: str, config: Any, plan: Any) -> str | None:
 
 
 def _typed_query_context(plan: Any, question: str) -> dict[str, Any]:
+    from cobol_rag.quality_scope import quality_tasks_for_plan
+
     graph_nodes = _graph_node_names(plan.program) if plan.program else ()
     effective_output_fields = tuple(dict.fromkeys((
         *(getattr(plan, "output_fields", ()) or ()),
@@ -2219,6 +2765,7 @@ def _typed_query_context(plan: Any, question: str) -> dict[str, Any]:
         "programs": plan.programs or ((plan.program,) if plan.program else ()),
         "paragraphs": plan.entity_values_for("paragraph"),
         "variables": plan.entity_values_for("variable"),
+        "unresolved_entities": plan.entity_values_for("unknown_identifier"),
         "calls": plan.entity_values_for("call"),
         "graph_nodes": graph_nodes,
         "screen_fields": screen_field_names(plan.program) if plan.program else (),
@@ -2232,12 +2779,7 @@ def _typed_query_context(plan: Any, question: str) -> dict[str, Any]:
         # access role is silently lost before compilation.
         "output_fields": effective_output_fields,
         "operations": getattr(plan, "operations", ()) or (),
-        "quality_categories": tuple(
-            task for task in (getattr(plan, "tasks", ()) or ())
-            if task in {
-                "commented_code", "unreachable_code", "unused_copybooks", "review_copybooks",
-            }
-        ),
+        "quality_categories": quality_tasks_for_plan(plan),
         "query_spec": getattr(plan, "query_spec", None),
         "allow_inventory": (
             not plan.tasks
@@ -2295,7 +2837,9 @@ def _execute_typed_query(plan: Any, compiled: Any) -> str | None:
                 "answer the requested query."
             )
         return answer_inventory(
-            compiled.program, compiled.entity_type, compiled.property_filter
+            compiled.program, compiled.entity_type, compiled.property_filter,
+            limit=getattr(getattr(plan, "response_contract", None), "exact_item_count", None),
+            offset=getattr(plan, "result_offset", 0),
         )
     if compiled.kind == "screen_field":
         return answer_screen_field(compiled.program, compiled.field)
@@ -3557,7 +4101,8 @@ def _route_query(
             if fallback is not None:
                 return fallback
         return decision
-    except Exception:
+    except Exception as routing_error:
+        _log_stage_latency("route_query_rejected", 0.0, f"error={type(routing_error).__name__}: {routing_error}")
         try:
             _compact_started = time.perf_counter()
             _compact_prompt = _build_compact_routing_prompt(
@@ -3586,8 +4131,15 @@ def _route_query(
             if _conversational_route_is_blocked(question, config, decision, preliminary_scope):
                 raise QueryError("A conversational route cannot answer an evidence question.")
             return decision
-        except Exception:
-            pass
+        except Exception as compact_error:
+            _log_stage_latency("route_query_compact_rejected", 0.0, f"error={type(compact_error).__name__}: {compact_error}")
+            # A nontechnical message needs no evidence plan. Recover that route
+            # with a small independent envelope, not a truncated technical schema.
+            recovered = _recover_conversational_route(
+                question, config, preliminary_plan, preliminary_scope, session_state,
+            )
+            if recovered is not None:
+                return recovered
         # The planner produced nothing usable. Rank capabilities by meaning before
         # falling back to an empty plan, which would select no evidence at all.
         capability_decision = _capability_routing_decision(
@@ -3632,6 +4184,31 @@ def _route_query(
             response_language=fallback_language,
             planner_source="deterministic_fallback",
         )
+
+
+def _recover_conversational_route(question, config, plan, scope, state):
+    language = plan.response_language if plan else "en"
+    prompt = (
+        "Classify this message. Return only a JSON object with route and reply. "
+        "route is conversational for greetings, farewells, thanks, or general knowledge; "
+        "technical for requests about indexed code, files, programs or their evidence; "
+        "unclear otherwise. For technical or unclear, reply is empty. "
+        f"For conversational, answer briefly in {language}. Do not emit a query plan.\n"
+        + json.dumps({"message": question})
+    )
+    try:
+        response = build_llm(config, json_mode=True, max_output_tokens=180, temperature=0.0).complete(prompt)
+        decision = _parse_routing_decision(str(response.text))
+        if decision.route != "conversational" or not decision.reply.strip():
+            return None
+        if _routing_conflicts_with_verified_scope(decision, plan, scope):
+            return None
+        if _conversational_route_is_blocked(question, config, decision, scope):
+            return None
+        return _finalize_routing_language(question, decision, config, plan, state)
+    except Exception as error:
+        _log_stage_latency("route_query_conversation_rejected", 0.0, f"error={type(error).__name__}: {error}")
+        return None
 
 
 def _ensure_executable_query_spec(
@@ -4170,6 +4747,12 @@ def _ensure_executable_query_spec(
             normalized_filter_values = {
                 str(value).strip().upper() for value in filter_values if str(value or "").strip()
             }
+            if field_name == "call_type" and not normalized_filter_values <= {
+                "CALL", "LINK", "XCTL", "CICSLINK", "CICSXCTL",
+                "CALLBYLITERAL", "CALLBYIDENTIFIER", "CICSLINKBYLITERAL",
+                "CICSLINKBYIDENTIFIER", "CICSXCTLBYLITERAL", "CICSXCTLBYIDENTIFIER",
+            }:
+                errors.append("invalid_call_type_filter: use CALL, LINK or XCTL; workflow descriptions are not call types")
             if field_name == "paragraph" and any(
                 "paragraph" not in grounded_types.get(value, set())
                 for value in normalized_filter_values
@@ -4307,6 +4890,8 @@ User request: {question}
 Grounded programs (the only program names allowed): {json.dumps(programs)}
 Grounded entities (the only named entities allowed): {json.dumps(entities, sort_keys=True)}
 Already classified meaning: {json.dumps(classified, sort_keys=True)}
+Rejected specification reasons: {json.dumps(specification_errors(raw_spec) if isinstance(raw_spec, dict) else ['missing_query_spec'])}
+Call-type filters describe invocation mechanisms (CALL, LINK, XCTL), not business activities or workflow names. If a workflow qualifier cannot be grounded, do not invent a call type.
 
 Schema: {json.dumps(schema)}
 Allowed operators: {', '.join(sorted(ALLOWED_QUERY_OPERATORS))}
@@ -5761,6 +6346,22 @@ def _claim_supported_by_sources(
     source_texts = [source.text for source in sources]
     if exact_code or re.match(r"^(?:IF|MOVE|GO\s+TO|PERFORM|EXEC|CALL)\b", clean, re.IGNORECASE):
         return any(normalized_claim in _normalized_evidence_text(text) for text in source_texts)
+
+    # A coordinated identifier list contains one assertion per member, not a
+    # relationship between its members. Validate each against its own evidence;
+    # never accept merely because the union of chunks mentions all names.
+    # Keep this deliberately restricted to an unambiguous copular list. Other
+    # prose remains subject to the ordinary single-claim checks below.
+    listing = re.fullmatch(
+        r"(.+?\bare\s+)([A-Z][A-Z0-9-]*(?:(?:,\s*(?:and\s+)?|\s+and\s+)[A-Z][A-Z0-9-]*)+)\.?",
+        clean,
+    )
+    if listing:
+        members = re.split(r",\s*(?:and\s+)?|\s+and\s+", listing.group(2))
+        return all(
+            _claim_supported_by_sources(listing.group(1) + member, sources, exact_code=False)
+            for member in members
+        )
 
     identifiers = [
         value

@@ -29,6 +29,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from cobol_rag.quality_scope import quality_categories_named
+
 
 # --------------------------------------------------------------------------
 # Query types
@@ -423,18 +425,7 @@ def property_filter_named(question: str) -> str | None:
 
 def unused_categories_named(question: str) -> tuple[str, ...]:
     """Which quality evidence families the subject of the question permits."""
-    copybook_requested = entity_type_named(question) == "copybook"
-    code_requested = bool(re.search(r"(?<![a-z])(?:unused|dead)\s+code(?![a-z])", question, re.I))
-    if copybook_requested and not code_requested:
-        return ("unused_copybooks", "review_copybooks")
-    if re.search(r"(?<![a-z])unreachable(?![a-z])", question, re.I):
-        return ("unreachable_code",)
-    if re.search(r"(?<![a-z])comment(?:ed)?(?![a-z])", question, re.I):
-        return ("commented_code",)
-    code_categories = UnusedCode("").categories
-    if copybook_requested:
-        return (*code_categories, "unused_copybooks", "review_copybooks")
-    return code_categories
+    return quality_categories_named(question)
 
 
 
@@ -495,6 +486,7 @@ def compile_query(
     programs: Sequence[str] = (),
     paragraphs: Sequence[str] = (),
     variables: Sequence[str] = (),
+    unresolved_entities: Sequence[str] = (),
     calls: Sequence[str] = (),
     graph_nodes: Sequence[str] = (),
     screen_fields: Sequence[str] = (),
@@ -523,6 +515,12 @@ def compile_query(
             "commented_code", "unreachable_code", "unused_copybooks", "review_copybooks",
         }
     ))
+
+    # An unresolved operand is still part of the request. Never broaden a
+    # failed lookup into a whole-inventory comparison, even if a specification
+    # was produced later. Let the scope/evidence path report the missing name.
+    if unresolved_entities:
+        return None
 
     # The semantic planner owns meaning. Once it emitted a validated canonical
     # query, do not re-interpret the English and accidentally change direction,
@@ -610,7 +608,9 @@ def compile_query(
             upper_question,
         )
     )
-    if variables:
+    if calls and capability in {"call_evidence", "call_context"}:
+        membership_entity, membership_type = calls[0].upper(), "call"
+    elif variables:
         membership_entity, membership_type = variables[0].upper(), "variable"
     elif explicit_copybooks:
         membership_entity, membership_type = explicit_copybooks[0], "copybook"
@@ -777,8 +777,9 @@ def compile_query(
 
     # "Unused code or copy" is one question spanning three artifacts. Answered
     # from whichever the planner picked, it reported no unused copybooks while
-    # proven-unreachable paragraphs sat unmentioned in the graph.
-    if _UNUSED_QUESTION.search(question):
+    # graph-based candidates sat unmentioned in the analysis. Typed semantic
+    # obligations also work without matching the fallback's wording.
+    if requested_quality or _UNUSED_QUESTION.search(question):
         categories = requested_quality or unused_categories_named(question)
         return UnusedCode(program=program, categories=categories)
 

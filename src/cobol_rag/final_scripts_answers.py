@@ -121,7 +121,10 @@ def answer_from_final_scripts(
             return answer
 
     if intent == "dead_code" or (use_text_fallback and _asks_about_dead_or_commented_code(q)):
-        answer = _answer_commented_code(root, program, q)
+        from cobol_rag.quality_scope import quality_tasks_for_plan, quality_categories_named
+
+        categories = quality_tasks_for_plan(plan) if plan else ()
+        answer = answer_unused_code(program, categories or quality_categories_named(q))
         if answer:
             return answer
 
@@ -1652,6 +1655,14 @@ def answer_entity_membership(
         return None
     entity = entity.upper()
     requested = set(fields) | {"exists"}
+    artifact_names = {
+        "variable": "dataflow.used_variables.json",
+        "copybook": "architecture.copybooks.json",
+        "call": "architecture.call_parameters.json",
+    }
+    artifact_name = artifact_names.get(entity_type)
+    if artifact_name is None:
+        return None
     lines = [f"{entity} {entity_type} membership:"]
     found_any = False
     for program in dict.fromkeys(str(value).upper() for value in programs if value):
@@ -1661,8 +1672,23 @@ def answer_entity_membership(
             continue
         details: list[str] = []
         present = False
+        payload = _read_json(_artifact_path(program_root, artifact_name))
+        if entity_type == "variable" and isinstance(payload, list):
+            payload = {"variables": payload}
+        # Missing or malformed inventories cannot establish non-membership.
+        if not isinstance(payload, dict) or (
+            entity_type == "variable" and not isinstance(payload.get("variables"), list)
+        ) or (
+            entity_type == "call" and not isinstance(payload.get("calls"), list)
+        ) or (
+            entity_type == "copybook" and (
+                not isinstance(payload.get("content"), dict)
+                or not isinstance(payload["content"].get("all"), list)
+            )
+        ):
+            lines.append(f"- {program}: {artifact_name} unavailable or invalid; membership unknown")
+            continue
         if entity_type == "variable":
-            payload = _read_json(_artifact_path(program_root, "dataflow.used_variables.json"))
             variables = (payload.get("variables") if isinstance(payload, dict) else payload) or []
             record = next((
                 item for item in variables
@@ -1682,7 +1708,6 @@ def answer_entity_membership(
                     if locations:
                         details.append(locations)
         elif entity_type == "copybook":
-            payload = _read_json(_artifact_path(program_root, "architecture.copybooks.json"))
             content = (payload or {}).get("content") or {}
             present = entity in {str(value).upper() for value in content.get("all") or []}
             if present and "source_line" in requested:
@@ -1697,13 +1722,23 @@ def answer_entity_membership(
                 )
                 if locations:
                     details.append(locations)
-        else:
-            return None
+        elif entity_type == "call":
+            matching = [
+                item for item in payload["calls"]
+                if isinstance(item, dict) and str(item.get("target") or "").upper() == entity
+            ]
+            present = bool(matching)
+            if present:
+                details.extend(
+                    f"{item.get('call_type') or 'call'} in {item.get('paragraph') or '?'}"
+                    f" line {item.get('line_start') or '?'}"
+                    for item in matching
+                )
         found_any = found_any or present
         suffix = f"; {'; '.join(details)}" if details else ""
         lines.append(f"- {program}: {'present' if present else 'not present'}{suffix}")
     lines.append(
-        "Sources: `dataflow.used_variables.json` or `architecture.copybooks.json` per program."
+        f"Source: `{artifact_name}` per program; membership is limited to this analyzed inventory."
     )
     return "\n".join(lines) if found_any or len(lines) > 2 else None
 
@@ -3228,7 +3263,7 @@ def _answer_variable_access(
                 for literal in assigned_literals:
                     matching_sites = [
                         site for site in control_sites
-                        if literal.upper() in str(site.get("statement", "")).upper()
+                        if _condition_contains_literal(str(site.get("statement", "")), literal)
                     ]
                     if matching_sites:
                         locations = ", ".join(
@@ -3947,6 +3982,29 @@ def _normalized_variable_sites(
         else:
             corrected_reads.append(site)
     return _unique_sites(corrected_writes), _unique_sites(corrected_reads), conflicts
+
+
+def _condition_contains_literal(statement: str, literal: str) -> bool:
+    """Compare literal tokens, not substrings; numeric signs are not identity.
+
+    Quoted values remain strings: '01' is not the numeric value +1. Masking
+    quoted tokens also prevents an identifier suffix or a string containing a
+    digit from being mistaken for a numeric comparison.
+    """
+    from decimal import Decimal, InvalidOperation
+
+    value = literal.strip()
+    tokens = re.findall(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|[A-Z0-9_-]+(?:\.[0-9]+)?|[+]?[0-9]+(?:\.[0-9]+)?", statement.upper())
+    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", value):
+        for token in tokens:
+            if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", token):
+                try:
+                    if Decimal(token) == Decimal(value):
+                        return True
+                except InvalidOperation:
+                    continue
+        return False
+    return value.upper() in tokens
 
 
 def _assigned_literal_values(variable: str, write_sites: list[dict[str, Any]]) -> list[str]:
@@ -4857,7 +4915,8 @@ def answer_screen_field(program: str, field: str) -> str | None:
 
 
 def answer_inventory(
-    program: str, entity_type: str, property_filter: str | None = None
+    program: str, entity_type: str, property_filter: str | None = None,
+    *, limit: int | None = None, offset: int = 0,
 ) -> str | None:
     """Everything of one kind in a program, narrowed by a property if given.
 
@@ -4887,8 +4946,11 @@ def answer_inventory(
         if not selected:
             return None
         names = sorted(str(v.get("variable")) for v in selected if v.get("variable"))
+        total = len(names)
+        names = names[offset:offset + limit if limit is not None else None]
         qualifier = " that control flow" if property_filter == "controls_flow" else ""
-        head = f"{len(names)} variable(s) in {program}{qualifier}:"
+        head = (f"{len(names)} of {total} variable(s) in {program}{qualifier}:"
+                if limit is not None or offset else f"{total} variable(s) in {program}{qualifier}:")
         body = "\n".join(f"- {name}" for name in names)
         return f"{head}\n{body}\nSource: `dataflow.used_variables.json`."
 
@@ -5397,7 +5459,7 @@ def answer_unused_code(
     "Is there unused code or copy" is one question about three artifacts:
     unreferenced copybooks, paragraphs no edge reaches, and code left behind as
     comments. Answering from whichever one the planner picked reported no
-    unused copybooks while five proven-unreachable paragraphs sat in the graph.
+    unused copybooks while graph-based candidates sat in the analysis.
     """
     root = find_final_scripts_root()
     if root is None:
@@ -5423,6 +5485,8 @@ def answer_unused_code(
         )
     elif "unreachable_code" in requested and reachability.get("status") == "computed_from_controlflow_cfg":
         sections.append("Every paragraph is reached by at least one recorded edge.")
+    elif "unreachable_code" in requested:
+        sections.append("Unreachable-code assessment unavailable: no completed CFG reachability analysis was recorded.")
 
     commented = dead.get("commented_out_code") or []
     if "commented_code" in requested and commented:
@@ -5434,6 +5498,12 @@ def answer_unused_code(
         )
         more = f"\n- ... and {len(commented) - len(shown)} more" if len(commented) > len(shown) else ""
         sections.append(f"Code left behind as comments ({len(commented)}):\n{body}{more}")
+    elif "commented_code" in requested:
+        sections.append(
+            "No commented-out code is recorded in the available analysis."
+            if "commented_out_code" in dead
+            else "Commented-out-code assessment unavailable: the analysis does not record this category."
+        )
 
     unused = (
         _read_json(_artifact_path(program_root, "architecture.unused_copybooks.json")) or {}
@@ -5446,11 +5516,21 @@ def answer_unused_code(
             + "\n".join(f"- {name}" for name in proven)
         )
     elif "unused_copybooks" in requested:
-        sections.append("No copybook is proven unused by the available artifacts.")
+        sections.append(
+            "No copybook is proven unused by the available artifacts."
+            if "unused_copybooks_proven" in unused
+            else "Unused-copybook assessment unavailable: no proof inventory was recorded."
+        )
     if "review_copybooks" in requested and review:
         sections.append(
             f"Copybooks needing review ({len(review)}):\n"
             + "\n".join(f"- {name}" for name in review)
+        )
+    elif "review_copybooks" in requested:
+        sections.append(
+            "No copybooks needing review are recorded in the available analysis."
+            if "needs_review_copybooks" in unused
+            else "Copybooks needing review: assessment unavailable in the recorded analysis."
         )
     if requested & {"unused_copybooks", "review_copybooks"} and unused.get("proof_level"):
         caveats.append(str(unused["proof_level"]))

@@ -6,6 +6,8 @@ import re
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
+from cobol_rag.quality_scope import quality_categories_named, quality_tasks_for_plan
+
 from cobol_rag.scope import (
     EntityReference,
     QueryScope,
@@ -253,7 +255,7 @@ def parse_response_contract(question: str) -> ResponseContract:
     item_match = re.search(
         rf"\b(?:exactly\s+(?:the\s+)?(?:first\s+)?|(?:the\s+)?first\s+)({number})\s+"
         r"(?:(?:literal|forced|outgoing|external)\s+)?"
-        r"(?:bullet(?:\s+points?)?|bullets?|items?|results?|values?|assignments?|calls?|programs?|copybooks?)\b",
+        r"(?:bullet(?:\s+points?)?|bullets?|items?|results?|values?|assignments?|calls?|programs?|copybooks?|variables?|fields?|of\s+(?:them|those|these))\b",
         q,
     )
     if item_match:
@@ -2015,6 +2017,26 @@ def validate_plan_answer(plan: QueryPlan, answer: str) -> PlanContractValidation
     # and every sentence of it was citable.
     reasons.extend(_uncovered_control_flow_claims(plan, answer))
 
+    # A compound quality answer must address every requested category, even if
+    # the result for one category is empty or unavailable. Citations alone do
+    # not demonstrate coverage (a copybook-only answer can cite a dead-code
+    # artifact). This checks coverage, not proof that code is unreachable.
+    quality_tasks = quality_tasks_for_plan(plan)
+    if len(quality_tasks) > 1 and response.format not in {"count", "json", "json_array"}:
+        body = "\n".join(
+            line for line in lowered.splitlines()
+            if not re.match(r"\s*(?:sources?|scope):", line)
+        )
+        markers = {
+            "commented_code": (r"\bcomment(?:ed|s)?\b",),
+            "unreachable_code": (r"\bunreachable\b", r"\breachability\b", r"\bno recorded edge reaches\b", r"\bevery paragraph is reached\b", r"\ball cfg nodes are reachable\b"),
+            "unused_copybooks": (r"\b(?:copybooks?[^\n]*unused|unused[- ]copybooks?)\b", r"\bnone are proven unused\b"),
+            "review_copybooks": (r"\breview\b",),
+        }
+        for task in quality_tasks:
+            if not any(re.search(pattern, body) for pattern in markers[task]):
+                reasons.append(f"missing_requested_section:{task}")
+
     # Program-level capabilities describe a whole program rather than a location in
     # it, so requiring a source line from them rejects a correct answer for a field
     # the capability never renders.
@@ -2214,16 +2236,7 @@ def _fallback_tasks_and_relations(q: str, intent: str) -> tuple[tuple[str, ...],
         if "separat" in q:
             relations.append("separate_categories")
     elif intent == "dead_code":
-        if "comment" in q:
-            tasks.append("commented_code")
-        if "unreachable" in q:
-            tasks.append("unreachable_code")
-        if "unused" in q and ("copybook" in q or "copy book" in q or "copy" in q):
-            tasks.extend(["unused_copybooks", "review_copybooks"])
-        if "review" in q:
-            tasks.append("review_copybooks")
-        if not tasks:
-            tasks.extend(["commented_code", "unreachable_code"])
+        tasks.extend(quality_categories_named(q))
         if "separat" in q:
             relations.append("separate_categories")
     elif intent == "business_rules":

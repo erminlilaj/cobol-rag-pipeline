@@ -324,6 +324,23 @@ _CORPUS_RELATIONS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _clause_naming(question: str, entity: str) -> str:
+    """The part of the question that names this entity.
+
+    A relation read from the whole question can be taken from a clause that is
+    about something else: "who invokes PD0UTI01, and what COMMAREA or parameter
+    is used" carries "used" -- and so the "includes" relation -- only in its
+    second clause, and the answer then reported that no program includes a name
+    the registry records solely as a call. True, irrelevant, and printed above
+    the real answer where it reads as contradicting it.
+    """
+    named = re.compile(rf"(?<![A-Z0-9-]){re.escape(entity.upper())}(?![A-Z0-9-])")
+    for clause in re.split(r"\s*(?:,\s*and\b|;|\band\b)\s*", question, flags=re.I):
+        if named.search(clause.upper()):
+            return clause
+    return question
+
+
 def corpus_relation_named(question: str) -> str | None:
     for pattern, relation in _CORPUS_RELATIONS:
         if re.search(pattern, question, re.I):
@@ -605,7 +622,8 @@ def compile_query(
     ):
         return CorpusReferences(
             entity=corpus_entity.upper(),
-            relation=corpus_relation_named(question),
+            relation=("calls" if capability in {"call_evidence", "call_context"}
+                      else corpus_relation_named(_clause_naming(question, corpus_entity))),
         )
 
     # Whether two programs agree about a field of one named entity is that
@@ -817,6 +835,8 @@ def compile_query(
     predicate = property_filter_named(question)
     scope_paragraph = paragraph_scope(question, graph_nodes, program)
     wanted = entity_type_named(question) or inherited_entity_type
+    if wanted == "variable" and "control_usage" in requested_fields and predicate is None:
+        predicate = "controls_flow"
     if wanted is None and _OPERATION_WORD.search(question):
         wanted = "cics_operation"
     elif wanted is None and _CALL_WORD.search(question):
@@ -850,7 +870,7 @@ def compile_query(
     # or several programs are named.  The earlier special case covered only the
     # multi-program form and let a single-program question expand into the full
     # variable lifecycle.
-    if variables and _LITERAL_QUESTION.search(question):
+    if variables and (_LITERAL_QUESTION.search(question) or capability == "literal_assignment"):
         return FieldProjection(
             program=program,
             entity=variables[0].upper(),

@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from cobol_rag.final_scripts_answers import (
     answer_incoming_calls,
+    answer_corpus_references,
     answer_semantic_projection,
     incoming_calls,
 )
@@ -134,6 +135,22 @@ class DirectionIsExecutedTest(_CorpusFixture):
                    return_value="OUTGOING") as outgoing:
             self.assertEqual(answer_semantic_projection(self._query("outgoing")), "OUTGOING")
         outgoing.assert_called_once()
+
+    def test_explicit_target_does_not_require_a_target_artifact(self) -> None:
+        query = self._query("incoming")
+        query.target_entity = "SUBPGM"
+        query.entity_values = ("PROGA", "SUBPGM")
+        with patch("cobol_rag.final_scripts_answers._semantic_program_roots", return_value=[]):
+            answer = answer_semantic_projection(query)
+        self.assertIn("COMMAREA WSUB", answer)
+
+    def test_empty_incoming_set_does_not_become_registry_definition(self) -> None:
+        query = compile_query("Who invokes PROGA, and what parameter is used?",
+                              program="PROGA", corpus_entity="PROGA", capability="call_evidence")
+        self.assertEqual(query.relation, "calls")
+        answer = answer_corpus_references(query.entity, query.relation)
+        self.assertIn("No analyzed program calls", answer)
+        self.assertIn("No incoming COMMAREA", answer)
 
 
 class RoutingWithoutAVerbListTest(unittest.TestCase):

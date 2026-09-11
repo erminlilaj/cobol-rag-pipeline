@@ -111,6 +111,17 @@ class SessionState:
         self.pending_clarification = scope.reason if scope.ambiguous else None
         if plan is not None:
             self.current_plan = dict(plan)
+            self.current_intent = str(plan.get("intent") or self.current_intent or "general")
+            # Inventories have a subject type but no focused identifier. Keep
+            # that distinction so a refinement can narrow the collection.
+            if not resolved_entities:
+                tasks = set(plan.get("tasks") or ())
+                if any(str(task).startswith("variable") for task in tasks):
+                    self.current_entity_type = "variable"
+                elif tasks & {"copybooks", "unused_copybooks", "review_copybooks"}:
+                    self.current_entity_type = "copybook"
+                elif "unreachable_code" in tasks:
+                    self.current_entity_type = "paragraph"
             self.current_domain = str(plan.get("domain") or "") or None
             self.current_tasks = [str(value) for value in plan.get("tasks", [])]
             self.last_capabilities = [
@@ -707,6 +718,8 @@ def _looks_like_followup(question: str) -> bool:
         or _POSSESSIVE_REFERENCE.search(q)
         or _NAMED_REFERENCE.search(q)
         or _PLURAL_ENTITY_REFERENCE.search(q)
+        or re.search(r"\b(?:which ones|how many(?: distinct values)? (?:was|were|is|are) that)\b", q)
+        or is_program_scope_followup(question)
         or re.match(r"^(?:and\s+)?(?:where|what|how|why|when)\s+else\b", q)
         or re.match(r"^(?:and\s+)?(?:what|how)\s+about\b", q)
         or re.match(
@@ -715,6 +728,19 @@ def _looks_like_followup(question: str) -> bool:
             q,
         )
     )
+
+
+def is_program_scope_followup(question: str, program: str | None = None) -> bool:
+    """A scope-only ellipsis replaces the program, not the previous task.
+
+    Restrict this to an entire prepositional clause, so an explicit new
+    request (e.g. an overall summary) never inherits the old task.
+    """
+    name = re.escape(program) if program else r"(?-i:[A-Z][A-Z0-9_-]*\d[A-Z0-9_-]*|[A-Z]{3,})"
+    return bool(re.fullmatch(
+        rf"\s*(?:and\s+)?(?:in|for|about)\s+(?:{name})\s*[?.!]?\s*",
+        question, flags=re.I,
+    ))
 
 
 def _should_reuse_state_entities(

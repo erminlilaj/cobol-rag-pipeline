@@ -14,6 +14,7 @@ from cobol_rag.scope import (
     SessionState,
     named_identifiers_in,
     refers_to_previous_turn,
+    is_program_scope_followup,
 )
 
 
@@ -199,7 +200,7 @@ def parse_response_contract(question: str) -> ResponseContract:
     elif re.search(
         r"\b(?:how many|number of|count of)\b.{0,45}"
         r"\b(?:variables?|fields?|data items?|calls?|programs?|copybooks?|"
-        r"operations?|assignments?|forced values?)\b",
+        r"operations?|assignments?|(?:distinct |forced )?values?)\b",
         q,
     ) and not re.search(
         r"\b(?:summary|summarize|summarise|overview|describe|explain|list|show)\b"
@@ -753,6 +754,9 @@ def build_query_plan(
     resolved_intent = intent or scope.intent or "general"
     detected_intent = resolved_intent
     explicit_followup = _is_explicit_followup(q, question)
+    scope_only_followup = bool(state and scope.program and is_program_scope_followup(question, scope.program))
+    explicit_followup = explicit_followup or scope_only_followup
+    followup_quality: tuple[str, ...] = ()
     if explicit_followup and state and state.current_intent:
         # A follow-up names no subject of its own -- that is what makes it one
         # -- so it cannot be introducing a new one, and the words in it qualify
@@ -772,6 +776,11 @@ def build_query_plan(
             resolved_intent == "general" or named_type is None
         ):
             resolved_intent = state.current_intent
+        if not changes_subject and previous_type == "copybook" and re.search(r"\b(?:review|unused|proven)\b", q):
+            resolved_intent = "dead_code"
+            followup_quality = quality_categories_named(question, subject_type="copybook")
+        if not changes_subject and previous_type == "variable" and re.search(r"\bcontrol(?:s)?\s+(?:execution|(?:the\s+)?flow)\b", q):
+            resolved_intent = "variable_inventory"
 
     named_program_request = bool(
         scope.program
@@ -1080,7 +1089,7 @@ def build_query_plan(
             output_fields = tuple(
                 str(value) for value in previous.get("output_fields", [])
             )
-        if result_scope == "default":
+        if result_scope == "default" and resolved_intent == str(previous.get("intent", "")):
             previous_scope = str(previous.get("result_scope", "default"))
             if previous_scope in {"default", "all"}:
                 result_scope = previous_scope
@@ -1142,6 +1151,13 @@ def build_query_plan(
         confidence = min(confidence, 0.7)
     domain = _INTENT_DOMAIN.get(resolved_intent, "general")
     tasks, relations = _fallback_tasks_and_relations(q, resolved_intent)
+    if followup_quality:
+        tasks = followup_quality
+    elif explicit_followup and state and resolved_intent == state.current_intent:
+        # A presentation-only or scope-only follow-up retains the selected
+        # evidence family, not a fresh broad fallback for the same intent.
+        if scope_only_followup or not re.search(r"\b(?:unused|review|unreachable|commented)\b", q):
+            tasks = tuple(state.current_tasks) or tasks
     if scope.program and not scope.entities:
         requested_program_tasks: list[str] = []
         if re.search(r"\b(?:summary|summarize|summarise|overview)\b", q):
@@ -2126,6 +2142,7 @@ def validate_plan_answer(plan: QueryPlan, answer: str) -> PlanContractValidation
         control_usage_markers = (
             "control-flow use:",
             "controls flow",
+            "that control flow",
         )
         if not any(marker in lowered for marker in control_usage_markers):
             reasons.append("missing_requested_field:control_usage")

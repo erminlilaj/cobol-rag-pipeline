@@ -35,9 +35,9 @@ def quality_tasks_for_plan(plan: object) -> tuple[str, ...]:
     return named
 
 
-def quality_categories_named(question: str) -> tuple[str, ...]:
+def quality_categories_named(question: str, *, subject_type: str | None = None) -> tuple[str, ...]:
     text = re.sub(r"[-_\u2010-\u2015]+", " ", question.lower())
-    copybook = bool(re.search(r"\b(?:copy\s*books?|copies|copy)\b", text))
+    copybook = subject_type == "copybook" or bool(re.search(r"\b(?:copy\s*books?|copies|copy)\b", text))
     broad_code = bool(re.search(r"\b(?:unused|dead)\s+code\b", text))
     requested: set[str] = set()
     if broad_code or re.search(r"\bcomment(?:ed|s)?\b", text):

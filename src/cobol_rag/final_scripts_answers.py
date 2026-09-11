@@ -4599,6 +4599,15 @@ def _semantic_quality_answer(query: Any, program: str, root: Path) -> str | None
 
 def answer_semantic_projection(query: Any) -> str | None:
     """Execute the planner's canonical QuerySpec without re-reading English."""
+    if query.capability in {"call_evidence", "call_context"} and query.direction == "incoming":
+        # The target may be external and need not have its own artifact root.
+        target = getattr(query, "target_entity", None)
+        if not target:
+            values = tuple(dict.fromkeys(query.entity_values))
+            target = values[0] if len(values) == 1 else None
+        if not target:
+            return None  # Ambiguous roles must not become outgoing calls.
+        return answer_incoming_calls(str(target))
     roots = _semantic_program_roots(query)
     if not roots:
         return None
@@ -4615,16 +4624,6 @@ def answer_semantic_projection(query: Any) -> str | None:
         # its artifact records only what it calls.  Reading direction here is
         # what stops "who invokes X" returning X's outgoing calls -- a true
         # statement about the opposite relation.
-        if str(getattr(query, "direction", "") or "").strip().lower() == "incoming":
-            target = next(
-                (
-                    str(value).strip().upper()
-                    for value in query.entity_values
-                    if str(value).strip().upper() != program.strip().upper()
-                ),
-                program.strip().upper(),
-            )
-            return answer_incoming_calls(target)
         program_names = {name for name, _ in roots}
         constrained_targets = {
             value for value in query.entity_values if value not in program_names
@@ -4930,7 +4929,7 @@ def answer_screen_field(program: str, field: str) -> str | None:
 
 def answer_inventory(
     program: str, entity_type: str, property_filter: str | None = None,
-    *, limit: int | None = None, offset: int = 0,
+    *, limit: int | None = None, offset: int = 0, count_only: bool = False,
 ) -> str | None:
     """Everything of one kind in a program, narrowed by a property if given.
 
@@ -4961,6 +4960,8 @@ def answer_inventory(
             return None
         names = sorted(str(v.get("variable")) for v in selected if v.get("variable"))
         total = len(names)
+        if count_only:
+            return str(total)
         names = names[offset:offset + limit if limit is not None else None]
         qualifier = " that control flow" if property_filter == "controls_flow" else ""
         head = (f"{len(names)} of {total} variable(s) in {program}{qualifier}:"
@@ -5428,6 +5429,28 @@ def incoming_calls(target: str) -> tuple[dict[str, Any], ...]:
     return tuple(sorted(found, key=lambda item: (item["caller"], item["line_start"] or 0)))
 
 
+def call_records_available() -> bool:
+    """Whether any analyzed program has call records that could be searched.
+
+    An empty incoming result means nothing calls the target only when there
+    were records to search. Without any, the absence is unfalsifiable and the
+    registry, not the records, has to answer.
+    """
+    root = find_final_scripts_root()
+    if root is None:
+        return False
+    for program in analyzed_programs():
+        program_root = find_program_artifact_root(root, program)
+        if program_root is None:
+            continue
+        payload = _read_json(
+            _artifact_path(program_root, "architecture.call_parameters.json")
+        )
+        if isinstance(payload, dict) and isinstance(payload.get("calls"), list):
+            return True
+    return False
+
+
 def answer_incoming_calls(target: str) -> str | None:
     """Which analyzed programs call this one, and across what interface."""
     target = target.strip().upper()
@@ -5442,6 +5465,7 @@ def answer_incoming_calls(target: str) -> str | None:
     if not records:
         return (
             f"No analyzed program calls `{target}`.\n{scope_note}\n"
+            "No incoming COMMAREA or parameter can therefore be reported from these records.\n"
             f"Source: `architecture.call_parameters.json`."
         )
     plural = "" if len(records) == 1 else "s"
@@ -5494,7 +5518,12 @@ def answer_corpus_references(entity: str, relation: str | None = None) -> str | 
     # line, COMMAREA and parameters.  They refine the registry answer, they do
     # not replace it: with no readable call artifact this must fall through to
     # the registry rather than report an absence the records cannot support.
-    if relation in {None, "calls"} and incoming_calls(entity):
+    # An explicit call relation is answered from the records whenever there are
+    # records to search, so an empty result can say which interface it could
+    # not report. With nothing readable it falls back to the registry.
+    if relation in {None, "calls"} and (
+        incoming_calls(entity) or (relation == "calls" and call_records_available())
+    ):
         detailed = answer_incoming_calls(entity)
         if detailed is not None:
             return detailed
@@ -5665,7 +5694,7 @@ def answer_unused_code(
     return answer
 
 
-def answer_literal_projection(program: str, entity: str) -> str | None:
+def answer_literal_projection(program: str, entity: str, *, count_only: bool = False) -> str | None:
     """The literal values assigned to one named variable in one program.
 
     Comparing this across programs is that projection read in each. Routed to
@@ -5692,6 +5721,8 @@ def answer_literal_projection(program: str, entity: str) -> str | None:
             f"Source: `dataflow.literal_assignments.json`."
         )
     values = sorted({str(item.get("literal")) for item in matched})
+    if count_only:
+        return str(len(values))
     lines = [
         f"{entity} in {program} is assigned {len(values)} distinct literal value(s): "
         f"{', '.join(repr(value) for value in values)}"

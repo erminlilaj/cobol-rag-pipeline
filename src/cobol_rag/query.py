@@ -2748,6 +2748,20 @@ def _routed_capability(question: str, config: Any, plan: Any) -> str | None:
     return None
 
 
+def _single_subtask_capability(plan: Any) -> str | None:
+    """The capability every claim agrees on, or None when they differ.
+
+    Read with getattr like the rest of the typed context, so a claim that
+    carries no capability contributes nothing instead of failing the build.
+    """
+    capabilities = {
+        capability
+        for item in (getattr(plan, "subtasks", ()) or ())
+        if (capability := getattr(item, "capability", None))
+    }
+    return next(iter(capabilities)) if len(capabilities) == 1 else None
+
+
 def _typed_query_context(plan: Any, question: str) -> dict[str, Any]:
     from cobol_rag.quality_scope import quality_tasks_for_plan
 
@@ -2772,6 +2786,7 @@ def _typed_query_context(plan: Any, question: str) -> dict[str, Any]:
         "copybooks": program_copybooks(plan.program) if plan.program else (),
         "corpus_entity": _corpus_subject_entity(question, plan),
         "entity_type": _comparison_entity_type(plan),
+        "capability": _single_subtask_capability(plan),
         "inherited_entity_type": _inherited_entity_type(plan),
         # Semantic refinement may attach a projection to one claim rather than
         # to the plan envelope.  The executor sees the effective contract of
@@ -2821,6 +2836,14 @@ def _execute_typed_query(plan: Any, compiled: Any) -> str | None:
     if compiled.kind == "copybook_role":
         return answer_copybook_role(compiled.program, compiled.copybook)
     if compiled.kind == "inventory":
+        if compiled.entity_type == "variable" and not compiled.in_paragraph:
+            contract = getattr(plan, "response_contract", None)
+            return answer_inventory(
+                compiled.program, compiled.entity_type, compiled.property_filter,
+                limit=getattr(contract, "exact_item_count", None),
+                offset=getattr(plan, "result_offset", 0),
+                count_only=getattr(contract, "format", None) == "count",
+            )
         if compiled.property_filter or compiled.in_paragraph:
             qualified = answer_qualified_inventory(
                 compiled.program,
@@ -2858,7 +2881,10 @@ def _execute_typed_query(plan: Any, compiled: Any) -> str | None:
                 return "\n\n".join(rendered)
             return None
         if compiled.field == "literals":
-            return answer_literal_projection(compiled.program, compiled.entity)
+            return answer_literal_projection(
+                compiled.program, compiled.entity,
+                count_only=getattr(getattr(plan, "response_contract", None), "format", None) == "count",
+            )
         return answer_field_projection(
             compiled.program, compiled.entity, compiled.field
         )

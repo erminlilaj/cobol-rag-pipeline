@@ -79,6 +79,18 @@ class ObservabilityConfig:
 
 
 @dataclass(frozen=True)
+class InvestigationConfig:
+    enabled: bool = False
+    max_model_calls: int = 6
+    max_tool_calls: int = 10
+    timeout_seconds: int = 90
+
+    def __post_init__(self):
+        if not 3 <= self.max_model_calls <= 8 or not 1 <= self.max_tool_calls <= 20 or not 10 <= self.timeout_seconds <= 300:
+            raise ValueError('Investigation limits require 3..8 model calls, 1..20 tool calls and 10..300 seconds.')
+
+
+@dataclass(frozen=True)
 class AppConfig:
     paths: PathConfig = field(default_factory=PathConfig)
     llm: LlmConfig = field(default_factory=LlmConfig)
@@ -87,6 +99,7 @@ class AppConfig:
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     answers: AnswerConfig = field(default_factory=AnswerConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
+    investigation: InvestigationConfig = field(default_factory=InvestigationConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -101,6 +114,7 @@ def load_config(path: Path = Path("config/default.yaml")) -> AppConfig:
         retrieval=RetrievalConfig(**data.get("retrieval", {})),
         answers=AnswerConfig(**data.get("answers", {})),
         observability=ObservabilityConfig(**data.get("observability", {})),
+        investigation=InvestigationConfig(**data.get("investigation", {})),
         raw=data,
     )
 
@@ -133,6 +147,8 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         _set_nested(result, ("retrieval", "top_k"), int(top_k))
     if context_window := os.getenv("COBOL_RAG_LLM_CONTEXT_WINDOW"):
         _set_nested(result, ("llm", "context_window"), int(context_window))
+    if investigation := os.getenv("COBOL_RAG_INVESTIGATION"):
+        _set_nested(result, ("investigation", "enabled"), investigation.lower() in {"1", "true", "yes", "on"})
     return result
 
 

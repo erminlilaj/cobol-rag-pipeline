@@ -21,6 +21,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 # What each capability answers, written as meaning rather than as keywords.
 CAPABILITY_DESCRIPTORS: dict[str, str] = {
+    "corpus_inventory": "List or count the programs available in the analyzed corpus, known indexed programs, available COBOL sources; corpus-wide discovery without selecting a program. Not outgoing calls or artifacts inside a program.",
     # The typed capabilities. Described by meaning like every other one, so the
     # router selects them from what a question means rather than from the words
     # it happens to use. They were previously reached through hand-written

@@ -151,6 +151,9 @@ class SemanticProjection:
     source_entity: str | None = None
     target_entity: str | None = None
     filters: tuple[tuple[str, str, tuple[str, ...]], ...] = ()
+    limit: int | None = None
+    offset: int = 0
+    order_by: str = "name"
 
     @property
     def kind(self) -> str:
@@ -253,10 +256,23 @@ class CorpusReferences:
         return "corpus_references"
 
 
+@dataclass(frozen=True)
+class CorpusInventory:
+    """The analyzed programs themselves.
+
+    The subject is the corpus, so there is no program to select: a question
+    asking which programs exist cannot name one of them to be scoped to.
+    """
+
+    @property
+    def kind(self) -> str:
+        return "corpus_inventory"
+
+
 Query = (
     GraphEdges | GraphPredicate | SetRelation | EntityMembership | ScalarComparison
     | AccessProjection | TemporalProjection | SemanticProjection | FieldProjection | ScreenField
-    | Inventory | CopybookRole | CorpusReferences | UnusedCode
+    | Inventory | CopybookRole | CorpusReferences | CorpusInventory | UnusedCode
 )
 
 
@@ -371,7 +387,7 @@ def entity_type_named(question: str, known: Sequence[str] = ENTITY_TYPE_NAMES) -
     lowered = question.lower()
     best: tuple[int, str] | None = None
     for name in known:
-        if re.search(rf"(?<![a-z]){re.escape(name)}s?(?![a-z])", lowered):
+        if re.search(rf"(?<![a-z0-9_-]){re.escape(name)}s?(?![a-z0-9_-])", lowered):
             if best is None or len(name) > best[0]:
                 best = (len(name), name)
     return best[1] if best else None
@@ -545,6 +561,12 @@ def compile_query(
     if unresolved_entities:
         return None
 
+    # The router's corpus-inventory capability names the programs themselves.
+    # With no program and no name in the question there is nothing for a
+    # program-scoped shape to project over, so it compiles to the corpus.
+    if capability == "corpus_inventory" and not named_programs and not corpus_entity:
+        return CorpusInventory()
+
     # The semantic planner owns meaning. Once it emitted a validated canonical
     # query, do not re-interpret the English and accidentally change direction,
     # set subject, requested fields, or filters.
@@ -566,30 +588,10 @@ def compile_query(
                 programs=named_programs,
                 metric="main_source_physical_lines",
             )
-        # The planner owns direction when it sets one.  When it leaves it null
-        # on a call question the direction is still determined -- by whether
-        # the named program is the actor or the object of the verb -- and an
-        # unset direction makes the executor read the outgoing side, which is
-        # how "which analyzed program calls PDCBVC" answered with PDCBVC's own
-        # calls.  Filling a null is not re-interpreting a decision the planner
-        # made; a direction it did set is left exactly as given.
         spec_direction = query_spec.direction
         spec_entity_values = tuple(query_spec.entity_values)
-        if (
-            spec_direction is None
-            and query_spec.capability == "call_evidence"
-            and corpus_entity
-            and _CORPUS_SUBJECT.search(question)
-            and not _names_the_actor(question, corpus_entity)
-        ):
-            spec_direction = "incoming"
-            # The target of an incoming call is the name the question asked
-            # about.  A specification carrying no entity leaves the executor
-            # falling back to the scoped program, which under a two-program
-            # scope is merely the first of them: that is how "who invokes
-            # PD0UTI01" came back about PDB305.
-            if not spec_entity_values:
-                spec_entity_values = (corpus_entity.strip().upper(),)
+        # Missing roles are repaired by the semantic planner, never inferred
+        # again from English word order in the executor.
 
         return SemanticProjection(
             programs=named_programs,
@@ -605,6 +607,9 @@ def compile_query(
             source_entity=query_spec.source_entity,
             target_entity=query_spec.target_entity,
             filters=filters,
+            limit=getattr(query_spec, "limit", None),
+            offset=getattr(query_spec, "offset", 0),
+            order_by=getattr(query_spec, "order_by", "name"),
         )
 
     # A question about the corpus is answered from the corpus. Resolving it to

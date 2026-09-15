@@ -112,6 +112,7 @@ def health() -> Any:
         "inbox_dir": str(settings.paths.inbox_dir),
         "llm": settings.llm.model,
         "embedding": settings.embedding.model,
+        "investigation_enabled": settings.investigation.enabled,
     }
 
 @app.post("/api/chat")

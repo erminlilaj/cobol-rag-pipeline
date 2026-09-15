@@ -2021,6 +2021,34 @@ def analyzed_programs() -> tuple[str, ...]:
     ))
 
 
+def answer_program_inventory(*, count_only: bool = False) -> str | None:
+    """The programs the corpus holds, for a question about the corpus itself.
+
+    Such a question names no program because its subject is the set of them.
+    Reading the missing name as an ambiguity asked the user to choose a program
+    in answer to a request to be told which programs exist.
+    """
+    root = find_final_scripts_root()
+    if root is None:
+        return None
+    programs = analyzed_programs()
+    if count_only:
+        return str(len(programs))
+    registry = _read_json(root / "corpus.registry.json")
+    source = (
+        "`corpus.registry.json`"
+        if isinstance(registry, dict) and isinstance(registry.get("programs"), list)
+        else "the analyzed program folders"
+    )
+    if not programs:
+        return f"No program has been analyzed yet.\nSource: {source}."
+    lines = [f"{len(programs)} program(s) are analyzed and available for questions:"]
+    lines.extend(f"- {program}" for program in programs)
+    lines.append("Name a program in a question to restrict it to that program's evidence.")
+    lines.append(f"Source: {source}.")
+    return "\n".join(lines)
+
+
 def answer_program_comparison(
     programs: Sequence[str],
     capability: str,
@@ -4123,11 +4151,13 @@ def _semantic_program_roots(query: Any) -> list[tuple[str, Path]]:
 
 
 def _semantic_filters(query: Any, field: str) -> list[tuple[str, tuple[str, ...]]]:
-    return [
-        (operator, tuple(values))
-        for name, operator, values in query.filters
-        if name == field
-    ]
+    result = []
+    for item in query.filters:
+        name, operator, values = ((item.field, item.operator, item.values)
+                                  if hasattr(item, "field") else item)
+        if name == field:
+            result.append((operator, tuple(values)))
+    return result
 
 
 def _filter_value(value: str, predicates: Sequence[tuple[str, Sequence[str]]]) -> bool:
@@ -4438,9 +4468,12 @@ def _semantic_call_answer(query: Any, roots: Sequence[tuple[str, Path]]) -> str 
         value for value in query.entity_values
         if value not in {program for program, _ in roots}
     }
+    if getattr(query, "target_entity", None):
+        target_names.add(query.target_entity)
     type_filters = _semantic_filters(query, "call_type")
     paragraph_filters = _semantic_filters(query, "paragraph")
     lines: list[str] = []
+    counts: list[tuple[str, int]] = []
     for program, root in roots:
         payload = _read_json(_artifact_path(root, "architecture.call_parameters.json")) or {}
         calls = [item for item in payload.get("calls", []) if isinstance(item, dict)]
@@ -4453,6 +4486,9 @@ def _semantic_call_answer(query: Any, roots: Sequence[tuple[str, Path]]) -> str 
             calls = [item for item in calls if _filter_value(call_type(item), type_filters)]
         if paragraph_filters:
             calls = [item for item in calls if _filter_value(str(item.get("paragraph") or ""), paragraph_filters)]
+        counts.append((program, len(calls)))
+        if query.operator == "aggregate" or "count" in query.fields:
+            continue
         lines.append(f"{program} matching calls ({len(calls)}):")
         for item in calls:
             details = [str(item.get("call_type") or "unknown type")]
@@ -4466,6 +4502,15 @@ def _semantic_call_answer(query: Any, roots: Sequence[tuple[str, Path]]) -> str 
                 if item.get("commarea"):
                     details.append(f"COMMAREA {item['commarea']}")
             lines.append(f"- {item.get('target')}: " + "; ".join(details))
+    if query.operator == "aggregate" and len(counts) == 1:
+        return str(counts[0][1])
+    if "count" in query.fields:
+        lines = [f"{name}: {count} matching call(s)." for name, count in counts]
+        if len(counts) > 1:
+            largest = max(count for _, count in counts)
+            winners = [name for name, count in counts if count == largest]
+            lines.append(("Equal counts." if len(winners) == len(counts)
+                          else ", ".join(winners) + " has the most matching calls."))
     lines.append("Source: `architecture.call_parameters.json` per program.")
     return "\n".join(lines) if len(lines) > 1 else None
 
@@ -4597,8 +4642,126 @@ def _semantic_quality_answer(query: Any, program: str, root: Path) -> str | None
     return answer_unused_code(program, categories)
 
 
+def semantic_variable_rows(query: Any, program: str | None) -> list[dict[str, Any]]:
+    """Select the inventory once for both the answer and ordered result memory."""
+    root = find_final_scripts_root()
+    root = find_program_artifact_root(root, program) if root and program else None
+    if root is None:
+        return []
+    payload = _read_json(_artifact_path(root, "dataflow.used_variables.json")) or {}
+    rows = [row for row in payload.get("variables", []) if isinstance(row, dict)]
+    program_names = set(getattr(query, "programs", ())) | {program}
+    names = {v for v in query.entity_values if v not in program_names}
+    if names:
+        rows = [r for r in rows if str(r.get("variable", "")).upper() in names]
+    for field in ("controls_flow", "origin"):
+        predicates = _semantic_filters(query, field)
+        if predicates:
+            rows = [r for r in rows if _filter_value(str(r.get(field, False if field == "controls_flow" else "")), predicates)]
+    if getattr(query, "order_by", "name") == "source_line":
+        def declaration_line(row):
+            declarations = (row.get("relationships") or {}).get("declarations") or []
+            return min((int(d.get("line_start") or 10**9) for d in declarations
+                        if str(d.get("source_file", "")).upper() == f"{program}.CBL"), default=10**9)
+        rows.sort(key=lambda r: (declaration_line(r), str(r.get("variable", ""))))
+    else:
+        rows.sort(key=lambda r: str(r.get("variable", "")))
+    offset = getattr(query, "offset", 0)
+    limit = getattr(query, "limit", None)
+    return rows[offset:offset + limit if limit is not None else None]
+
+
+def _semantic_variable_answer(query: Any, program: str, root: Path) -> str | None:
+    program_names = set(getattr(query, "programs", ())) | {program}
+    if query.capability == "variable_access" and not set(query.entity_values) - program_names:
+        # Independent executor boundary: missing detail targets must never mean
+        # all variables, even if a caller bypasses semantic-plan validation.
+        return None
+    payload = _read_json(_artifact_path(root, "dataflow.used_variables.json"))
+    if not isinstance(payload, dict) or "variables" not in payload:
+        return None
+    rows = semantic_variable_rows(query, program)
+    if query.operator == "aggregate" or "count" in query.fields:
+        return str(len(rows))
+    if not rows:
+        return f"No matching analyzed variables in {program}.\nSource: `dataflow.used_variables.json`."
+    fields = set(query.fields)
+    if query.capability == "variable_inventory":
+        return (f"{len(rows)} matching analyzed variable(s) in {program}:\n"
+                + "\n".join(f"- {r['variable']}" for r in rows)
+                + "\nSource: `dataflow.used_variables.json`.")
+    lines = []
+    for row in rows:
+        name = row["variable"]
+        relations = row.get("relationships") or {}
+        declarations = relations.get("declarations") or []
+        text = " ".join(str(d.get("statement") or "") for d in declarations)
+        pic = re.search(r"\bPIC(?:TURE)?\s+(?:IS\s+)?([^\s.]+)", text, re.I)
+        lines.append(f"{name} in {program}:")
+        if not fields or fields & {"type", "definition", "declaration", "picture", "origin"}:
+            if pic:
+                lines.append(f"- Elementary item; PIC {pic.group(1)}.")
+            elif declarations and relations.get("children"):
+                lines.append("- Group item; no PIC clause of its own in the recorded declaration.")
+            else:
+                lines.append("- Type is not established by the recorded declaration.")
+            if row.get("origin"):
+                lines.append(f"- Origin: {row['origin']}.")
+            for d in declarations:
+                lines.append(f"- {d.get('source_file', program + '.CBL')} line {d.get('line_start')}: `{d.get('statement')}`")
+        if not fields or fields & {"definition", "type", "parents", "children"}:
+            for key in ("parents", "children"):
+                if relations.get(key):
+                    lines.append(f"- {key.capitalize()}: " + ", ".join(relations[key]))
+        evidence = row.get("evidence") or {}
+        for field in ("read_sites", "write_sites", "control_sites"):
+            if field not in fields and not (field == "control_sites" and "control_usage" in fields):
+                continue
+            lines.append("Control-flow use:" if field == "control_sites" else field.replace("_", " ").capitalize() + ":")
+            sites = evidence.get(field) or []
+            lines.extend(f"- {s.get('paragraph')} line {s.get('line_start')}: `{s.get('statement')}`" for s in sites)
+            if not sites:
+                lines.append("- None recorded.")
+    lines.append("Source: `dataflow.used_variables.json`.")
+    return "\n".join(lines)
+
+
+def _semantic_preparation_answer(query: Any, roots: Sequence[tuple[str, Path]]) -> str | None:
+    targets = {query.target_entity} if query.target_entity else set(query.entity_values) - {p for p, _ in roots}
+    lines = []
+    for program, root in roots:
+        payload = _read_json(_artifact_path(root, "architecture.call_parameters.json")) or {}
+        for call in payload.get("calls", []):
+            if targets and call.get("target") not in targets:
+                continue
+            sites = {(s.get("paragraph"), s.get("line_start"), s.get("statement"))
+                     for parameter in call.get("parameter_details", [])
+                     for variable in parameter.get("variables", [])
+                     for s in variable.get("writes_before_call", [])}
+            lines.append(f"Recorded preparation writes for {call.get('target')} / {call.get('commarea')} in {program}:")
+            lines.extend(f"- {paragraph}, line {line}: `{statement}`"
+                         for paragraph, line, statement in sorted(sites, key=lambda x: (x[1] or 0, str(x))))
+            if not sites:
+                lines.append("- No preparation writes are recorded in this call artifact.")
+    return "\n".join(lines + ["Source: `architecture.call_parameters.json`."]) if lines else None
+
+
 def answer_semantic_projection(query: Any) -> str | None:
     """Execute the planner's canonical QuerySpec without re-reading English."""
+    if query.capability in {"call_evidence", "call_context"} and query.direction not in {"incoming", "outgoing"}:
+        return None
+    if query.capability == "corpus_inventory":
+        if "file" not in query.entity_types:
+            return answer_program_inventory(count_only=query.operator == "aggregate")
+        base = find_final_scripts_root()
+        members = set()
+        for program in analyzed_programs():
+            root = find_program_artifact_root(base, program) if base else None
+            if root:
+                members.update((program, str(r.get("source_file"))) for r in _read_source_lines(root, program) if r.get("source_file"))
+        if query.operator == "aggregate":
+            return str(len(members))
+        return "Analyzed source members:\n" + "\n".join(f"- {p}/{f}" for p, f in sorted(members))
     if query.capability in {"call_evidence", "call_context"} and query.direction == "incoming":
         # The target may be external and need not have its own artifact root.
         target = getattr(query, "target_entity", None)
@@ -4613,6 +4776,33 @@ def answer_semantic_projection(query: Any) -> str | None:
         return None
     program, root = roots[0]
     capability = query.capability
+    if capability == "source_line_lookup":
+        starts = _semantic_filters(query, "line_start")
+        ends = _semantic_filters(query, "line_end")
+        if not starts:
+            return None
+        start_values = [int(value) for _, values in starts for value in values]
+        end_values = [int(value) for _, values in ends for value in values]
+        if any(value < 1 for value in start_values + end_values):
+            return None
+        if end_values and len(end_values) != len(start_values):
+            return None
+        files = _semantic_filters(query, "source_file")
+        return answer_source_line_spans(program, tuple(
+            {"line_start": start, "line_end": end_values[i] if end_values else start,
+             "source_file": files[0][1][0] if files else None}
+            for i, start in enumerate(start_values)))
+    if capability in {"variable_inventory", "variable_access"}:
+        if len(roots) > 1:
+            answers = [(name, _semantic_variable_answer(query, name, path)) for name, path in roots]
+            return "\n\n".join(f"{name}: {answer if answer is not None else 'Variable analysis unavailable.'}" for name, answer in answers)
+        return _semantic_variable_answer(query, program, root)
+    if capability == "call_context":
+        return _semantic_preparation_answer(query, roots)
+    if capability == "literal_assignment":
+        values = [v for v in query.entity_values if v != program]
+        if values:
+            return answer_field_projection(program, values[0], "literals")
     if capability in {"variable_lineage", "screen_lineage"} and query.operator == "traverse":
         return _semantic_lineage_answer(query, program, root)
     if capability == "paragraph_evidence":
@@ -4628,7 +4818,7 @@ def answer_semantic_projection(query: Any) -> str | None:
         constrained_targets = {
             value for value in query.entity_values if value not in program_names
         }
-        if len(roots) > 1 and query.relation and not constrained_targets:
+        if len(roots) > 1 and query.relation and not constrained_targets and not query.filters and "count" not in query.fields:
             return answer_program_comparison(
                 tuple(name for name, _ in roots), "call_evidence", query.relation,
                 query.subject_program,
@@ -4646,6 +4836,11 @@ def answer_semantic_projection(query: Any) -> str | None:
             tuple(name for name, _ in roots), "copybook_evidence", query.relation,
             query.subject_program,
         )
+    if capability == "copybook_evidence":
+        names = [v for v in query.entity_values if v != program]
+        if names:
+            return answer_copybook_role(program, names[0])
+        return answer_inventory(program, "copybook", count_only=query.operator == "aggregate")
     if capability == "db2_evidence" and len(roots) > 1 and query.relation:
         return answer_program_comparison(
             tuple(name for name, _ in roots), "db2_table_evidence", query.relation,

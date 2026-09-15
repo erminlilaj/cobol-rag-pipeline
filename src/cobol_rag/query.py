@@ -6,7 +6,7 @@ import re
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -38,6 +38,7 @@ from cobol_rag.final_scripts_answers import (
     answer_qualified_inventory,
     answer_copybook_role,
     answer_corpus_references,
+    answer_program_inventory,
     answer_unused_code,
     answer_access_projection,
     answer_entity_membership,
@@ -108,6 +109,7 @@ from cobol_rag.retrieve import (
     retrieve_with_trace,
 )
 from cobol_rag.scope import (
+    EntityReference,
     named_identifiers_in,
     source_addresses_in,
     QueryScope,
@@ -938,6 +940,9 @@ def answer_query(
     session_state: SessionState | None = None,
     target_program: str | None = None,
 ) -> QueryAnswer:
+    if config.investigation.enabled:
+        from cobol_rag.investigation import answer_with_investigation
+        return answer_with_investigation(question, config, session_state, target_program, conversation_history)
     started = time.perf_counter()
     original_question = question
     requested_language, requested_language_source = resolve_response_language(
@@ -1105,92 +1110,8 @@ def answer_query(
             execution_mode="clarification",
         )
 
-    # A physical source address is exact, so it is resolved before anything that
-    # ranks or generates. Embeddings find meaning, not addresses: asking a vector
-    # index for "line 227" can only return something that reads like line 227.
-    addresses = source_addresses_in(question)
-    if addresses and initial_scope.program:
-        # A source address can also be the anchor of a temporal request.  Carry
-        # a small physical window in the requested direction so "what follows
-        # this call" is not truncated to the anchor line by the exact-address
-        # route.  This is source addressing semantics and applies to any COBOL
-        # statement, not to a particular line or identifier.
-        asks_after = bool(re.search(
-            r"\b(?:immediately\s+)?(?:after|afterward|afterwards|following|next)\b",
-            question,
-            re.IGNORECASE,
-        ))
-        asks_before = bool(re.search(
-            r"\b(?:immediately\s+)?(?:before|beforehand|preceding|previous)\b",
-            question,
-            re.IGNORECASE,
-        ))
-        if asks_after or asks_before:
-            addresses = tuple({
-                **address,
-                "context_before": max(int(address.get("context_before") or 0), 5 if asks_before else 0),
-                "context_after": max(int(address.get("context_after") or 0), 5 if asks_after else 0),
-            } for address in addresses)
-        located = answer_source_line_spans(initial_scope.program, addresses)
-        if located:
-            address_entities = tuple(
-                source_address_entity(initial_scope.program, address)
-                for address in addresses
-            )
-            address_entity = address_entities[0]
-            return finish(
-                located,
-                [],
-                route="technical",
-                scope=replace(
-                    initial_scope, intent="source_lines", entities=address_entities,
-                    entity_type=address_entity.entity_type,
-                    entity_value=address_entity.value,
-                    entity_key=address_entity.entity_key,
-                ),
-                plan=replace(
-                    initial_plan,
-                    route="technical",
-                    domain="program_structure",
-                    intent="source_lines",
-                    tasks=("source_lines",),
-                    entities=(address_entity,),
-                    planner_source="source_address",
-                ),
-                execution_mode="source_address_lookup",
-            )
-
-    # Asked before a capability is chosen, because once the missing one has been
-    # filtered out of the ranking the question has already been handed to its
-    # nearest available neighbour and the absence can no longer be reported.
-    absent_capability = _absent_capability_request(question, config, initial_scope)
-    if absent_capability:
-        absent_answer = absent_capability_answer(initial_scope.program, absent_capability)
-        if absent_answer:
-            absent_intent, absent_domain = _capability_route(absent_capability, ())
-            return finish(
-                absent_answer,
-                [],
-                route="technical",
-                scope=replace(initial_scope, intent=absent_intent),
-                plan=replace(
-                    initial_plan,
-                    route="technical",
-                    domain=absent_domain,
-                    intent=absent_intent,
-                    tasks=_CAPABILITY_TASKS.get(absent_capability, ()),
-                    planner_source="capability_manifest",
-                ),
-                execution_mode="manifest_absent_capability",
-                debug={
-                    "status": "analysis_gap",
-                    "evidence_disposition": EvidenceDisposition(
-                        state=EvidenceState.ANALYSIS_GAP,
-                        capability=absent_capability,
-                        reasons=("capability_not_produced_by_analysis",),
-                    ).as_dict(),
-                },
-            )
+    # Source addresses and corpus inventories are selected by the same semantic
+    # planner as other requests; exact readers execute only the selected operation.
 
     routing: QueryRoutingDecision | None = None
     if initial_plan.requires_clarification:
@@ -1226,7 +1147,7 @@ def answer_query(
                 scope=QueryScope(intent="general"), plan=nontechnical_plan,
                 execution_mode=("conversational" if routing.route == "conversational" else "clarification"),
             )
-        if needs_answerability_check:
+        if needs_answerability_check and routing.query_spec is None:
             answerable, answerability_reason = _assess_technical_answerability(
                 question, config, initial_scope,
             )
@@ -1262,15 +1183,12 @@ def answer_query(
         # A high-confidence typed interpretation remains the base plan. The LLM
         # can enrich it, but resolving scope a second time under a conflicting LLM
         # intent would erase that protection before merge_semantic_plan sees it.
-        refinement_intent = (
-            initial_plan.intent
-            if initial_plan.intent != "general" and initial_plan.confidence >= 0.9
-            else routing.intent
-        )
+        refinement_intent = routing.intent
         refined_scope = resolve_query_scope(
             question, intent=refinement_intent, state=session_state,
             target_program=target_program,
         )
+        refined_scope = _scope_with_result_reference(refined_scope, routing, session_state)
         refined_base = build_query_plan(
             question, refined_scope, intent=refinement_intent, state=session_state,
         )
@@ -1285,10 +1203,19 @@ def answer_query(
             else replace(refined_base, planner_source="deterministic_fallback")
         )
         initial_plan = _refine_variable_tasks(question, config, initial_plan)
-        initial_plan = _supplement_missing_capability(
-            question, config, initial_scope, initial_plan,
-        )
+        if initial_plan.query_spec is None:
+            initial_plan = _supplement_missing_capability(
+                question, config, initial_scope, initial_plan,
+            )
         initial_scope = replace(refined_scope, intent=initial_plan.intent)
+        if initial_plan.query_spec is not None:
+            selected_capability = initial_plan.query_spec.capability
+            if selected_capability in unavailable_capabilities(initial_scope.program):
+                absent_answer = absent_capability_answer(initial_scope.program, selected_capability)
+                if absent_answer:
+                    return finish(absent_answer, [], scope=initial_scope, plan=initial_plan,
+                                  execution_mode="manifest_absent_capability",
+                                  debug={"status": "analysis_gap"})
         if initial_plan.requires_clarification:
             return finish(
                 "The semantic planner could not resolve a unique target. Please name the exact program or COBOL entity.",
@@ -1300,6 +1227,15 @@ def answer_query(
         # pre-refinement compiler could not act on information that did not yet
         # exist, so compile the enriched plan once more before invoking the
         # broader semantic executor.
+        if initial_plan.query_spec is not None and initial_plan.query_spec.capability == "variable_inventory":
+            from cobol_rag.final_scripts_answers import semantic_variable_rows
+            rows = semantic_variable_rows(initial_plan.query_spec, initial_plan.program)
+            initial_plan = replace(initial_plan, result_entities=tuple(
+                EntityReference(program=initial_plan.program or "", entity_type="variable",
+                                value=str(row["variable"]),
+                                entity_key=f"{initial_plan.program}|VARIABLE|{row['variable']}")
+                for row in rows
+            ))
         refined_typed_answer = _typed_query_answer(initial_plan, question)
         if refined_typed_answer:
             typed_sources = []
@@ -1645,7 +1581,7 @@ def answer_query(
         return finish(message, [], scope=scope, outcome=outcome, plan=plan)
 
     pipeline_attempts: list[dict[str, Any]] = []
-    structured_answer = _try_structured_plan_answer(plan, sources, contextual_question)
+    structured_answer = _try_structured_plan_answer(plan, sources, question)
     if structured_answer:
         contract = validate_plan_answer(plan, structured_answer)
         if contract.passed:
@@ -2721,12 +2657,50 @@ def _part_is_covered(part: str, answer: str) -> bool:
 # pattern deciding first and the router never being consulted.
 _TYPED_CAPABILITY_KINDS: dict[str, str] = {
     "corpus_references": "corpus_references",
+    "corpus_inventory": "corpus_inventory",
     "copybook_role": "copybook_role",
     "unused_code": "unused_code",
     "screen_field": "screen_field",
     "graph_edges_between": "graph_edges",
     "graph_predicate": "graph_predicate",
 }
+
+
+# Capabilities that describe a program or the corpus as a whole. A question for
+# programs that the router places nearest one of these asks for the programs
+# themselves; one it places nearest any other capability asks for programs
+# restricted by that evidence, which a list of every program cannot answer.
+_WHOLE_PROGRAM_CAPABILITIES = frozenset({
+    "corpus_inventory", "corpus_references", "artifact_inventory", "program_summary",
+})
+
+
+def _program_inventory_request(question: str, config: Any, plan: Any) -> bool:
+    """Whether the question's subject is the set of analyzed programs.
+
+    It asks for programs in the plural, names nothing, points at no earlier
+    answer and requests no evidence of its own, so there is no program to
+    choose. Structure alone cannot tell "which programs are available" from
+    "which programs have unreachable code" -- they read the same -- but the
+    router can, so a question it places nearest a particular kind of evidence
+    is left to the normal path. Without a ranking it is left alone too.
+    """
+    from cobol_rag.query_ir import entity_type_named
+    from cobol_rag.scope import refers_to_previous_turn
+
+    if entity_type_named(question) != "program":
+        return False
+    if not re.search(r"(?<![a-z])programs(?![a-z])", question, re.IGNORECASE):
+        return False
+    if named_identifiers_in(question) or refers_to_previous_turn(question):
+        return False
+    if getattr(plan, "tasks", ()):
+        return False
+    try:
+        ranked = _rank_question_capabilities(question, config, None) or []
+    except Exception:
+        return False
+    return bool(ranked) and ranked[0].capability in _WHOLE_PROGRAM_CAPABILITIES
 
 
 def _routed_capability(question: str, config: Any, plan: Any) -> str | None:
@@ -2833,6 +2807,9 @@ def _execute_typed_query(plan: Any, compiled: Any) -> str | None:
         )
     if compiled.kind == "corpus_references":
         return answer_corpus_references(compiled.entity, compiled.relation)
+    if compiled.kind == "corpus_inventory":
+        contract = getattr(plan, "response_contract", None)
+        return answer_program_inventory(count_only=getattr(contract, "format", None) == "count")
     if compiled.kind == "copybook_role":
         return answer_copybook_role(compiled.program, compiled.copybook)
     if compiled.kind == "inventory":
@@ -3651,7 +3628,7 @@ def _capability_routing_decision(
     )
 
 
-_MERGEABLE_PLANNER_SOURCES = {"semantic_llm", "semantic_router", "capability_router"}
+_MERGEABLE_PLANNER_SOURCES = {"semantic_llm", "semantic_router", "capability_router", "semantic_query_spec"}
 
 
 def _mergeable_planner_source(source: str) -> bool:
@@ -3804,7 +3781,7 @@ def _refine_variable_tasks(question: str, config: AppConfig, plan: QueryPlan) ->
     not of which verb it happens to use, so "calculated", "set" and "produces"
     must reach the same evidence without any of them being listed anywhere.
     """
-    if plan.intent != "variable_dataflow":
+    if plan.query_spec is not None or plan.intent != "variable_dataflow":
         return plan
     if not plan.entity_values_for("variable", "unknown_identifier"):
         return plan
@@ -4057,159 +4034,282 @@ def _resolve_weak_technical_route(
     return _capability_routing_decision(question, config, scope, plan) or routing
 
 
-def _route_query(
-    question: str,
-    config: AppConfig,
-    conversation_history: str | None = None,
-    session_state: SessionState | None = None,
-    preliminary_plan: QueryPlan | None = None,
-    preliminary_scope: QueryScope | None = None,
-) -> QueryRoutingDecision:
-    """Use the LLM as a structured semantic planner, never as entity authority."""
-    candidates: tuple[CapabilityMatch, ...] = ()
-    if _constrained_routing_enabled():
-        candidates = _routing_candidates(
-            question, config, preliminary_scope, preliminary_plan,
-        )
-    if candidates:
-        prompt = _build_constrained_routing_prompt(
-            question, conversation_history, session_state,
-            preliminary_plan=preliminary_plan,
-            preliminary_scope=preliminary_scope,
-            candidates=candidates,
-        )
-    else:
-        prompt = _build_routing_prompt(
-            question, conversation_history, session_state,
-            preliminary_plan=preliminary_plan,
-            preliminary_scope=preliminary_scope,
-        )
-    try:
-        _route_query_started = time.perf_counter()
-        response = build_llm(
-            config,
-            json_mode=True,
-            max_output_tokens=420,
-            temperature=0.0,
-        ).complete(prompt)
-        _log_stage_latency(
-            "route_query_main",
-            time.perf_counter() - _route_query_started,
-            f"prompt_chars={len(prompt)} candidates={len(candidates)}",
-        )
-        # The LLM owns semantic classification. Deterministic scope remains the
-        # authority for exact program/entity names and literal constraints only.
-        decision = _finalize_routing_language(
-            question,
-            _parse_routing_decision(str(response.text)),
-            config,
-            preliminary_plan,
-            session_state,
-        )
-        decision = _ensure_executable_query_spec(
-            question,
-            config,
-            decision,
-            preliminary_plan=preliminary_plan,
-            preliminary_scope=preliminary_scope,
-        )
-        if _routing_conflicts_with_verified_scope(decision, preliminary_plan, preliminary_scope):
-            raise QueryError("The semantic route conflicts with verified technical scope.")
-        if _conversational_route_is_blocked(question, config, decision, preliminary_scope):
-            raise QueryError("A conversational route cannot answer an evidence question.")
-        if not _decision_respects_candidates(decision, candidates):
-            # The planner reached outside the shortlist it was given. Ranking is the
-            # deterministic signal here, so fall back to it rather than executing a
-            # capability the question was not judged to belong to.
-            fallback = _capability_routing_decision(
-                question, config, preliminary_scope, preliminary_plan,
-            )
-            if fallback is not None:
-                return fallback
-        return decision
-    except Exception as routing_error:
-        _log_stage_latency("route_query_rejected", 0.0, f"error={type(routing_error).__name__}: {routing_error}")
+def _scope_with_result_reference(scope, decision, state):
+    """Ground a semantic reference against the actual ordered previous result."""
+    spec = decision.query_spec or {}
+    if not isinstance(spec, dict):
+        return scope
+    available = list(scope.entities)
+    if state:
+        available.extend(state.last_result_entities)
+    names = set(spec.get("entity_values") or ())
+    index = spec.get("reference_index")
+    if index is not None:
+        if not state or type(index) is not int or not 1 <= index <= len(state.last_result_entities):
+            raise QueryError("The requested previous-result position is unavailable.")
+        selected = state.last_result_entities[index - 1]
+        names.add(selected.value)
+        spec["entity_values"] = [selected.value]
+    chosen = tuple(dict.fromkeys(item for item in available if item.value in names))
+    if chosen:
+        return replace(scope, entities=chosen, entity_type=chosen[0].entity_type,
+                       entity_value=chosen[0].value if len(chosen) == 1 else None,
+                       entity_key=chosen[0].entity_key if len(chosen) == 1 else None,
+                       entity_source="semantic_reference", ambiguous=False, reason="")
+    return scope
+
+
+def _execution_routing_prompt(question, scope, state):
+    from cobol_rag.final_scripts_answers import analyzed_programs
+    context = {
+        "programs": list(analyzed_programs())[:64],
+        "current_program": scope.program if scope else None,
+        "explicit_scope": list(scope.programs) if scope else [],
+        # A collection is represented by its query and ordered result handle,
+        # not hundreds of serialized registry entries in a 4K model context.
+        "entities": [{"program": e.program, "type": e.entity_type, "name": e.value}
+                     for e in (scope.entities if scope else ())[:8]],
+        "explicit_entities": [{"type": e.entity_type, "name": e.value}
+                              for e in _explicit_request_entities(question, scope)],
+        "requested_addresses": list(source_addresses_in(question)),
+        "previous_intent": state.current_intent if state else None,
+        "previous_spec": (state.current_plan or {}).get("query_spec") if state else None,
+        "previous_result_count": len(state.last_result_entities) if state else 0,
+        "previous_result_preview": [e.value for e in state.last_result_entities[:12]] if state else [],
+    }
+    return """Interpret the user's request, using conversation context only when needed.
+Return JSON: {"route":"technical|conversational|unclear","reply":"",
+"query_spec":{"operator":"describe|lookup|list|project|filter|compare|intersect|difference|union|traverse|aggregate",
+"capability":"one capability below","entity_types":[],"entity_values":[],
+"fields":[],"direction":null,"source_entity":null,"target_entity":null,
+"subject_program":null,"relation":null,"filters":[],
+"limit":null,"offset":0,"order_by":"name","reference_index":null}}.
+For greetings answer briefly in reply with route conversational. For technical requests supply query_spec.
+Omit unused keys, nulls, and empty arrays. Keep the JSON compact; do not explain your reasoning.
+An evidence question must return an executable operation, not an acknowledgement.
+Example output for a variable count: {"route":"technical","query_spec":{"operator":"aggregate","capability":"variable_inventory","fields":["count"]}}.
+Example output for the first three variables: {"route":"technical","query_spec":{"operator":"list","capability":"variable_inventory","fields":["name"],"limit":3,"selection_evidence":"first three"}}.
+Example output for the type of a previous first result: {"route":"technical","query_spec":{"operator":"describe","capability":"variable_access","fields":["type"],"reference_index":1}}.
+Capabilities:
+corpus_inventory: available analyzed programs or physical source files, fields name or count;
+artifact_inventory: generated analysis artifacts of a program;
+source_line_lookup: exact physical lines, filters line_start and line_end and optional source_file;
+source_metrics: physical_line_count or paragraph_count;
+program_summary: explain a program;
+variable_inventory: list/count/select variables, filter controls_flow or origin;
+variable_access: one variable's type, definition, declaration, parents, children, read_sites, write_sites;
+literal_assignment: literal values assigned to named variables;
+paragraph_evidence: explain a paragraph (body), or outgoing_edges/incoming_edges and condition;
+control_flow: paths and transitions;
+call_evidence: invocations and parameters (target, commarea, parameters, call_type, paragraph, source_line);
+call_context: preparation writes before an invocation;
+cics_evidence: CICS commands, filter command, resource_name, paragraph;
+copybook_evidence: included copybooks or description of a named copybook;
+quality_evidence: unused/unreachable/commented code or review copybooks;
+db2_evidence, jcl_evidence, variable_lineage, condition_outcome, screen_lineage, pagination_evidence.
+Filters are {"field":"...","operator":"eq|neq|in|not_in|contains","values":["..."]}.
+Rules:
+- Identifiers are opaque: MAP inside PREPARA-MAP-010 is not a request for a screen map.
+- Program names scope evidence; naming a call target is not requesting its variable inventory.
+- Calls made IN or BY a program are outgoing. Who invokes a program asks for incoming calls.
+  Always set direction incoming/outgoing for call_evidence/call_context. Use target_entity for a specific callee.
+- A variable passed to a call asks for commarea/parameters on call_evidence.
+- Comparison must retain BOTH programs in entity_values. To compare counts use operator compare, fields ["count"];
+  outgoing CICS links require call_type=LINK (exclude XCTL and ordinary CALL).
+- "How many" asks for operator aggregate, fields ["count"], not a list.
+- A first item asks for limit=1; use order_by=source_line for first declaration in source, name for inventory order.
+  Any limit or nonzero offset must have selection_evidence quoting the selection instruction in THIS request.
+  Previous limits are not defaults for a new request. Omit them unless requested again.
+- A reference to an item of the previous displayed list uses reference_index (1-based).
+  Use previous_spec to interpret a follow-up's subject; preserve relevant filters, change the requested operation.
+- A definition of a named paragraph asks for paragraph_evidence/body, not a program inventory.
+- Physical source files and generated artifacts are different inventories. Unqualified available files asks for corpus_inventory.
+- Exact line requests still require semantic planning; put addresses in numeric line_start/line_end filters.
+- Keep response fields narrow. Do not add unrelated inventory tasks.
+- Do not invent identifiers. Use names from the request or grounded context.
+- Preserve explicit_entities and every requested address. variable_access requires a named variable;
+  never use a targetless variable detail query for a paragraph or CICS command definition.
+Context: """ + json.dumps(context, ensure_ascii=False) + "\nUser request: " + question
+
+
+def _explicit_request_entities(question, scope):
+    """Verified lexical anchors, not an intent classifier or phrase router."""
+    return tuple(e for e in (scope.entities if scope else ()) if re.search(
+        r"(?<![\w-])" + re.escape(e.value) + r"(?![\w-])", question, re.I))
+
+
+def _bind_request_targets(spec, scope, question):
+    """Keep explicit request anchors independent of the LLM's optional fields.
+
+    Only bind roles after the model has selected a compatible capability. A
+    conflicting capability is repaired, not replaced by a keyword-based route.
+    """
+    capability = spec.get("capability")
+    explicit = _explicit_request_entities(question, scope)
+    compatible = {"variable_access": {"variable"},
+                  "paragraph_evidence": {"paragraph"}}
+    types = compatible.get(capability)
+    if types:
+        incompatible = {e.value for e in explicit} - {e.value for e in explicit if e.entity_type in types}
+        if incompatible:
+            raise QueryError("Capability does not match the explicit entity types: " + ", ".join(sorted(incompatible)))
+        targets = [e.value for e in explicit if e.entity_type in types]
+        spec["entity_values"] = list(dict.fromkeys([*(spec.get("entity_values") or []), *targets]))
+    represented = set(spec.get("entity_values") or []) | {
+        spec.get("source_entity"), spec.get("target_entity"), spec.get("subject_program")}
+    represented.update(str(v).upper() for f in spec.get("filters", []) for v in f.get("values", []))
+    represented.update(str(v)[5:].upper() for f in spec.get("filters", []) if f.get("field") == "origin"
+                       for v in f.get("values", []) if str(v).upper().startswith("COPY:"))
+    missing = {e.value for e in explicit} - represented
+    if missing:
+        raise QueryError("The query dropped explicit request targets: " + ", ".join(sorted(missing)))
+    if capability == "variable_access":
+        variables = {e.value for e in scope.entities if e.entity_type == "variable"}
+        if not variables.intersection(spec.get("entity_values") or []):
+            raise QueryError("variable_access needs a resolved variable target; use variable_inventory for a collection, or select the capability matching the requested entity.")
+    addresses = source_addresses_in(question)
+    if addresses and capability == "source_line_lookup":
+        # This is lossless address binding AFTER semantic routing, not an early
+        # deterministic answer path. Keep disjoint addresses disjoint.
+        filters = [f for f in spec.get("filters", []) if f.get("field") not in {"line_start", "line_end"}]
+        filters.extend({"field": field, "operator": "in", "values": [str(a[field]) for a in addresses]}
+                       for field in ("line_start", "line_end"))
+        spec["filters"] = filters
+    if question and (spec.get("limit") is not None or spec.get("offset", 0)):
+        quote = spec.get("selection_evidence")
+        if not isinstance(quote, str) or not quote.strip() or quote.casefold() not in question.casefold():
+            raise QueryError("Selection limit/offset requires selection_evidence quoting THIS request; do not inherit a previous limit for a new question.")
+
+
+def _prepare_execution_decision(decision, scope, state, question=""):
+    from cobol_rag.query_plan import _capability_route, _CAPABILITY_TASKS, _QUERY_SPEC_FIELDS
+    if decision.route != "technical":
+        return decision, scope
+    spec = decision.query_spec
+    if not isinstance(spec, dict):
+        raise QueryError("Missing executable query specification.")
+    # Check before ordinal resolution can replace the explicit scope.
+    explicit = _explicit_request_entities(question, scope)
+    if explicit and spec.get("reference_index") is not None:
+        raise QueryError("Use the explicitly named entity, not a previous-result position.")
+    if not explicit:
+        scope = _scope_with_result_reference(scope, decision, state)
+    capability = spec.get("capability")
+    if capability not in ALLOWED_EVIDENCE_CAPABILITIES or spec.get("operator") not in ALLOWED_QUERY_OPERATORS:
+        raise QueryError("Unsupported evidence operation.")
+    if not isinstance(spec.get("fields", []), list) or any(field not in _QUERY_SPEC_FIELDS for field in spec.get("fields", [])):
+        raise QueryError("Unsupported output field; use the documented evidence fields.")
+    _bind_request_targets(spec, scope, question)
+    allowed = {e.value.upper() for e in scope.entities} | set(scope.programs)
+    if scope.program:
+        allowed.add(scope.program)
+    values = spec.get("entity_values") or []
+    if not isinstance(values, list) or any(str(v).upper() not in allowed for v in values):
+        raise QueryError("The planner selected an ungrounded identifier.")
+    spec["entity_values"] = [str(v).upper() for v in values]
+    for role in ("source_entity", "target_entity", "subject_program"):
+        if spec.get(role) and str(spec[role]).upper() not in allowed:
+            raise QueryError("The planner selected an ungrounded role: " + role)
+        if spec.get(role):
+            spec[role] = str(spec[role]).upper()
+    if capability in {"call_evidence", "call_context"} and spec.get("direction") not in {"incoming", "outgoing"}:
+        raise QueryError("Call direction must be explicitly planned.")
+    if capability in {"call_evidence", "call_context"} and spec.get("direction") == "incoming" and not spec.get("target_entity"):
+        raise QueryError("Incoming calls require an explicit target.")
+    if spec.get("limit") is not None and (type(spec["limit"]) is not int or spec["limit"] < 1):
+        raise QueryError("Invalid selection limit.")
+    if type(spec.get("offset", 0)) is not int or spec.get("offset", 0) < 0:
+        raise QueryError("Invalid selection offset.")
+    filters = spec.get("filters") or []
+    for item in filters:
+        if item.get("field") not in ALLOWED_QUERY_FILTER_FIELDS or item.get("operator", "eq") not in ALLOWED_QUERY_FILTER_OPERATORS:
+            raise QueryError("Unsupported evidence filter.")
+        if item.get("field") == "call_type" and not set(item.get("values") or []) <= {"CALL","LINK","XCTL","CICSLINK","CICSXCTL"}:
+            raise QueryError("A workflow description is not an invocation type.")
+        if not isinstance(item.get("values"), list) or not item["values"]:
+            raise QueryError("Evidence filters require nonempty values.")
+        if item.get("field") == "call_type":
+            item["values"] = [{"CICSLINK": "LINK", "CICSXCTL": "XCTL"}.get(v, v) for v in item["values"]]
+    intent, domain = _capability_route(capability, scope.entities)
+    tasks = _CAPABILITY_TASKS.get(capability, ())
+    return replace(decision, intent=intent, domain=domain, tasks=tasks,
+                   output_fields=tuple(spec.get("fields") or ()),
+                   subtasks=(), query_spec=spec, planner_source="semantic_query_spec",
+                   requires_comparison=spec.get("operator") in {"compare","intersect","difference","union"}), scope
+
+
+def _execution_schema():
+    """Constrain syntax at generation time; grounding still validates meaning."""
+    from cobol_rag.query_plan import _QUERY_SPEC_FIELDS
+    strings = {"type": "array", "items": {"type": "string"}}
+    spec = {"type": "object", "additionalProperties": False,
+            "required": ["operator", "capability"], "properties": {
+        "operator": {"type": "string", "enum": sorted(ALLOWED_QUERY_OPERATORS)},
+        "capability": {"type": "string", "enum": sorted(ALLOWED_EVIDENCE_CAPABILITIES)},
+        "entity_types": {"type": "array", "items": {"type": "string", "enum": sorted(ALLOWED_QUERY_ENTITY_TYPES)}},
+        "entity_values": strings,
+        "fields": {"type": "array", "items": {"type": "string", "enum": sorted(_QUERY_SPEC_FIELDS)}},
+        "direction": {"type": "string", "enum": ["incoming", "outgoing"]},
+        "source_entity": {"type": "string"}, "target_entity": {"type": "string"},
+        "subject_program": {"type": "string"},
+        "relation": {"type": "string", "enum": ["intersection", "difference", "symmetric_difference", "union", "comparison"]},
+        "limit": {"type": "integer", "minimum": 1}, "offset": {"type": "integer", "minimum": 0},
+        "order_by": {"type": "string", "enum": ["name", "source_line"]},
+        "reference_index": {"type": "integer", "minimum": 1},
+        "selection_evidence": {"type": "string", "minLength": 1},
+        "filters": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+            "required": ["field", "operator", "values"], "properties": {
+                "field": {"type": "string", "enum": sorted(ALLOWED_QUERY_FILTER_FIELDS)},
+                "operator": {"type": "string", "enum": sorted(ALLOWED_QUERY_FILTER_OPERATORS)},
+                "values": strings}}},
+    }}
+    return {"oneOf": [
+        {"type": "object", "additionalProperties": False,
+         "required": ["route", "query_spec"], "properties": {
+            "route": {"const": "technical"}, "query_spec": spec}},
+        {"type": "object", "additionalProperties": False,
+         "required": ["route", "reply"], "properties": {
+            "route": {"type": "string", "enum": ["conversational", "unclear"]},
+            "reply": {"type": "string"}}},
+    ]}
+
+
+def _route_query(question, config, conversation_history=None, session_state=None,
+                 preliminary_plan=None, preliminary_scope=None):
+    """One semantic authority, with one bounded repair for invalid structure."""
+    scope = preliminary_scope or QueryScope()
+    prompt = _execution_routing_prompt(question, scope, session_state)
+    error = ""
+    require_technical = False
+    for attempt in range(2):
         try:
-            _compact_started = time.perf_counter()
-            _compact_prompt = _build_compact_routing_prompt(
-                question, session_state, preliminary_plan=preliminary_plan,
-            )
-            compact_response = build_llm(
-                config, json_mode=True, max_output_tokens=260, temperature=0.0,
-            ).complete(_compact_prompt)
-            _log_stage_latency("route_query_compact_retry", time.perf_counter() - _compact_started, f"prompt_chars={len(_compact_prompt)}")
-            decision = _finalize_routing_language(
-                question,
-                _parse_routing_decision(str(compact_response.text)),
-                config,
-                preliminary_plan,
-                session_state,
-            )
-            decision = _ensure_executable_query_spec(
-                question,
-                config,
-                decision,
-                preliminary_plan=preliminary_plan,
-                preliminary_scope=preliminary_scope,
-            )
-            if _routing_conflicts_with_verified_scope(decision, preliminary_plan, preliminary_scope):
-                raise QueryError("The compact semantic route conflicts with verified technical scope.")
-            if _conversational_route_is_blocked(question, config, decision, preliminary_scope):
-                raise QueryError("A conversational route cannot answer an evidence question.")
-            return decision
-        except Exception as compact_error:
-            _log_stage_latency("route_query_compact_rejected", 0.0, f"error={type(compact_error).__name__}: {compact_error}")
-            # A nontechnical message needs no evidence plan. Recover that route
-            # with a small independent envelope, not a truncated technical schema.
-            recovered = _recover_conversational_route(
-                question, config, preliminary_plan, preliminary_scope, session_state,
-            )
-            if recovered is not None:
-                return recovered
-        # The planner produced nothing usable. Rank capabilities by meaning before
-        # falling back to an empty plan, which would select no evidence at all.
-        capability_decision = _capability_routing_decision(
-            question, config, preliminary_scope, preliminary_plan,
-        )
-        if capability_decision is not None:
-            return capability_decision
-        if preliminary_plan and (
-            preliminary_plan.intent != "general"
-            or preliminary_plan.entities
-            or (preliminary_scope is not None and _scope_is_verified_technical(preliminary_scope))
-        ):
-            return QueryRoutingDecision(
-                "technical", "", preliminary_plan.intent,
-                category=preliminary_plan.category,
-                operations=preliminary_plan.operations,
-                source_domains=preliminary_plan.source_domains,
-                output_fields=preliminary_plan.output_fields,
-                domain=preliminary_plan.domain,
-                tasks=preliminary_plan.tasks,
-                relations=preliminary_plan.relations,
-                response_language=preliminary_plan.response_language,
-                excluded_operations=preliminary_plan.excluded_operations,
-                requires_comparison=preliminary_plan.requires_comparison,
-                requires_clarification=preliminary_plan.requires_clarification,
-                confidence=preliminary_plan.confidence,
-                planner_source="deterministic_fallback",
-            )
-        fallback_language = preliminary_plan.response_language if preliminary_plan else "en"
-        fallback_reply = (
-            "Non sono riuscito a classificare la richiesta in modo affidabile. "
-            "Fai una domanda sull'analisi COBOL oppure indica il programma e l'entità da esaminare."
-            if fallback_language == "it"
-            else "I could not reliably classify that request. Please ask a COBOL-analysis question "
-            "or name the program and entity you want to inspect."
-        )
-        return QueryRoutingDecision(
-            "unclear",
-            fallback_reply,
-            "general",
-            category="clarification",
-            response_language=fallback_language,
-            planner_source="deterministic_fallback",
-        )
+            from llama_index.core.llms import ChatMessage
+            instructions, context = prompt.split("\nContext: ", 1)
+            schema = _execution_schema()
+            if require_technical:
+                schema = schema["oneOf"][0]
+            response = build_llm(config, json_mode=True, max_output_tokens=512, temperature=0.0).chat([
+                ChatMessage(role="system", content=instructions + ("\nRepair the previous planning error: " + error if error else "")),
+                ChatMessage(role="user", content="Context: " + context),
+            ], format=schema)
+            decision = _parse_routing_decision(str(response.message.content or ""))
+            if (decision.route == "conversational" and session_state and session_state.last_result_entities
+                    and decision.reply.strip().casefold().rstrip(".?!") == question.strip().casefold().rstrip(".?!")):
+                require_technical = True
+                raise QueryError("Repeating the question is not an answer. Resolve the request against previous_result_preview and previous_spec; use reference_index for an ordinal item.")
+            if decision.route in {"conversational", "unclear"} and _routing_conflicts_with_verified_scope(decision, preliminary_plan, scope):
+                require_technical = True
+                raise QueryError("This request needs indexed COBOL evidence; return a technical query_spec, not a conversational reply.")
+            decision, _ = _prepare_execution_decision(decision, scope, session_state, question)
+            return _enforce_routing_language(decision, preliminary_plan)
+        except Exception as exc:
+            error = str(exc)
+            _log_stage_latency("semantic_plan_rejected", 0, f"attempt={attempt + 1} reason={error}")
+    return QueryRoutingDecision(
+        "unclear", "I could not form an executable evidence query for this request.",
+        "general", planner_source="semantic_query_spec_rejected",
+        requires_clarification=True,
+    )
 
 
 def _recover_conversational_route(question, config, plan, scope, state):

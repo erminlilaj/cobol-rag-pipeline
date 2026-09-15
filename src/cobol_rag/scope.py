@@ -72,6 +72,7 @@ class SessionState:
     last_sources: list[str] = field(default_factory=list)
     pending_clarification: str | None = None
     current_plan: dict[str, Any] = field(default_factory=dict)
+    investigation_memory: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -82,6 +83,12 @@ class SessionState:
         source_ids: list[str],
         plan: dict[str, Any] | None = None,
     ) -> None:
+        if plan is not None and plan.get('investigation_memory') is not None:
+            from copy import deepcopy
+            self.investigation_memory = deepcopy(plan['investigation_memory'])
+            # The new workflow owns its own result handles; do not retain an
+            # unrelated legacy variable focus after a successful topic change.
+            self.clear_entities()
         if scope.program:
             self.current_program = scope.program
         self.current_programs = list(scope.programs or ((scope.program,) if scope.program else ()))
@@ -111,6 +118,16 @@ class SessionState:
         self.pending_clarification = scope.reason if scope.ambiguous else None
         if plan is not None:
             self.current_plan = dict(plan)
+            if "result_entities" in plan:
+                results = [EntityReference(**item) for item in plan["result_entities"]
+                           if isinstance(item, dict)]
+                if results:
+                    self.last_result_entities = results
+                    self.focused_entity = results[0] if len(results) == 1 else None
+                    self.current_entities = results if len(results) == 1 else []
+                    self.current_entity_value = results[0].value if len(results) == 1 else None
+                    self.current_entity_key = results[0].entity_key if len(results) == 1 else None
+                    self.current_entity_type = results[0].entity_type
             self.current_intent = str(plan.get("intent") or self.current_intent or "general")
             # Inventories have a subject type but no focused identifier. Keep
             # that distinction so a refinement can narrow the collection.

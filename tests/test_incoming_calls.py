@@ -188,14 +188,7 @@ class RoutingWithoutAVerbListTest(unittest.TestCase):
 
 
 class SpecDirectionIsCompletedTest(unittest.TestCase):
-    """A planner specification that sets no direction has not chosen one.
-
-    The specification outranks the deterministic corpus compile, so a null
-    direction on a call question left the executor reading the outgoing side:
-    "which analyzed program calls PDCBVC" answered with PDCBVC's own calls.
-    Filling a null is not overriding a decision -- a direction the planner did
-    set is passed through untouched.
-    """
+    """The compiler preserves roles; the planner must repair absent roles."""
 
     def spec(self, direction=None, capability="call_evidence"):
         return SimpleNamespace(
@@ -208,12 +201,12 @@ class SpecDirectionIsCompletedTest(unittest.TestCase):
         return compile_query(question, program="PDCBVC", corpus_entity="PDCBVC",
                              graph_nodes=(), query_spec=spec)
 
-    def test_a_null_direction_is_read_from_the_question(self) -> None:
+    def test_null_direction_requires_semantic_repair_not_wording_inference(self) -> None:
         compiled = self.compile(
             "which analyzed program calls PDCBVC, and what parameter does it pass?",
             self.spec(),
         )
-        self.assertEqual(compiled.direction, "incoming")
+        self.assertIsNone(compiled.direction)
 
     def test_the_named_actor_is_left_outgoing(self) -> None:
         """"which programs does PDCBVC call" names PDCBVC as the actor, so the
@@ -229,7 +222,7 @@ class SpecDirectionIsCompletedTest(unittest.TestCase):
                 )
                 self.assertEqual(compiled.direction, given)
 
-    def test_the_target_comes_from_the_question_not_the_scope(self) -> None:
+    def test_compiler_does_not_invent_a_missing_semantic_target(self) -> None:
         """A specification with no entity must not fall back to the scoped
         program: under a two-program scope that is merely the first of them,
         which turned "who invokes PD0UTI01" into an answer about PDB305."""
@@ -238,8 +231,9 @@ class SpecDirectionIsCompletedTest(unittest.TestCase):
             program="PDB305", programs=("PDB305", "PDCBVC"),
             corpus_entity="PD0UTI01", graph_nodes=(), query_spec=self.spec(),
         )
-        self.assertEqual(compiled.direction, "incoming")
-        self.assertIn("PD0UTI01", compiled.entity_values)
+        self.assertIsNone(compiled.direction)
+        self.assertIsNone(compiled.target_entity)
+        self.assertNotIn("PD0UTI01", compiled.entity_values)
         self.assertNotIn("PDB305", compiled.entity_values)
 
     def test_an_entity_the_planner_supplied_is_kept(self) -> None:

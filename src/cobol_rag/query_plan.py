@@ -79,6 +79,9 @@ class QuerySpecification:
     source_entity: str | None = None
     target_entity: str | None = None
     filters: tuple[QueryFilter, ...] = ()
+    limit: int | None = None
+    offset: int = 0
+    order_by: str = "name"
 
 
 @dataclass(frozen=True)
@@ -96,6 +99,8 @@ class QueryPlan:
     programs: tuple[str, ...] = ()
     files: tuple[str, ...] = ()
     entities: tuple[EntityReference, ...] = ()
+    result_entities: tuple[EntityReference, ...] = ()
+    investigation_memory: dict[str, Any] | None = None
     operations: tuple[str, ...] = ()
     excluded_operations: tuple[str, ...] = ()
     source_domains: tuple[str, ...] = ()
@@ -640,6 +645,7 @@ ALLOWED_PLAN_RELATIONS = {
 }
 
 ALLOWED_EVIDENCE_CAPABILITIES = {
+    "corpus_inventory", "source_line_lookup",
     "artifact_inventory", "program_summary", "source_metrics",
     "variable_inventory",
     "paragraph_evidence", "variable_access", "literal_assignment",
@@ -656,6 +662,7 @@ ALLOWED_QUERY_OPERATORS = {
 }
 
 ALLOWED_QUERY_ENTITY_TYPES = {
+    "file",
     "program", "variable", "paragraph", "call", "copybook", "cics_operation",
     "map", "mapset", "queue", "table", "statement", "metric",
 }
@@ -665,6 +672,7 @@ ALLOWED_QUERY_DIRECTIONS = {
 }
 
 ALLOWED_QUERY_FILTER_FIELDS = {
+    "controls_flow", "origin", "line_start", "line_end",
     "call_type", "command", "paragraph", "resource_type", "resource_name",
     "condition_variable", "condition_operator", "condition_value", "source_file",
 }
@@ -1232,6 +1240,7 @@ def plan_needs_semantic_refinement(question: str, plan: QueryPlan) -> bool:
 
 
 _QUERY_SPEC_FIELDS = set(_OUTPUT_FIELD_PATTERNS) | {
+    "count", "type", "definition", "declaration", "children", "parents", "picture", "usage", "control_sites",
     "statement_count", "resource_type", "resource_name", "map", "mapset",
     "queue", "body", "incoming_edges", "outgoing_edges", "terminal", "exists",
 }
@@ -1327,10 +1336,54 @@ def _parse_query_spec(plan: QueryPlan, raw: Any) -> QuerySpecification | None:
         source_entity=grounded_optional("source_entity"),
         target_entity=grounded_optional("target_entity"),
         filters=tuple(parsed_filters),
+        limit=(raw.get("limit") if type(raw.get("limit")) is int and 0 < raw["limit"] <= 10000 else None),
+        offset=(raw.get("offset") if type(raw.get("offset")) is int and raw["offset"] >= 0 else 0),
+        order_by=(raw.get("order_by") if raw.get("order_by") in {"name", "source_line"} else "name"),
     )
 
 
 def merge_semantic_plan(plan: QueryPlan, update: dict[str, Any]) -> QueryPlan:
+    # An executable semantic specification owns meaning. Keyword-derived tasks
+    # must not survive beside it and widen a parameter lookup into an inventory.
+    specification = _parse_query_spec(plan, update.get("query_spec"))
+    if specification is not None:
+        intent, domain = _capability_route(specification.capability, plan.entities)
+        tasks = _CAPABILITY_TASKS.get(specification.capability, ())
+        if specification.capability == "variable_access":
+            requested = set(specification.fields)
+            tasks = tuple(task for task, fields in (
+                ("variable_definition", {"type", "definition", "declaration", "origin", "picture", "usage", "parents", "children"}),
+                ("variable_reads", {"read_sites"}),
+                ("variable_writes", {"write_sites"}),
+            ) if not requested or requested & fields)
+        contract = plan.response_contract
+        if (update.get("query_spec") or {}).get("reference_index") is not None:
+            # "The first one" selects an existing entity; it does not request
+            # a one-bullet explanation of that entity.
+            contract = replace(contract, exact_item_count=None)
+        if specification.operator == "aggregate":
+            contract = replace(contract, format="count")
+        elif specification.limit is not None:
+            contract = replace(contract, format="default", exact_item_count=specification.limit)
+        elif contract.format == "count":
+            contract = replace(contract, format="default")
+        merged = replace(
+            plan, intent=intent, domain=domain, tasks=tasks, operations=(specification.operator,),
+            entities=tuple(entity for entity in plan.entities if entity.value in specification.entity_values
+                           or entity.value in {specification.source_entity, specification.target_entity}),
+            query_spec=specification, source_domains=_INTENT_SOURCE_DOMAINS.get(intent, ()),
+            output_fields=specification.fields, response_contract=contract,
+            result_offset=specification.offset, result_scope="default", requires_clarification=False,
+            requires_comparison=len(plan.programs) > 1,
+            category="multi_source_comparison" if len(plan.programs) > 1 else "single_source",
+            planner_source="semantic_query_spec", confidence=float(update.get("confidence") or 0.7),
+        )
+        return replace(merged, subtasks=(EvidenceSubtask(
+            claim_id="claim_1", description="Execute the requested evidence operation",
+            capability=specification.capability, tasks=tasks,
+            entity_values=specification.entity_values, source_domains=merged.source_domains,
+            output_fields=specification.fields,
+        ),))
     allowed_routes = {"technical", "conversational", "unclear", "out_of_scope"}
     allowed_categories = {
         "single_source", "multi_source_synthesis", "multi_source_comparison",
@@ -1868,6 +1921,7 @@ def _capability_route(
     entities: tuple[EntityReference, ...],
 ) -> tuple[str, str]:
     mapping = {
+        "corpus_inventory": ("artifact_inventory", "program_structure"),
         "artifact_inventory": ("artifact_inventory", "program_structure"),
         "program_summary": ("program_summary", "program_structure"),
         "source_metrics": ("source_metrics", "program_structure"),

@@ -25,11 +25,11 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()[:20]
 
 
-def field(row, path):
+def field(row, path, default=None):
     value = row
     for name in path.split('.'):
         if not isinstance(value, dict) or name not in value:
-            return None
+            return default
         value = value[name]
     return value
 
@@ -40,8 +40,9 @@ def match(row, predicate):
     wanted = predicate.get('value')
     if not key or op not in {'eq', 'neq', 'in', 'contains'}:
         raise ToolError('Filter needs field, op=eq|neq|in|contains, and value.')
-    actual = field(row, key)
-    if actual is None:
+    missing = object()
+    actual = field(row, key, missing)
+    if actual is missing:
         raise ToolError(f'Field {key} is unavailable; inspect the schema first.')
     normalize = lambda x: str(x).casefold()
     if op == 'contains':
@@ -56,6 +57,7 @@ def match(row, predicate):
 
 TABLES = {
     'variables': ('dataflow.used_variables.json', 'variables'),
+    'variable_access': ('dataflow.used_variables.json', 'variables'),
     'calls': ('architecture.call_parameters.json', 'calls'),
     'cics': ('architecture.cics_operations.json', 'content.operations'),
     'copybooks': ('architecture.copybooks.json', 'content.inclusions'),
@@ -66,6 +68,16 @@ TABLES = {
     'summary': ('program.summary.json', ''),
     'quality': ('quality.dead_code.json', ''),
     'copybook_review': ('architecture.unused_copybooks.json', ''),
+}
+
+# Measurements keep their meaning and provenance at the evidence boundary.
+# This vocabulary validates answers; it never routes a user's question.
+METRIC_DEFINITIONS = {
+    'mapa_loc': ('MAPA LOC', 'program.summary.json'),
+    'mapa_paragraphs': ('MAPA paragraphs', 'program.summary.json'),
+    'source_procedure_paragraphs': ('source procedure paragraphs', 'program.comments.json'),
+    'physical_source_lines': ('physical source lines', 'program.comments.json'),
+    'graph_nodes': ('control-flow graph nodes', 'controlflow.cfg.json'),
 }
 
 
@@ -91,6 +103,19 @@ class EvidenceTools:
         self.evidence = {}
         self._ids = {}
         self._cache = {}
+
+    def mentioned_entities(self, text):
+        """Reuse the existing corpus catalogue, without inferring question intent."""
+        from cobol_rag.scope import _catalogue
+        root = artifacts.find_final_scripts_root()
+        _, entities = _catalogue(str(root) if root else '')
+        tokens = set(re.findall(r'[A-Za-z0-9_$.-]+', text.upper()))
+        tokens |= {token.rstrip('.') for token in tokens}
+        matches = [{'name': p, 'program': p, 'entity_type': 'program'}
+                   for p in self.programs if p in tokens]
+        matches.extend({'name': e.value, 'program': e.program, 'entity_type': e.entity_type}
+                       for e in entities if e.value in tokens)
+        return matches
 
     def root(self, program):
         program = str(program).upper()
@@ -146,7 +171,8 @@ class EvidenceTools:
             summary = self.load(program, artifact)
             comments = self.load(program, 'program.comments.json')
             cfg = self.load(program, 'controlflow.cfg.json')
-            metrics = {'physical_source_lines': comments.get('metrics', {}).get('total_lines'),
+            metrics = {'mapa_loc': summary.get('meta', {}).get('loc'),
+                       'physical_source_lines': comments.get('metrics', {}).get('total_lines'),
                        'source_procedure_paragraphs': comments.get('metrics', {}).get('total_procedure_paragraphs'),
                        'mapa_paragraphs': summary.get('meta', {}).get('paragraphs'),
                        'graph_nodes': len(cfg.get('nodes', []))}
@@ -159,6 +185,11 @@ class EvidenceTools:
                                              if r.get('line', 9999) < 30 and r.get('indexable')],
                         'metrics': metrics, 'outgoing_calls': [r.get('target') for r in calls.get('calls', [])],
                         'limitations': 'Purpose comments describe intent; graph nodes and source paragraphs are different measurements.'}]
+            raw[0]['metric_facts'] = [dict(field=key, value=metrics[key], unit=unit, source_artifact=source)
+                for key, (unit, source) in METRIC_DEFINITIONS.items() if metrics.get(key) is not None]
+            raw[0]['source_artifacts'] = ['program.summary.json', 'program.comments.json', 'controlflow.cfg.json']
+            if table == 'summary':
+                raw[0]['source_artifacts'].append('architecture.call_parameters.json')
         elif table == 'artifacts':
             artifact = 'artifact_inventory'
             raw = [{'name': str(p.relative_to(root))} for p in sorted(root.rglob('*.json'))
@@ -171,7 +202,12 @@ class EvidenceTools:
                 raw = payload.get(key.split('.')[-1])
             if not isinstance(raw, list):
                 raise ToolError(f'Analysis schema gap: {artifact} has no row collection {key}; inspect it.')
-            if table == 'copybook_review':
+            if table == 'variable_access':
+                raw = [dict(site, name=variable.get('variable'), variable=variable.get('variable'),
+                            access_kind=kind.removesuffix('_sites'))
+                       for variable in raw for kind, sites in variable.get('evidence', {}).items()
+                       if isinstance(sites, list) for site in sites if isinstance(site, dict)]
+            elif table == 'copybook_review':
                 content = payload.get('content', {})
                 raw = [{key: content[key] for key in ('copybooks_total', 'all_copybooks',
                     'needs_review_count', 'needs_review_copybooks', 'unused_copybooks_proven',
@@ -183,6 +219,11 @@ class EvidenceTools:
         result = []
         for item in raw:
             row = dict(item) if isinstance(item, dict) else {'name': str(item)}
+            if table == 'variable_access' and isinstance(row.get('line_start'), int) and row['line_start'] < 1:
+                row['recorded_line_start'] = row['line_start']
+                row['line_start'] = None
+                row['address_status'] = 'No physical source address recorded'
+                row['access_kind'] = 'unlocated_' + row['access_kind']
             row.setdefault('name', row.get('variable') or row.get('target') or row.get('copybook') or row.get('command') or table)
             row.update(program=program, _artifact=artifact)
             row['_row_id'] = digest(row)
@@ -234,7 +275,26 @@ class EvidenceTools:
             raise ToolError('Invalid replay operation.')
         category_values = {key: {str(field(r, key)).casefold() for r in rows if field(r, key) is not None}
                            for key in ('call_type', 'command', 'classification')}
+        schema_rows = rows
         for predicate in args.get('where', []):
+            key = predicate.get('field', '')
+            missing = object()
+            actual_values = [field(r, key, missing) for r in schema_rows]
+            present = [v for v in actual_values if v is not missing]
+            wanted = predicate.get('value')
+            values = wanted if isinstance(wanted, list) else [wanted]
+            if present and all(isinstance(v, bool) for v in present) and any(str(v).lower() not in {'true', 'false'} for v in values):
+                raise ToolError(f'Field {key} is boolean; use true or false as the value, not an operator or field name.')
+            if predicate.get('field') == 'origin' and predicate.get('op') in {'eq', 'in'}:
+                values = predicate.get('value')
+                values = values if isinstance(values, list) else [values]
+                origins = {str(r.get('origin', '')).upper() for r in rows}
+                if any(str(v).upper() in self.programs and str(v).upper() not in origins for v in values):
+                    error = ToolError('Program scope is already selected by programs. origin is a declaration origin, not the owning program; remove this ownership filter or use a recorded origin.')
+                    error.suggested_where = [p for p in args.get('where', []) if p != predicate]
+                    raise error
+            if schema_rows and not present:
+                raise ToolError(f'Field {key} is unavailable; inspect the table schema before filtering.')
             if tool == 'query' and args.get('table') in {'variables', 'copybooks', 'paragraphs'} and predicate.get('field') == 'name':
                 values = predicate.get('value')
                 values = values if isinstance(values, list) else [values]
@@ -266,9 +326,11 @@ class EvidenceTools:
             rows = [r for r in rows if match(r, predicate)]
         order = args.get('order_by', 'name' if tool != 'select' else None)
         if order:
+            descending = order.startswith('-')
+            order = order[1:] if descending else order
             if rows and any(field(r, order) is None for r in rows):
                 raise ToolError(f'Ordering field {order} unavailable.')
-            rows.sort(key=lambda r: (field(r, order), r.get('program', ''), r['_row_id']))
+            rows.sort(key=lambda r: (field(r, order), r.get('program', ''), r['_row_id']), reverse=descending)
         return rows, digest(rows)
 
     def register(self, row):
@@ -278,6 +340,22 @@ class EvidenceTools:
             self._ids[key] = eid
             self.evidence[eid] = deepcopy(row)
         return self._ids[key]
+
+    def call_relation(self, recipe):
+        """Describe the executed relation, including a zero-row result."""
+        args = recipe['args']
+        if recipe['tool'] == 'select':
+            relation = self.call_relation(args['parent'])
+            if relation:
+                relation = {**relation, 'refinement_filters': args.get('where', [])}
+            return relation
+        if recipe['tool'] != 'query' or args.get('table') != 'calls':
+            return None
+        target_filters = [p for p in args.get('where', []) if p.get('field') == 'target']
+        return {'edge': 'caller -> target', 'caller_scope': args['programs'],
+                'target_filters': target_filters, 'filters': args.get('where', []),
+                'direction': 'incoming_to_target' if target_filters else 'outgoing_from_callers',
+                'absence_scope': 'Only this caller scope and these filters were checked; the reverse direction was not checked.'}
 
     def paragraph_operations(self, program, paragraph):
         """Join analyzed operations to their host paragraph, including COPY origin."""
@@ -309,28 +387,76 @@ class EvidenceTools:
             raise ToolError(str(error)) from error
         if tool == 'files':
             return self.execute('query', {**args, 'programs': args.get('programs') or list(self.programs), 'table': 'files'})
+        if tool == 'variable_access':
+            variables = args.pop('variables')
+            if any(not name or '*' in name or '?' in name for name in variables):
+                raise ToolError('variable_access requires literal variable identifiers, not wildcards. '
+                                'For a variable inventory use query table=variables; controls_flow is a boolean property. '
+                                'For all access sites use query table=variable_access without an identifier filter.')
+            kind = args.pop('access_kind', None)
+            where = [{'field': 'variable', 'op': 'in', 'value': variables}]
+            if kind:
+                where.append({'field': 'access_kind', 'op': 'eq', 'value': kind})
+            return self.execute('query', {**args, 'table': 'variable_access', 'where': where})
         if tool == 'copybooks':
             return self.execute('query', {**args, 'table': 'copybooks'})
+        if tool == 'callees':
+            target = args.pop('target', None)
+            return self.execute('query', {**args, 'table': 'calls',
+                **({'where': [{'field': 'target', 'op': 'in' if isinstance(target, list) else 'eq', 'value': target}]} if target else {})})
         if tool == 'source_range':
             start, end = args.pop('start'), args.pop('end')
             return self.execute('source', {**args, 'spans': [[start, end]]})
         if tool == 'describe':
             identifier = args['identifier'].upper()
             if identifier in self.programs:
-                return self.execute('query', {'programs': [identifier], 'table': 'summary'})
-            matches = []
-            for program in args.get('programs') or self.programs:
+                result = self.execute('query', {'programs': [identifier], 'table': 'summary'})
+                if args.get('depth') == 'detailed':
+                    result['detail_coverage'] = {}
+                    for table in ('calls', 'edges', 'cics'):
+                        try:
+                            records = self.rows(identifier, table)
+                            result['detail_coverage'][table] = {'total': len(records), 'returned': min(8, len(records))}
+                            for record in records[:8]:
+                                row = {k: record[k] for k in ('program', '_artifact', 'name', 'caller', 'target',
+                                    'paragraph', 'line_start', 'line', 'statement', 'parameters', 'commarea', 'length', 'call_type',
+                                    'from', 'to', 'type', 'condition', 'evidence', 'command') if k in record}
+                                if table == 'calls':
+                                    row['relation'] = self.call_relation({'tool': 'query', 'args': {'programs': [identifier], 'table': 'calls'}})
+                                    row['call_inventory_counts'] = {kind: sum(r.get('call_type') == kind for r in records)
+                                        for kind in {r.get('call_type') for r in records} if kind}
+                                result['rows'].append({'evidence_id': self.register(row), **row})
+                        except (ToolError, OSError) as exc:
+                            result['detail_coverage'][table] = {'unavailable': str(exc)}
+                    result['returned'] = len(result['rows'])
+                    result['detail_limitations'] = 'Behavioral samples, not exhaustive paths or full implementation proof. Query specific aspects for more detail.'
+                return result
+            matches, paragraphs, gaps = [], [], []
+            programs = list(args.get('programs') or self.programs)
+            for program in programs:
                 for table in ('calls', 'copybooks', 'variables', 'paragraphs', 'files'):
-                    for row in self.rows(program, table):
+                    try:
+                        rows = self.rows(program, table)
+                    except ToolError as error:
+                        gaps.append({'program': program, 'table': table, 'error': str(error)})
+                        continue
+                    for row in rows:
                         name = str(row.get('name', '')).upper()
                         if name != identifier and not (table == 'files' and Path(name).stem == identifier):
                             continue
                         selected = {k: row[k] for k in ('program', '_artifact', 'name', 'caller', 'target',
                             'call_type', 'paragraph', 'parameters', 'commarea', 'line_start', 'line',
-                            'source_file', 'statement', 'origin', 'controls_flow') if k in row}
+                            'source_file', 'statement', 'origin', 'controls_flow', 'evidence', 'relationships') if k in row}
                         selected['entity_type'] = table
                         matches.append({'evidence_id': self.register(selected), **selected})
-            return {'rows': matches, 'returned': len(matches),
+                        if table == 'paragraphs':
+                            paragraphs.append(self.execute('source', {'program': program,
+                                'source_file': row['source_file'], 'paragraph': row['name']}))
+            lookup = {'_artifact': 'verified_entity_lookup', 'identifier': identifier,
+                      'programs': programs, 'matched_roles': len(matches), 'analysis_gaps': gaps,
+                      'scope': 'Recorded roles, not proof of an available program implementation.'}
+            return {'rows': matches, 'returned': len(matches), 'lookup_evidence_id': self.register(lookup),
+                    'analysis_gaps': gaps, 'paragraph_contexts': paragraphs,
                     'limitation': 'Recorded entity roles only. A called program is not necessarily analyzed; its implementation cannot be inferred from its interface.'}
         if tool == 'quality':
             reports = []
@@ -344,6 +470,8 @@ class EvidenceTools:
                                 'commented_out_code_count', 'unreachable_paragraphs', 'cfg_reachability',
                                 'copybooks_total', 'needs_review_count', 'needs_review_copybooks',
                                 'unused_copybooks_proven', 'proof_level', 'limitations') if k in row}
+                            if 'commented_out_code_count' in selected:
+                                selected['commented_out_code_unit'] = 'classified commented-code records; not a physical-line total'
                             reports.append({'evidence_id': self.register(selected), **selected})
                     except ToolError as error:
                         reports.append({'program': program, 'analysis_gap': str(error)})
@@ -351,7 +479,7 @@ class EvidenceTools:
         if tool == 'callers':
             target = args.pop('target')
             return self.execute('query', {**args, 'programs': args.get('programs') or list(self.programs),
-                'table': 'calls', 'where': [{'field': 'target', 'op': 'eq', 'value': target}]})
+                'table': 'calls', 'where': [{'field': 'target', 'op': 'in' if isinstance(target, list) else 'eq', 'value': target}]})
         if tool in {'inventory', 'query', 'select', 'compare'}:
             if any(k in args for k in ('parent', 'left', 'right', 'displayed_ids')):
                 raise ToolError('Internal replay fields cannot be supplied by the model.')
@@ -384,16 +512,26 @@ class EvidenceTools:
                     return result_unit(recipe['args']['parent'])
                 return TABLE_INFO.get(recipe['args'].get('table'), ('set members', ''))[0]
             unit = result_unit(recipe)
+            relation = self.call_relation(recipe)
             summary = {'recipe': recipe, 'result_id': rid, 'unit': unit, 'total_matches': len(rows), 'offset': offset,
                        'returned': len(shown), 'complete': offset == 0 and len(shown) == len(rows),
                        'member_rows': shown,
                        'programs': sorted({r['program'] for r in rows if r.get('program')} or set(args.get('programs', []))),
                        'source_artifacts': sorted({r['_artifact'] for r in rows if r.get('_artifact')}),
-                       '_artifact': 'verified_collection_operation'}
-            return {'result_id': rid, 'unit': unit, 'total_matches': len(rows), 'returned': len(shown),
+                       'relation': relation, '_artifact': 'verified_collection_operation'}
+            result = {'result_id': rid, 'unit': unit, 'relation': relation,
+                    'total_matches': len(rows), 'returned': len(shown),
                     'complete': summary['complete'], 'collection_evidence_id': self.register(summary),
                     'available_fields': sorted({k for r in rows[:20] for k in r if not k.startswith('_')}),
-                    'rows': [{'evidence_id': self.register({**r, 'result_id': rid}), **r} for r in shown]}
+                    'rows': [{'evidence_id': self.register({**r, 'result_id': rid, 'relation': relation}), **r} for r in shown]}
+            # Keep the operation's containing paragraph available without
+            # replacing the model's requested filtered result.
+            if tool == 'query' and args.get('table') == 'cics':
+                hosts = list(dict.fromkeys((r['program'], r['paragraph']) for r in shown if r.get('paragraph')))
+                result['paragraph_contexts'] = [{'program': p, 'paragraph': name, 'entity_type': 'paragraph',
+                    'operations': self.paragraph_operations(p, name)} for p, name in hosts[:5]]
+                result['paragraph_contexts_complete'] = len(hosts) <= 5
+            return result
         if tool == 'inspect':
             if args.get('evidence_id'):
                 row = self.evidence.get(args['evidence_id'])
@@ -486,17 +624,49 @@ class EvidenceTools:
                     'limitation': 'Literal source search, not exhaustive semantic absence; refine the term or inspect artifacts.'}
         raise ToolError('Unknown tool; use inventory, query, select, compare, inspect, source or search.')
 
+    def recall_active(self, limit=20):
+        """Revalidate the active collection without changing its saved meaning."""
+        rid = self.memory.get('last_result_id')
+        if not rid:
+            return None
+        saved = self.saved(rid)  # Reject stale corpus fingerprints.
+        recipe = saved['recipe']
+        rows, _ = self.evaluate(recipe)
+        base = recipe
+        while base['tool'] == 'select':
+            base = base['args']['parent']
+        unit = TABLE_INFO.get(base['args'].get('table'), ('set members', ''))[0]
+        relation = self.call_relation(recipe)
+        # Never offer a partial recalled list as though it were a usable set:
+        # a refinement must query the whole collection, not filter a preview.
+        shown = rows if len(rows) <= limit else []
+        summary = dict(_artifact='verified_collection_operation', result_id=rid,
+            total_matches=len(rows), returned=len(shown), complete=len(shown) == len(rows),
+            unit=unit, member_rows=shown, relation=relation,
+            source_artifacts=sorted({r['_artifact'] for r in rows if r.get('_artifact')}))
+        return dict(result_id=rid, total_matches=len(rows), returned=len(shown),
+            complete=summary['complete'], unit=unit, collection_evidence_id=self.register(summary),
+            rows=[dict(r, evidence_id=self.register(dict(r, result_id=rid, relation=relation))) for r in shown])
+
     def context(self):
+        unresolved = self.memory.get('unresolved_turn')
         active = self.memory['collections'].get(self.memory.get('last_result_id'), {})
         recipe = active.get('recipe', {})
+        filters = []
         while recipe.get('tool') == 'select':
+            filters.extend(recipe['args'].get('where', []))
             recipe = recipe['args']['parent']
+        filters = recipe.get('args', {}).get('where', []) + filters
         exchange = deepcopy(self.memory.get('last_exchange'))
         if exchange:
-            exchange['answer'] = re.sub(r'\[(?:E\d+|Source \d+)\]', '', exchange.get('answer', ''))
+            exchange['answer'] = re.sub(r'\[(?:E\d+|Source \d+)(?:\s*[,\-]\s*(?:E\d+|Source \d+))*\]', '', exchange.get('answer', ''))
         return {'evidence_scope': 'Evidence IDs expire each turn. Replay a saved result with select or query fresh evidence before citing it.',
+                'unresolved_turn': deepcopy(unresolved),
+                'focus_status': 'Previous successful context; latest request is unresolved.' if unresolved else 'Previous successful context.',
                 'active_subject': {'programs': recipe.get('args', {}).get('programs', []),
                                    'entity_collection': recipe.get('args', {}).get('table'),
+                                   'filters': filters,
+                                   'unit': TABLE_INFO.get(recipe.get('args', {}).get('table'), ('set members', ''))[0],
                                    'total': active.get('total')},
                 'last_result_id': self.memory.get('last_result_id'),
                 'last_exchange': exchange,

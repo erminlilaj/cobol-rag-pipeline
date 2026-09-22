@@ -153,7 +153,7 @@ function renderDebugDetails(debug, traceId = '') {
 
     const evidenceBlock = `
         <section class="debug-section">
-            <h5>Evidence inspected (${evidence.length})</h5>
+            <h5>${debug.investigation ? 'Evidence retrieved' : 'Evidence inspected'} (${evidence.length})</h5>
             ${evidence.length ? evidence.map(item => {
                 const label = item.source_file || item.source_id || `Evidence ${item.rank || ''}`;
                 const descriptors = [item.chunk_type, item.program, item.entity_key].filter(Boolean).join(' · ');
@@ -161,6 +161,7 @@ function renderDebugDetails(debug, traceId = '') {
                 return `<details class="debug-nested">
                     <summary>${escapeHTML(label)}${score}</summary>
                     ${descriptors ? `<p class="debug-muted">${escapeHTML(descriptors)}</p>` : ''}
+                    ${debug.investigation ? `<p class="debug-muted">${item.cited ? 'Cited in answer' : 'Retrieved, not cited'}${item.excerpt_truncated ? ' · excerpt truncated' : ''}</p>` : ''}
                     <pre>${escapeHTML(item.excerpt || 'No text excerpt available.')}</pre>
                 </details>`;
             }).join('') : '<p class="debug-muted">No evidence record was attached to this route.</p>'}
@@ -168,7 +169,7 @@ function renderDebugDetails(debug, traceId = '') {
 
     const planBlock = `
         <section class="debug-section">
-            <h5>Query plan</h5>
+            <h5>${debug.investigation ? 'Investigation request and execution trace' : 'Query plan'}</h5>
             <pre>${escapeHTML(JSON.stringify(debug.plan || {}, null, 2))}</pre>
         </section>`;
 

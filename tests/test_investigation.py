@@ -37,6 +37,265 @@ def test_count_followup_preserves_collection(evidence):
     assert [r['name'] for r in filtered['rows']] == ['V1']
 
 
+def test_optional_null_options_do_not_break_tool_batch():
+    decision = normalize_decision(dict(action='tools', calls=[dict(tool='callees', args=dict(programs=['A'], target=None))]), None)
+    assert decision['calls'][0]['args'] == {'programs': ['A']}
+    required = normalize_decision(dict(action='tools', calls=[dict(tool='callers', args=dict(target=None))]), None)
+    assert required['calls'][0]['args']['target'] is None
+
+
+def test_grouped_call_kind_claim_must_match_retrieved_calls():
+    from cobol_rag.investigation import call_kind_errors
+    rows = [dict(program='A', target='B', call_type='CICSLINK'), dict(program='A', target='C', call_type='CICSXCTL')]
+    assert call_kind_errors('A makes CICS LINK calls to B and C.', rows)
+    assert not call_kind_errors('A makes CICS LINK calls to B.', rows)
+    assert not call_kind_errors('A uses CICS LINK to B and CICS XCTL to C.', rows)
+    rows[0]['call_inventory_counts'] = {'CICSLINK': 1, 'CICSXCTL': 1}
+    assert call_kind_errors('A makes two CICS LINK calls and one CICS XCTL call.', rows)
+    assert not call_kind_errors('A makes one CICS LINK call and one CICS XCTL call.', rows)
+
+
+def test_detailed_explanation_cannot_claim_complete_with_only_overview(evidence):
+    from cobol_rag.investigation import answer_checks
+    evidence.evidence['E1'] = dict(_artifact='program.summary.json', program='A', identity='A program')
+    candidate = dict(answer='A is a program [E1].', mode='technical', status='complete', evidence_ids=['E1'])
+    request = dict(depth='detailed', output='summary')
+    assert any('only overview evidence' in e for e in answer_checks('Explain A.', candidate, evidence, [], request))
+    assert not any('only overview evidence' in e for e in answer_checks(
+        'Explain A.', candidate, evidence, [], dict(depth='brief', output='summary')))
+    candidate['status'] = 'partial'
+    assert not any('only overview evidence' in e for e in answer_checks('Explain A.', candidate, evidence, [], request))
+
+
+def test_detailed_description_returns_bounded_behavior_not_written_answer(evidence, monkeypatch):
+    original = evidence.rows
+    def rows(program, table):
+        if table == 'summary':
+            return [dict(name=program, program=program, identity='Example', _artifact='program.summary.json', _row_id='summary')]
+        if table in {'edges', 'cics'}:
+            return [dict(program=program, _artifact=table, _row_id=str(i), paragraph='HANDLER',
+                         statement='EXEC CICS RETURN END-EXEC.', condition='FLAG = 1') for i in range(12)]
+        return original(program, table)
+    monkeypatch.setattr(evidence, 'rows', rows)
+    result = evidence.execute('describe', dict(identifier='A', depth='detailed'))
+    assert result['detail_coverage']['edges'] == dict(total=12, returned=8)
+    assert result['detail_coverage']['cics'] == dict(total=12, returned=8)
+    assert 'answer' not in result
+    assert all(r['evidence_id'] in evidence.evidence for r in result['rows'])
+    assert next(r for r in result['rows'] if r.get('target') == 'B')['relation']['caller_scope'] == ['A']
+    preview = tool_view(result)
+    assert any(r.get('statement') for r in preview['rows'])
+    assert any(r.get('identity') == 'Example' for r in preview['rows'])
+
+
+def test_wildcard_identifier_is_not_false_absence(evidence):
+    with pytest.raises(ToolError, match='literal variable identifiers'):
+        evidence.execute('variable_access', dict(programs=['A'], variables=['*'], access_kind='control'))
+
+
+def test_owner_program_cannot_be_misused_as_declaration_origin(evidence):
+    with pytest.raises(ToolError, match='declaration origin'):
+        evidence.execute('query', dict(programs=['A'], table='variables',
+                         where=[dict(field='origin', op='eq', value='A')], limit=0))
+
+
+def test_boolean_filter_cannot_silently_match_nothing(evidence):
+    with pytest.raises(ToolError, match='boolean'):
+        evidence.execute('query', dict(programs=['A'], table='variables',
+            where=[dict(field='controls_flow', op='eq', value='eq')]))
+
+
+def test_unknown_filter_checked_even_after_no_match(evidence):
+    with pytest.raises(ToolError, match='unavailable'):
+        evidence.execute('query', dict(programs=['A'], table='variables', where=[
+            dict(field='name', op='eq', value='MISSING'),
+            dict(field='invented_field', op='eq', value=True)]))
+
+
+def test_corpus_scope_cannot_bypass_evidence_as_general(evidence):
+    from cobol_rag.investigation import answer_checks
+    candidate = dict(answer='I can list them if you ask.', mode='general', evidence_ids=[])
+    assert 'corpus_entity_answer_requires_evidence' in answer_checks(
+        'What can I inspect?', candidate, evidence, [], dict(scope='corpus', output='list', limit=None))
+
+
+def test_reference_resolution_receives_verified_query(evidence):
+    from cobol_rag.investigation import resolve_request
+    evidence.execute('callees', dict(programs=['A'], target='B'))
+    captured = []
+    class ResolverBudget:
+        def call(self, instructions, payload, *args, **kwargs):
+            captured.append(payload)
+            return dict(resolved_question='Does C call B?', output='other', limit=None, scope='corpus')
+    resolve_request('Does C call it?', '', evidence.memory, ResolverBudget())
+    assert captured[0]['previous_verified_query']['args']['table'] == 'calls'
+    assert captured[0]['CURRENT QUESTION'] == 'Does C call it?'
+
+
+def test_exact_member_count_does_not_require_bullet_format(evidence):
+    from cobol_rag.investigation import answer_checks
+    result = evidence.execute('query', dict(programs=['A'], table='variables', limit=2))
+    candidate = dict(answer='The variables are V1 and V2.', mode='technical', status='complete',
+                     collection_output='list', evidence_ids=[result['collection_evidence_id']])
+    assert not answer_checks('List the first two variables.', candidate, evidence, [], dict(output='list', limit=2))
+
+
+def test_call_target_set_keeps_caller_scope(evidence):
+    result = evidence.execute('callers', dict(programs=['A'], target=['B', 'C']))
+    assert [r['target'] for r in result['rows']] == ['B']
+    assert result['relation']['caller_scope'] == ['A']
+    assert result['relation']['target_filters'] == [dict(field='target', op='in', value=['B', 'C'])]
+
+
+def test_outgoing_target_array_and_string_have_same_relation_meaning(evidence):
+    from cobol_rag.investigation import call_review_errors
+    result = evidence.execute('callees', dict(programs=['A'], target='B'))
+    contracts = [dict(evidence_id='E1', relation=result['relation'])]
+    for restriction in (dict(target='B'), dict(targets=['B'])):
+        assert not call_review_errors(dict(requested_call_relation=dict(direction='outgoing', callers=['A'], **restriction)), contracts)
+    assert call_review_errors(dict(requested_call_relation=dict(direction='outgoing', callers=['A'], targets=['C'])), contracts)
+
+
+def test_unpaged_target_lookups_are_batched_without_changing_scope(evidence):
+    decision = normalize_decision(dict(action='tools', calls=[dict(tool='callers', id='client-label', args=dict(programs=['A'], target=t))
+                                                             for t in ['B', 'C', 'D', 'E', 'F']]), evidence)
+    assert decision['calls'] == [dict(tool='callers', args=dict(programs=['A'], target=['B','C','D','E','F']))]
+
+
+def test_equivalent_infix_filter_is_normalized(evidence):
+    decision = normalize_decision(dict(action='query', args=dict(programs=['A'], table='variables',
+        where=[{'controls_flow': 'eq', 'value': True}])), evidence)
+    assert decision['calls'][0]['args']['where'] == [dict(field='controls_flow', op='eq', value=True)]
+
+
+def test_budget_keeps_json_transport_without_duplicate_decision_prompt(monkeypatch):
+    import sys, json
+    from cobol_rag.investigation import Budget, schema
+    captured = []
+    def chat(messages, **kwargs):
+        captured.append((messages, kwargs))
+        return SimpleNamespace(message=SimpleNamespace(content=json.dumps(dict(action='tools', calls=[dict(tool='inventory', args={})]))))
+    monkeypatch.setitem(sys.modules, 'llama_index.core.llms', SimpleNamespace(ChatMessage=lambda **kw: kw))
+    monkeypatch.setitem(sys.modules, 'cobol_rag.index', SimpleNamespace(build_llm=lambda *a, **kw: SimpleNamespace(chat=chat)))
+    contract = schema()
+    Budget(AppConfig()).call('Choose a tool.', {'question': 'List programs'}, contract)
+    assert captured[0][1]['format'] == 'json'
+    assert 'response_schema' not in json.loads(captured[0][0][1]['content'])
+
+
+def test_row_citation_can_prove_complete_single_member_list(evidence):
+    from cobol_rag.investigation import answer_checks
+    result = evidence.execute('callees', dict(programs=['A'], target='B'))
+    candidate = dict(answer='A calls B with AREA.', mode='technical', status='complete',
+                     collection_output='list', evidence_ids=[result['rows'][0]['evidence_id']])
+    assert not answer_checks('What parameters are passed to B?', candidate, evidence, [], dict(output='list', limit=None))
+
+
+def test_list_execution_does_not_inherit_count_only_transport(evidence):
+    budget = FakeBudget([
+        dict(action='tools', calls=[dict(tool='query', args=dict(programs=['A'], table='variables', limit=0))]),
+        dict(action='final', mode='technical', status='complete', answer='V1, V2.', evidence_ids=['E1']),
+        dict(passed=True, issues=[]),
+    ])
+    result = investigate('Which variables?', AppConfig(), budget=budget,
+                         resolved_request=dict(resolved_question='Which variables in A?', output='list', limit=None))
+    assert result['status'] == 'complete'
+    assert next(s for s in result['trace'] if s.get('tool') == 'query')['returned'] == 2
+
+
+def test_tool_failure_gets_isolated_argument_repair(evidence):
+    repaired_payloads = []
+    class RepairBudget(FakeBudget):
+        def call(self, instructions, payload, *args, **kwargs):
+            if 'failed_request' in payload:
+                repaired_payloads.append(deepcopy(payload))
+            return super().call(instructions, payload, *args, **kwargs)
+    budget = RepairBudget([
+        dict(action='query', args=dict(programs=['A'], table='variables', where=[dict(field='origin', op='eq', value='A')], limit=0)),
+        dict(action='query', args=dict(programs=['A'], table='variables', limit=0)),
+        dict(action='final', mode='technical', status='complete', answer='2', evidence_ids=['E1']),
+        dict(passed=True, issues=[]),
+    ])
+    result = investigate('How many variables in A?', AppConfig(), budget=budget)
+    assert result['status'] == 'complete'
+    assert len(repaired_payloads) == 1
+    assert 'declaration origin' in repaired_payloads[0]['failed_request']['error']
+    assert repaired_payloads[0]['failed_request']['proposed_repair'] == {
+        'tool': 'query', 'args': {'programs': ['A'], 'table': 'variables', 'where': [], 'limit': 0}}
+    assert 'observations' not in repaired_payloads[0]
+
+
+@pytest.mark.parametrize('direction,expected', [('asc', 'V1'), ('desc', 'V2')])
+def test_sort_representation_preserves_direction_and_pages_after_sort(evidence, direction, expected):
+    decision = normalize_decision(dict(action='query', args=dict(programs=['A'], table='variables',
+        order_by=[dict(field='name', op=direction)], limit=1)), evidence)
+    result = evidence.execute('query', decision['calls'][0]['args'])
+    assert result['rows'][0]['name'] == expected
+
+
+def test_full_list_cannot_pass_as_partial_page_or_omit_output_kind(evidence):
+    from cobol_rag.investigation import answer_checks
+    page = evidence.execute('query', dict(programs=['A'], table='variables', limit=1))
+    candidate = dict(answer='V1', mode='technical', status='complete', evidence_ids=[page['collection_evidence_id']])
+    request = dict(output='list', limit=None)
+    errors = answer_checks('Which variables?', candidate, evidence, [], request)
+    assert any('collection_output' in e for e in errors)
+    assert any('incomplete' in e for e in errors)
+    candidate['collection_output'] = 'list'
+    assert not answer_checks('Which variable?', candidate, evidence, [], dict(output='list', limit=1))
+
+
+def test_request_is_frozen_before_tools(evidence):
+    request = dict(resolved_question='List programs', output='list', limit=None)
+    captured = []
+    class Capture(FakeBudget):
+        def call(self, instructions, payload, *args, **kwargs):
+            captured.append(deepcopy(payload.get('resolved_request')))
+            return super().call(instructions, payload, *args, **kwargs)
+    answer = final()
+    answer['collection_output'] = 'list'
+    answer['evidence_ids'] = ['E1', 'E2', 'E3']
+    answer['request_contract'] = dict(resolved_question='Different question', output='summary', limit=None)
+    budget = Capture([dict(action='tools', request_contract=request, calls=[dict(tool='inventory', args={})]),
+                      answer, dict(passed=True, issues=[])])
+    result = investigate('List programs', AppConfig(), budget=budget)
+    assert result['status'] == 'complete'
+    assert captured[0] is None
+    assert all(c == request for c in captured[1:])
+
+
+def test_valid_tool_request_without_optional_contract_passes_actual_schema(evidence):
+    from jsonschema import validate
+    class SchemaCheckingBudget(FakeBudget):
+        def call(self, instructions, payload, output_schema=None, **kwargs):
+            response = super().call(instructions, payload, output_schema, **kwargs)
+            if output_schema:
+                validate(response, output_schema)
+            return response
+    budget = SchemaCheckingBudget([
+        dict(action='tools', calls=[dict(tool='query', args=dict(programs=['A'], table='variables', limit=0))]),
+        dict(action='final', mode='technical', status='complete', answer='2', evidence_ids=['E1']),
+        dict(passed=True, issues=[]),
+    ])
+    result = investigate('How many variables does A have?', AppConfig(), budget=budget)
+    assert result['status'] == 'complete'
+    assert result['tool_calls'] == 1
+
+
+def test_reviewer_cannot_substitute_a_retrieved_callee(evidence):
+    request = dict(resolved_question='Does A call C?', output='other', limit=None,
+                   call_relation=dict(direction='outgoing', callers=['A'], target='C'))
+    budget = FakeBudget([
+        dict(action='tools', request_contract=request, calls=[dict(tool='callees', args=dict(programs=['A']))]),
+        dict(action='final', mode='technical', status='complete', answer='A calls B.', evidence_ids=['E2']),
+        dict(passed=True, issues=[], requested_call_relation=dict(direction='outgoing', callers=['A'], target='B')),
+        RuntimeError('stop'), RuntimeError('stop'),
+    ])
+    result = investigate('Does A call it too?', AppConfig(), budget=budget)
+    assert result['status'] == 'failed'
+    assert any('Requested callee changed' in issue for step in result['trace'] for issue in step.get('issues', []))
+
+
 def test_displayed_and_whole_collection_are_distinct(evidence):
     page = evidence.execute('query', dict(programs=['A'], table='variables', limit=1))
     shown = evidence.execute('select', dict(result_id=page['result_id'], basis='displayed'))
@@ -54,6 +313,106 @@ def test_callers_primitive_keeps_direction_and_parameters(evidence):
     found = evidence.execute('callers', dict(target='B'))
     assert [(r['caller'], r['target'], r['commarea']) for r in found['rows']] == [('A', 'B', 'AREA')]
     assert evidence.execute('callers', dict(target='A'))['total_matches'] == 0
+
+
+def test_call_relations_preserve_direction_even_when_empty(evidence):
+    outgoing = evidence.execute('callees', dict(programs=['A']))
+    incoming = evidence.execute('callers', dict(target='A'))
+    assert outgoing['total_matches'] == 1 and incoming['total_matches'] == 0
+    assert outgoing['relation']['direction'] == 'outgoing_from_callers'
+    assert incoming['relation']['direction'] == 'incoming_to_target'
+    assert incoming['unit'] == 'program-call records'
+    assert incoming['relation']['target_filters'] == [dict(field='target', op='eq', value='A')]
+    assert evidence.evidence[incoming['collection_evidence_id']]['relation'] == incoming['relation']
+    selected = evidence.execute('select', dict(result_id=incoming['result_id'], basis='collection'))
+    assert selected['relation']['direction'] == 'incoming_to_target'
+
+
+def test_review_cannot_approve_reversed_call_evidence(evidence):
+    from cobol_rag.investigation import call_review_errors
+    incoming = evidence.execute('callers', dict(target='A'))
+    contracts = [dict(evidence_id=incoming['collection_evidence_id'], relation=incoming['relation'])]
+    review = dict(passed=True, requested_call_relation=dict(subject='A', direction='outgoing'))
+    assert call_review_errors(review, contracts)[0].startswith('call_direction_mismatch')
+    review['requested_call_relation']['direction'] = 'incoming'
+    assert call_review_errors(review, contracts) == []
+    assert call_review_errors(dict(passed=True), contracts)
+
+
+def test_outgoing_target_filter_is_not_automatically_incoming_question(evidence):
+    from cobol_rag.investigation import call_review_errors
+    found = evidence.execute('query', dict(programs=['A'], table='calls',
+        where=[dict(field='target', op='eq', value='B')]))
+    contracts = [dict(evidence_id='E1', relation=found['relation'])]
+    # "Does A call B?" and "Does B have A as a caller?" use the same edge.
+    for subject, direction in [('A', 'outgoing'), ('B', 'incoming')]:
+        assert call_review_errors(dict(requested_call_relation=dict(subject=subject, direction=direction, target='B')), contracts) == []
+
+
+@pytest.mark.parametrize('text', ['392 MAPA paragraphs', '14 source procedure paragraphs', 'Physical lines: 392', '392 paragraphs'])
+def test_metric_labels_cannot_be_swapped(text):
+    from cobol_rag.investigation import metric_label_errors
+    facts = [dict(metric_facts=[dict(field='mapa_paragraphs', value=14),
+        dict(field='source_procedure_paragraphs', value=69), dict(field='physical_source_lines', value=912)])]
+    assert metric_label_errors(text, facts)
+
+
+def test_metric_labels_accept_correct_units():
+    from cobol_rag.investigation import metric_label_errors
+    facts = [dict(metric_facts=[dict(field='mapa_loc', value=392), dict(field='mapa_paragraphs', value=14),
+        dict(field='source_procedure_paragraphs', value=69), dict(field='physical_source_lines', value=912)])]
+    assert metric_label_errors('392 MAPA LOC, 14 MAPA paragraphs, 69 source paragraphs and 912 physical lines.', facts) == []
+
+
+def test_known_external_role_cannot_be_denied_without_lookup(evidence, monkeypatch):
+    from cobol_rag.investigation import answer_checks
+    from cobol_rag.scope import EntityReference
+    monkeypatch.setattr('cobol_rag.scope._catalogue', lambda _: (('A',),
+        (EntityReference('A', 'call', 'EXTERNAL-X', 'A|EXTERNAL-X'),)))
+    candidate = dict(answer='I have no information about EXTERNAL-X.', mode='general', status='complete', evidence_ids=[])
+    assert 'corpus_entity_answer_requires_evidence' in answer_checks('Explain external-x', candidate, evidence, [])
+    assert evidence.mentioned_entities('What is external-x?')[0]['entity_type'] == 'call'
+    assert evidence.mentioned_entities('good morning') == []
+
+
+def test_filtered_cics_keeps_host_paragraph_context(evidence, monkeypatch):
+    operations = [dict(program='A', name=command, command=command, paragraph='ERROR-HANDLER',
+        statement=command, _artifact='architecture.cics_operations.json', _row_id=str(i))
+        for i, command in enumerate(['SYNCPOINT', 'LINK', 'ABEND'])]
+    monkeypatch.setattr(evidence, 'rows', lambda p, t: deepcopy(operations))
+    found = evidence.execute('query', dict(programs=['A'], table='cics',
+        where=[dict(field='command', op='eq', value='ABEND')]))
+    assert found['total_matches'] == 1  # Context must NOT change the requested selection.
+    context = found['paragraph_contexts'][0]
+    assert context['entity_type'] == 'paragraph'
+    assert [r['command'] for r in context['operations']] == ['SYNCPOINT', 'LINK', 'ABEND']
+
+
+def test_describe_lookup_records_analysis_gaps(evidence, monkeypatch):
+    def missing(p, t):
+        if t == 'calls':
+            raise ToolError('Analysis gap')
+        return []
+    monkeypatch.setattr(evidence, 'rows', missing)
+    found = evidence.execute('describe', dict(identifier='MISSING-X', programs=['A']))
+    lookup = evidence.evidence[found['lookup_evidence_id']]
+    assert lookup['matched_roles'] == 0 and lookup['analysis_gaps']
+
+
+def test_summary_metric_provenance_uses_actual_source_fields(monkeypatch):
+    monkeypatch.setattr('cobol_rag.investigation_tools.artifacts.analyzed_programs', lambda: ('A',))
+    tool = EvidenceTools(AppConfig())
+    monkeypatch.setattr(tool, 'root', lambda p: None)
+    data = {'program.summary.json': dict(content='COBOL program', meta=dict(loc=120, paragraphs=8)),
+            'program.comments.json': dict(metrics=dict(total_lines=300, total_procedure_paragraphs=21), comments=[]),
+            'controlflow.cfg.json': dict(nodes=list(range(22))), 'architecture.call_parameters.json': dict(calls=[])}
+    monkeypatch.setattr(tool, 'load', lambda p, a: deepcopy(data[a]))
+    row = tool.rows('A', 'summary')[0]
+    facts = {f['field']: f for f in row['metric_facts']}
+    assert facts['mapa_loc']['value'] == 120 and facts['mapa_loc']['unit'] == 'MAPA LOC'
+    assert facts['source_procedure_paragraphs']['value'] == 21
+    assert facts['source_procedure_paragraphs']['source_artifact'] == 'program.comments.json'
+    assert set(row['source_artifacts']) == set(data)
 
 
 def test_empty_collection_supports_scoped_absence(evidence):
@@ -115,6 +474,40 @@ def test_describe_retains_distinct_entity_roles(evidence, monkeypatch):
     monkeypatch.setattr(evidence, 'rows', lambda p, t: [dict(name='X', program=p, _artifact=t)] if t in ('calls', 'copybooks') else [])
     result = evidence.execute('describe', dict(identifier='X', programs=['A']))
     assert {r['entity_type'] for r in result['rows']} == {'calls', 'copybooks'}
+
+
+def test_describe_preserves_variable_check_sites(evidence, monkeypatch):
+    sites = {'control_sites': [{'paragraph': 'CHECK', 'line_start': 49, 'statement': "IF FLAG = 'E'"}]}
+    monkeypatch.setattr(evidence, 'rows', lambda p, t: [dict(name='FLAG', program=p,
+        _artifact=t, evidence=sites, controls_flow=True)] if t == 'variables' else [])
+    result = evidence.execute('describe', {'identifier': 'FLAG', 'programs': ['A']})
+    assert tool_view(result)['rows'][0]['evidence'] == sites
+
+
+def test_variable_access_exposes_late_sites_as_queryable_rows(monkeypatch, tmp_path):
+    monkeypatch.setattr('cobol_rag.investigation_tools.artifacts.analyzed_programs', lambda: ('A',))
+    tool = EvidenceTools(AppConfig())
+    monkeypatch.setattr(tool, 'root', lambda p: tmp_path)
+    monkeypatch.setattr(tool, 'load', lambda p, a: {'variables': [dict(variable='VALUE', evidence={
+        'read_sites': [dict(paragraph='P', line_start=n, statement=f'MOVE VALUE TO V{n}') for n in range(1, 21)],
+        'control_sites': [dict(paragraph='CHECK', line_start=-1, statement='VALUE > ZERO')],
+    })]})
+    result = tool.execute('query', {'programs': ['A'], 'table': 'variable_access',
+        'where': [{'field': 'variable', 'op': 'eq', 'value': 'VALUE'},
+                  {'field': 'line_start', 'op': 'eq', 'value': 19}]})
+    assert result['total_matches'] == 1
+    assert tool_view(result)['rows'][0]['statement'] == 'MOVE VALUE TO V19'
+    assert result['rows'][0]['access_kind'] == 'read'
+    assert result['rows'][0]['_artifact'] == 'dataflow.used_variables.json'
+    control = tool.execute('query', {'programs': ['A'], 'table': 'variable_access',
+        'where': [{'field': 'access_kind', 'op': 'eq', 'value': 'unlocated_control'}]})
+    assert control['returned'] == 1
+    assert control['rows'][0]['line_start'] is None
+    assert control['rows'][0]['recorded_line_start'] == -1
+    assert tool.execute('variable_access', {'programs': ['A'], 'variables': ['VALUE'], 'access_kind': 'control'})['returned'] == 0
+    page = tool.execute('variable_access', {'programs': ['A'], 'variables': ['VALUE', 'OTHER'],
+                                          'access_kind': 'read', 'offset': 19, 'limit': 1})
+    assert page['total_matches'] == 20 and page['returned'] == 1
 
 
 def test_source_member_stem_resolves_only_when_unique(evidence, monkeypatch):
@@ -250,6 +643,154 @@ def test_review_failure_can_be_repaired(evidence):
     ])
     result = investigate('List the programs.', AppConfig(), budget=budget)
     assert result['status'] == 'complete' and budget.calls == 5
+
+
+def test_followup_context_is_frozen_during_new_tool_queries(evidence):
+    previous = evidence.execute('query', {'programs': ['A'], 'table': 'variables'})
+    evidence.memory['last_exchange'] = {'question': 'List variables', 'answer': 'V1, V2', 'result_id': previous['result_id']}
+    contexts = []
+    class CapturingBudget(FakeBudget):
+        def call(self, instructions, payload, *args, **kwargs):
+            contexts.append(deepcopy(payload['conversation']))
+            return super().call(instructions, payload, *args, **kwargs)
+    budget = CapturingBudget([
+        dict(action='tools', requirements=['List programs'], calls=[dict(tool='inventory', args={})]),
+        final(), dict(passed=True, issues=[]),
+    ])
+    result = investigate('List programs', AppConfig(), state=SimpleNamespace(investigation_memory=evidence.memory), budget=budget)
+    assert result['status'] == 'complete'
+    assert all(c['last_result_id'] == previous['result_id'] for c in contexts)
+    assert contexts[0] == contexts[-1]
+
+
+def test_memory_keeps_refined_filters_but_removes_old_citations(evidence):
+    first = evidence.execute('query', {'programs': ['A'], 'table': 'variables'})
+    predicate = dict(field='controls_flow', op='eq', value=True)
+    evidence.execute('select', dict(result_id=first['result_id'], basis='collection', where=[predicate]))
+    evidence.memory['last_exchange'] = {'answer': 'V1 [E1, E2-E19] [Source 1]'}
+    context = evidence.context()
+    assert context['active_subject']['filters'] == [predicate]
+    assert context['active_subject']['unit'] == 'recorded variables'
+    assert context['last_exchange']['answer'].strip() == 'V1'
+
+
+def test_new_turn_does_not_automatically_promote_memory_to_evidence(evidence):
+    evidence.execute('query', {'programs': ['A'], 'table': 'variables'})
+    class ContextOnlyBudget(FakeBudget):
+        def call(self, instructions, payload, *args, **kwargs):
+            if self.calls == 0:
+                assert payload['observations'] == []
+                assert payload['conversation']['last_result_id']
+            return super().call(instructions, payload, *args, **kwargs)
+    budget = ContextOnlyBudget([
+        dict(action='tools', calls=[dict(tool='inventory', args={})]),
+        final(), dict(passed=True, issues=[]),
+    ])
+    result = investigate('List programs', AppConfig(), state=SimpleNamespace(investigation_memory=evidence.memory), budget=budget)
+    assert result['status'] == 'complete'
+    assert not any(t.get('tool') == 'memory_recall' for t in result['trace'])
+
+
+def test_unresolved_request_labels_but_preserves_previous_context(evidence):
+    evidence.execute('query', {'programs': ['A'], 'table': 'variables'})
+    evidence.memory['unresolved_turn'] = {'question': 'Show lines 10 to 20 in A'}
+    before = deepcopy(evidence.memory)
+    context = evidence.context()
+    assert context['unresolved_turn']['question'] == 'Show lines 10 to 20 in A'
+    assert context['last_result_id']
+    assert 'unresolved' in context['focus_status']
+    assert context['active_subject']['entity_collection'] == 'variables'
+    assert evidence.memory == before
+
+
+def test_memory_recall_revalidates_without_mutating_collection(evidence):
+    first = evidence.execute('query', {'programs': ['A'], 'table': 'variables', 'limit': 0})
+    before = deepcopy(evidence.memory)
+    recalled = evidence.recall_active()
+    assert recalled['total_matches'] == 2 and recalled['returned'] == 2
+    assert recalled['collection_evidence_id'] in evidence.evidence
+    assert evidence.memory == before
+    count_only = evidence.recall_active(limit=1)
+    assert count_only['total_matches'] == 2 and count_only['rows'] == []
+    assert not count_only['complete']
+    evidence.memory['collections'][first['result_id']]['fingerprint'] = 'stale'
+    with pytest.raises(ToolError, match='Corpus changed'):
+        evidence.recall_active()
+
+
+def test_review_protocol_repair_does_not_rewrite_answer(evidence):
+    budget = FakeBudget([
+        dict(action='tools', calls=[dict(tool='callees', args={'programs': ['A']})]),
+        dict(action='final', mode='technical', status='complete',
+             answer='A calls B. [E2]', evidence_ids=['E2']),
+        dict(passed=True, issues=[]),
+        dict(passed=True, issues=[], requested_call_relation={'callers': ['A'], 'direction': 'outgoing'}),
+    ])
+    result = investigate('Which programs does A call?', AppConfig(), budget=budget)
+    assert result['status'] == 'complete' and budget.calls == 4, result['trace']
+    assert [step['action'] for step in result['trace'] if 'action' in step] == ['tools', 'final']
+    assert any(step.get('review_protocol_errors') for step in result['trace'])
+
+
+@pytest.mark.parametrize('bad', [dict(passed=True, issues=[]), {'passed': 'true', 'issues': []}, []])
+def test_invalid_review_stops_after_one_protocol_repair(bad):
+    from cobol_rag.investigation import review_answer, ReviewProtocolError
+    budget = FakeBudget([bad, bad])
+    with pytest.raises(ReviewProtocolError, match='review_protocol_invalid'):
+        review_answer(budget, 'Review', {'evidence_contracts': [{'relation': {'caller_scope': ['A']}}]}, [])
+    assert budget.calls == 2
+
+
+def test_null_relationship_is_valid_only_without_call_evidence():
+    from cobol_rag.investigation import review_answer, ReviewProtocolError
+    response = dict(passed=True, issues=[], requested_call_relation=None)
+    budget = FakeBudget([response])
+    assert review_answer(budget, 'Review', {'evidence_contracts': []}, [])['passed']
+    assert budget.calls == 1
+    with pytest.raises(ReviewProtocolError):
+        review_answer(FakeBudget([response, response]), 'Review',
+                      {'evidence_contracts': [{'relation': {'caller_scope': ['A']}}]}, [])
+
+
+def test_repaired_review_still_rejects_reversed_direction(evidence):
+    from cobol_rag.investigation import review_answer, call_review_errors
+    found = evidence.execute('callers', {'target': 'A'})
+    contracts = [{'evidence_id': found['collection_evidence_id'], 'relation': found['relation']}]
+    budget = FakeBudget([dict(passed=True, issues=[]), dict(passed=True, issues=[],
+        requested_call_relation={'callers': ['A'], 'direction': 'outgoing'})])
+    review = review_answer(budget, 'Review', {'evidence_contracts': contracts}, [])
+    assert call_review_errors(review, contracts)[0].startswith('call_direction_mismatch')
+
+
+def test_review_requires_evidence_for_each_call_subject(evidence):
+    from cobol_rag.investigation import call_review_errors
+    contracts = [{'evidence_id': 'E1', 'relation': evidence.execute('callees', {'programs': ['A']})['relation']}]
+    review = dict(requested_call_relation={'subjects': ['A', 'B'], 'direction': 'outgoing'})
+    assert call_review_errors(review, contracts)
+    contracts.append({'evidence_id': 'E2', 'relation': evidence.execute('callees', {'programs': ['B']})['relation']})
+    assert call_review_errors(review, contracts) == []
+
+
+def test_incoming_review_repairs_conflicting_target_field(evidence):
+    from cobol_rag.investigation import review_answer, call_review_errors
+    contracts = [{'evidence_id': 'E1', 'relation': evidence.execute('callers', {'target': 'A'})['relation']}]
+    budget = FakeBudget([
+        dict(passed=True, issues=[], requested_call_relation={'subjects': ['B'], 'direction': 'incoming', 'target': 'A'}),
+        dict(passed=True, issues=[], requested_call_relation={'targets': ['A'], 'direction': 'incoming'}),
+    ])
+    review = review_answer(budget, 'Review', {'evidence_contracts': contracts}, [])
+    assert budget.calls == 2 and call_review_errors(review, contracts) == []
+
+
+def test_supplemental_review_roles_do_not_create_false_rejection(evidence):
+    from cobol_rag.investigation import review_answer, call_review_errors
+    review = dict(passed=True, issues=[], requested_call_relation={
+        'direction': 'outgoing', 'callers': ['A'], 'targets': ['B']})
+    contracts = [{'evidence_id': 'E1', 'relation': evidence.execute('callees', {'programs': ['A']})['relation']}]
+    for scope in [contracts, []]:
+        budget = FakeBudget([review])
+        checked = review_answer(budget, 'Review', {'evidence_contracts': scope}, [])
+        assert budget.calls == 1 and call_review_errors(checked, scope) == []
 
 
 def test_review_exception_cannot_accept_unreviewed_answer(evidence):

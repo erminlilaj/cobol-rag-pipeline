@@ -2,7 +2,8 @@
 
 TABLE_INFO = {
     'variables': ('recorded variables', 'Variable declarations and use: name, controls_flow, origin, relationships, evidence.'),
-    'calls': ('outgoing program calls', 'External program invocations: caller, target, call_type, paragraph, parameters, commarea, line_start. COPY is not a call_type.'),
+    'variable_access': ('recorded variable access evidence', 'Flat pageable records: variable/name, access_kind (read, write, read_write, control, subscript), paragraph, line_start, statement. Unlocated analyzer expressions use unlocated_ prefixed access_kind and null line_start; these are not additional physical locations. Write sites show data sources.'),
+    'calls': ('program-call records', 'Directed invocations caller -> target: caller, target, call_type, paragraph, parameters, commarea, line_start. Owner programs are callers; a target filter finds incoming references. COPY is not a call_type.'),
     'cics': ('CICS operations', 'command, paragraph, resources, statement, line_start. Filter command for SEND, RECEIVE, SYNCPOINT, ABEND etc.'),
     'copybooks': ('COPY inclusions', 'Included copy members, not program invocations: copybook, line, section, division.'),
     'edges': ('control-flow edges', 'from, to, type, condition, evidence, line. Query destination to find incoming conditions.'),
@@ -26,6 +27,16 @@ def obj(properties, required=()):
 
 S = {'type': 'string'}
 STRINGS = {'type': 'array', 'items': S}
+TARGET = {'anyOf': [S, {'type': 'array', 'items': S, 'minItems': 1}]}
+REQUEST = obj({'resolved_question': S,
+    'depth': {'enum': ['brief', 'standard', 'detailed']},
+    'explanation_goals': STRINGS,
+    'scope': {'enum': ['corpus', 'general', 'conversational']},
+    'output': {'enum': ['list', 'count', 'summary', 'other']},
+    'limit': {'type': ['integer', 'null'], 'minimum': 1},
+    'call_relation': obj({'direction': {'enum': ['incoming', 'outgoing']},
+                          'callers': STRINGS, 'targets': STRINGS, 'target': S}, ['direction'])},
+    ['resolved_question', 'output', 'limit'])
 FILTER = obj({'field': S, 'op': {'type': 'string', 'enum': ['eq', 'neq', 'in', 'contains']},
               'value': {'type': ['string', 'number', 'boolean', 'array', 'null']}}, ['field', 'op', 'value'])
 PAGE = {'offset': {'type': 'integer', 'minimum': 0}, 'limit': {'type': 'integer', 'minimum': 0, 'maximum': 100}}
@@ -34,9 +45,12 @@ QUERY = {'programs': STRINGS, 'table': {'type': 'string', 'enum': list(TABLE_INF
 TOOL_SCHEMAS = {
     'inventory': obj(PAGE),
     'files': obj({'programs': STRINGS, **PAGE}),
-    'callers': obj({'target': S, 'programs': STRINGS, **PAGE}, ['target']),
+    'callers': obj({'target': TARGET, 'programs': STRINGS, **PAGE}, ['target']),
+    'callees': obj({'programs': STRINGS, 'target': TARGET, **PAGE}, ['programs']),
+    'variable_access': obj({'programs': STRINGS, 'variables': STRINGS,
+        'access_kind': {'enum': ['read', 'write', 'read_write', 'control', 'subscript']}, **PAGE}, ['programs', 'variables']),
     'quality': obj({'programs': STRINGS}, ['programs']),
-    'describe': obj({'identifier': S, 'programs': STRINGS}, ['identifier']),
+    'describe': obj({'identifier': S, 'programs': STRINGS, 'depth': {'enum': ['brief', 'standard', 'detailed']}}, ['identifier']),
     'copybooks': obj({'programs': STRINGS, **PAGE}, ['programs']),
     'source_range': obj({'program': S, 'source_file': S, 'start': {'type': 'integer', 'minimum': 1},
                          'end': {'type': 'integer', 'minimum': 1}}, ['program', 'start', 'end']),
@@ -63,6 +77,7 @@ def decision_schema():
                 'status': {'enum': ['complete', 'partial']}, 'requirements': STRINGS,
                 'evidence_ids': STRINGS, 'result_id': {'type': ['string', 'null']},
                 'collection_output': {'enum': ['list', 'count', 'summary']},
+                'request_contract': REQUEST,
                 'coverage': {'type': 'array', 'items': obj({'requirement': S, 'status': {'enum': ['answered', 'unavailable']}}, ['requirement', 'status'])}}, ['action'])
     schema['allOf'] = [
         {'if': {'properties': {'action': {'const': 'tools'}}}, 'then': {'required': ['calls']}},
@@ -81,8 +96,10 @@ def tool_help():
                   'copybooks(programs) reads actual COPY inclusions. Filename extensions do NOT identify all copybooks.',
                   'source_range(program,start,end) reads an inclusive line range; prefer this flat form for consecutive lines.',
                   'quality(programs) reads existing dead-code findings and copybook review evidence, including limitations. This analysis is available; do not claim there is no tool for it.',
-                  'callers(target, programs optional) finds incoming calls TO target across the analyzed corpus; preserves caller, COMMAREA and parameters. query table=calls instead lists outgoing calls FROM owner programs.',
+                  'callees(programs) lists outgoing calls MADE BY those programs. callers(target, programs optional) finds incoming calls TO target. Their empty results have different meanings. Both preserve caller, target, COMMAREA and parameters.',
+                  'callers/callees target accepts one identifier or an array of identifiers for a single batched lookup within the same caller scope.',
                   'select refines a saved result, basis collection or displayed. Preserve its filters.',
+                  'order_by is a field string: name for ascending, -name for descending. Sorting precedes pagination.',
                   'source reads spans [[start,end]] or a paragraph body.',
                   'search mode literal finds source text; mode hybrid retrieves conceptual evidence.',
                   'Filters: {field,op:eq|neq|in|contains,value}. Multiple filters are AND.',

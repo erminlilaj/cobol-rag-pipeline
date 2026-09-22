@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 
 from cobol_rag.config import AppConfig
 from cobol_rag.query import REJECTED_EXECUTION_MODES, QueryAnswer, answer_query
@@ -91,6 +92,10 @@ class ChatSession:
                 [str(source.metadata.get("source_id", "")) for source in answer.sources],
                 plan=answer.plan.as_dict() if answer.plan else None,
             )
+        elif self.config.investigation.enabled and answer.route != "conversational":
+            # Remember the request, never the failed answer as a fact. Do not
+            # let a follow-up silently attach to the previous successful topic.
+            self.state.investigation_memory['unresolved_turn'] = {"question": message}
         return QueryAnswer(
             question=message,
             answer=answer.answer,
@@ -116,6 +121,11 @@ class ChatSession:
     def _history_context(self) -> str | None:
         if not self.turns:
             return None
+
+        if self.config.investigation.enabled:
+            return json.dumps([{'question': t.user, 'answer': t.assistant[:2000],
+                                'status': 'answered' if t.route == 'technical' else t.route}
+                               for t in self.turns[-self.max_history:]])
 
         technical_turns = [
             turn for turn in self.turns if turn.route == "technical"

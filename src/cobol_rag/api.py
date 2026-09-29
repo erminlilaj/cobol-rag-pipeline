@@ -6,6 +6,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -118,6 +119,7 @@ def health() -> Any:
 @app.post("/api/chat")
 def chat(req: ChatRequest, request: Request) -> Any:
     session = get_chat_session(_request_session_id(request, req.session_id))
+    started = time.monotonic()
     try:
         answer = session.ask(req.message, target_program=req.program)
         sources = [
@@ -149,6 +151,14 @@ def chat(req: ChatRequest, request: Request) -> Any:
             "plan": answer.plan.as_dict() if answer.plan else {},
             "execution_mode": answer.execution_mode,
             "debug": answer.debug,
+            "runtime": {
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "duration_ms": round((time.monotonic() - started) * 1000),
+                "llm": session.config.llm.model,
+                "embedding": session.config.embedding.model,
+                "collection": session.config.index.collection,
+                "investigation_enabled": session.config.investigation.enabled,
+            },
         }
     except QueryError as error:
         raise HTTPException(status_code=400, detail=str(error))

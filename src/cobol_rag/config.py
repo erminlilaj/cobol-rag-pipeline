@@ -81,13 +81,17 @@ class ObservabilityConfig:
 @dataclass(frozen=True)
 class InvestigationConfig:
     enabled: bool = False
-    max_model_calls: int = 6
-    max_tool_calls: int = 10
-    timeout_seconds: int = 90
+    memory_enabled: bool = False
+    max_model_calls: int = 16
+    max_tool_calls: int = 20
+    timeout_seconds: int = 240
+    context_window: int = 16384
 
     def __post_init__(self):
-        if not 3 <= self.max_model_calls <= 8 or not 1 <= self.max_tool_calls <= 20 or not 10 <= self.timeout_seconds <= 300:
-            raise ValueError('Investigation limits require 3..8 model calls, 1..20 tool calls and 10..300 seconds.')
+        if not 8192 <= self.context_window <= 131072:
+            raise ValueError('Investigation context_window requires 8192..131072 tokens.')
+        if not 3 <= self.max_model_calls <= 16 or not 1 <= self.max_tool_calls <= 40 or not 10 <= self.timeout_seconds <= 600:
+            raise ValueError('Investigation limits require 3..16 model calls, 1..40 tool calls and 10..600 seconds.')
 
 
 @dataclass(frozen=True)
@@ -149,6 +153,8 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         _set_nested(result, ("llm", "context_window"), int(context_window))
     if investigation := os.getenv("COBOL_RAG_INVESTIGATION"):
         _set_nested(result, ("investigation", "enabled"), investigation.lower() in {"1", "true", "yes", "on"})
+    if memory := os.getenv("COBOL_RAG_MEMORY_ENABLED"):
+        _set_nested(result, ("investigation", "memory_enabled"), memory.lower() in {"1", "true", "yes", "on"})
     return result
 
 

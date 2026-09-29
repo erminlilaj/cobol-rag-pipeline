@@ -1,11 +1,12 @@
 """Shared, data-driven contracts for the investigation model and executor."""
 
 TABLE_INFO = {
+    'parameter_writes': ('call parameter preparation sites', 'Flat records: caller, target, parameter (COMMAREA), variable, paragraph, line_start, statement, call_line. Recorded writes_before_call, not proof of every possible runtime path.'),
     'variables': ('recorded variables', 'Variable declarations and use: name, controls_flow, origin, relationships, evidence.'),
     'variable_access': ('recorded variable access evidence', 'Flat pageable records: variable/name, access_kind (read, write, read_write, control, subscript), paragraph, line_start, statement. Unlocated analyzer expressions use unlocated_ prefixed access_kind and null line_start; these are not additional physical locations. Write sites show data sources.'),
     'calls': ('program-call records', 'Directed invocations caller -> target: caller, target, call_type, paragraph, parameters, commarea, line_start. Owner programs are callers; a target filter finds incoming references. COPY is not a call_type.'),
     'cics': ('CICS operations', 'command, paragraph, resources, statement, line_start. Filter command for SEND, RECEIVE, SYNCPOINT, ABEND etc.'),
-    'copybooks': ('COPY inclusions', 'Included copy members, not program invocations: copybook, line, section, division.'),
+    'copybooks': ('COPY inclusions', 'Included copy members: copybook, line, section, division, categories, classification_note. Where review analysis exists, needs_review and proven_unused are booleans with review_source and review_limitations. Filter needs_review eq true for candidates; missing review fields mean unknown, not false. Categories are heuristic hints; filter categories with contains then inspect source to establish purpose.'),
     'edges': ('control-flow edges', 'from, to, type, condition, evidence, line. Query destination to find incoming conditions.'),
     'paragraphs': ('source procedure paragraphs', 'Source paragraph names and source_file; excludes the implicit program entry node.'),
     'graph_nodes': ('control-flow graph nodes', 'Graph node names including implicit program entry; not a source paragraph count.'),
@@ -34,6 +35,8 @@ REQUEST = obj({'resolved_question': S,
     'scope': {'enum': ['corpus', 'general', 'conversational']},
     'output': {'enum': ['list', 'count', 'summary', 'other']},
     'limit': {'type': ['integer', 'null'], 'minimum': 1},
+    'offset': {'type': 'integer', 'minimum': 0},
+    'order_by': S,
     'call_relation': obj({'direction': {'enum': ['incoming', 'outgoing']},
                           'callers': STRINGS, 'targets': STRINGS, 'target': S}, ['direction'])},
     ['resolved_question', 'output', 'limit'])
@@ -43,6 +46,10 @@ PAGE = {'offset': {'type': 'integer', 'minimum': 0}, 'limit': {'type': 'integer'
 QUERY = {'programs': STRINGS, 'table': {'type': 'string', 'enum': list(TABLE_INFO)},
          'where': {'type': 'array', 'items': FILTER}, 'order_by': S, **PAGE}
 TOOL_SCHEMAS = {
+    'data_dependencies': obj({'programs': STRINGS, 'source': S, 'target': S,
+        'max_depth': {'type': 'integer', 'minimum': 1, 'maximum': 6}}, ['programs', 'source', 'target']),
+    'flow_edges': obj({'programs': STRINGS, 'paragraph': S,
+        'direction': {'enum': ['incoming', 'outgoing']}, **PAGE}, ['programs', 'paragraph', 'direction']),
     'inventory': obj(PAGE),
     'files': obj({'programs': STRINGS, **PAGE}),
     'callers': obj({'target': TARGET, 'programs': STRINGS, **PAGE}, ['target']),
@@ -51,7 +58,7 @@ TOOL_SCHEMAS = {
         'access_kind': {'enum': ['read', 'write', 'read_write', 'control', 'subscript']}, **PAGE}, ['programs', 'variables']),
     'quality': obj({'programs': STRINGS}, ['programs']),
     'describe': obj({'identifier': S, 'programs': STRINGS, 'depth': {'enum': ['brief', 'standard', 'detailed']}}, ['identifier']),
-    'copybooks': obj({'programs': STRINGS, **PAGE}, ['programs']),
+    'copybooks': obj({'programs': STRINGS, 'where': QUERY['where'], 'order_by': S, **PAGE}, ['programs']),
     'source_range': obj({'program': S, 'source_file': S, 'start': {'type': 'integer', 'minimum': 1},
                          'end': {'type': 'integer', 'minimum': 1}}, ['program', 'start', 'end']),
     'query': obj(QUERY, ['programs', 'table']),
@@ -59,6 +66,9 @@ TOOL_SCHEMAS = {
                    'where': QUERY['where'], 'order_by': S, **PAGE}, ['result_id', 'basis']),
     'compare': obj({'left_id': S, 'right_id': S, 'field': S,
                     'operation': {'enum': ['intersection', 'difference', 'union']}, **PAGE}, ['left_id', 'right_id', 'operation']),
+    'compare_groups': obj({'result_id': S, 'group_by': S, 'left_value': S, 'right_value': S, 'field': S,
+                    'operation': {'enum': ['intersection', 'difference', 'union']}, **PAGE},
+                    ['result_id', 'group_by', 'left_value', 'right_value', 'operation']),
     'inspect': obj({'evidence_id': S, 'program': S, 'artifact': S, 'field': S, **PAGE}),
     'source': obj({'program': S, 'source_file': S, 'paragraph': S,
                   'spans': {'type': 'array', 'items': {'type': 'array', 'items': {'type': 'integer'}, 'minItems': 2, 'maxItems': 2}}}, ['program']),
@@ -70,7 +80,7 @@ def decision_schema():
     # A flat envelope avoids recursive unions in inference-server grammars.
     # Per-tool arguments are still strictly validated before execution.
     argument_fields = {key: value for spec in TOOL_SCHEMAS.values() for key, value in spec['properties'].items()}
-    calls = {'type': 'array', 'maxItems': 3, 'items': obj({
+    calls = {'type': 'array', 'maxItems': 6, 'items': obj({
         'tool': {'enum': list(TOOL_SCHEMAS)}, 'args': obj(argument_fields)}, ['tool', 'args'])}
     schema = obj({'action': {'enum': ['tools', 'final']}, 'calls': calls, 'answer': S,
                 'mode': {'enum': ['technical', 'general', 'conversational', 'clarification']},
@@ -92,6 +102,7 @@ def tool_help():
         lines.append(name + '(' + ', '.join(schema['properties']) + ')')
     lines.extend(['inventory lists analyzed PROGRAMS, not files.',
                   'query reads a table for explicit programs; limit:0 counts, limit:N pages.',
+                  'data_dependencies(programs,source,target,max_depth) traces indirect static read/write dependency paths between named variables. Prefer it for propagation questions, then inspect source/definitions for formatting and conditions. No path is not a proof of global absence.',
                   'describe(identifier) resolves a program or entity and reads its evidence for explanations. Use it rather than answering from old citations.',
                   'copybooks(programs) reads actual COPY inclusions. Filename extensions do NOT identify all copybooks.',
                   'source_range(program,start,end) reads an inclusive line range; prefer this flat form for consecutive lines.',
@@ -99,6 +110,7 @@ def tool_help():
                   'callees(programs) lists outgoing calls MADE BY those programs. callers(target, programs optional) finds incoming calls TO target. Their empty results have different meanings. Both preserve caller, target, COMMAREA and parameters.',
                   'callers/callees target accepts one identifier or an array of identifiers for a single batched lookup within the same caller scope.',
                   'select refines a saved result, basis collection or displayed. Preserve its filters.',
+                  'compare_groups compares two groups inside ONE saved result without intermediate IDs. For shared members across programs use group_by=program, left_value/right_value=the program identifiers, field=name, operation=intersection. Difference is left minus right; union combines both. It works for any table and grouping field.',
                   'order_by is a field string: name for ascending, -name for descending. Sorting precedes pagination.',
                   'source reads spans [[start,end]] or a paragraph body.',
                   'search mode literal finds source text; mode hybrid retrieves conceptual evidence.',

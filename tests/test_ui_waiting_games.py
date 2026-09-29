@@ -79,7 +79,8 @@ class WaitingGamesAssetTest(unittest.TestCase):
 
     def test_ui_assets_are_versioned_and_served_without_stale_browser_caching(self) -> None:
         self.assertIn("style.css?v=waiting-games-", self.index)
-        self.assertIn("app.js?v=waiting-games-", self.index)
+        self.assertRegex(self.index, r'app\.js\?v=[A-Za-z0-9-]+')
+        self.assertIn('chat-export.js?v=', self.index)
         self.assertIn('response.headers["Cache-Control"] = "no-store', self.api)
 
     def test_each_browser_has_isolated_chat_memory(self) -> None:

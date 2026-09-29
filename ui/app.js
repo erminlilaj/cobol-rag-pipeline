@@ -14,6 +14,28 @@ const treeFilter = document.getElementById('tree-filter');
 
 let selectedInboxPaths = new Set();
 let inboxTreeData = null;
+let transcript = [];
+let transcriptStartedAt = new Date().toISOString();
+
+function downloadChat(includeDebug) {
+    if (!transcript.length) {
+        showModal('Download Chat', '<p>Send a message first. The initial welcome message is not a conversation.</p>');
+        return;
+    }
+    const exportedAt = new Date().toISOString();
+    const html = ChatExport.render({messages: transcript, sessionId: chatSessionId,
+        startedAt: transcriptStartedAt, exportedAt,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        includeDebug, pending: pendingQuestions.length, running: Boolean(runningRequest)});
+    const url = URL.createObjectURL(new Blob([html], {type: 'text/html;charset=utf-8'}));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `cobol-rag-chat-${exportedAt.replace(/[:.]/g, '-')}-${includeDebug ? 'debug' : 'clean'}.html`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 const chatSessionStorageKey = 'cobol-rag-session-id';
 let chatSessionId = window.localStorage.getItem(chatSessionStorageKey);
 if (!chatSessionId) {
@@ -359,6 +381,7 @@ async function resetCollection() {
 }
 
 function appendMessage(role, content, sources = [], metadata = null) {
+    transcript.push({role, content, sources, metadata, timestamp: new Date().toISOString()});
     const msgDiv = document.createElement('div');
     msgDiv.className = `message ${role}`;
 
@@ -751,6 +774,8 @@ async function resetChat() {
     try {
         await apiFetch('/api/chat/reset', { method: 'POST' });
         chatHistory.innerHTML = '';
+        transcript = [];
+        transcriptStartedAt = new Date().toISOString();
         appendMessage('assistant', 'Chat memory cleared. What should we inspect next?');
     } catch (error) {
         showModal('Chat Reset Failed', `<p>${escapeHTML(error.message)}</p>`);

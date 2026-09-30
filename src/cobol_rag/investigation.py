@@ -48,12 +48,44 @@ callers queries incoming calls to target. Preserve both roles. Distinguish CALL,
 and XCTL. Empty incoming evidence says nothing about outgoing calls. For parameters
 read the matching call record; parameter_writes records preparation. Query both inventories
 then compare for shared/exclusive members. Cite the derived result, not only its inputs.
+When asked which function or function number a caller uses with an external routine,
+look for a function-selector field prepared before the call in its parameter area.
+The selector may use a copybook/interface prefix rather than the callee's program name.
+Verify the assignment and its relation to the call; report the value as requested by
+the caller, not as an intrinsic property or proven behavior of the callee.
+If only a numeric selector is available, answer with that code and say its business
+meaning is unknown unless the analyzed evidence defines it. Do not require a named
+function to answer which selector the caller used.
 
 For variable inventories use query table=variables; controls_flow eq true selects variables
 controlling execution. origin is declaration provenance, not owner program. For specific
 access locations use variable_access with named variables and read/write/control kind.
 Trace value propagation by reading destination writes and then intermediate inputs;
 control-flow edges alone cannot prove value propagation. literals records assignments.
+For a field-to-screen question, use name prefixes to discover candidate interface
+fields, then verify COPY origin, source assignments, intermediate fields, group layout,
+and the final map/output transfer. Distinguish a data group declared with a COBOL
+level number from a PROCEDURE paragraph. Give only paths supported by source evidence.
+An assignment to a child of a data group will not appear as a write to the group
+name in variable_access. Search the group name to find its declaration and the
+paragraph that prepares or transfers it; read that full paragraph and the group
+declaration. Follow writes to child fields before the group transfer. Do not conclude
+that no source fields reach the group from group-level writes alone.
+Use group_context when the question names a destination data group and an input
+interface prefix. Inspect its returned source lines, then request the full preparation
+paragraph where needed to verify indirect paths and conditions.
+In group_context, group is the destination record (for example a map row), and
+source_prefix is the input interface. Never put the input interface in group.
+Fields written to child items are represented by their parent group when the group
+is moved to a map or output area. Distinguish MOVE group TO output from MOVE output
+TO group. For "which fields" give the supported source field names as a list, with
+their intermediate and destination fields where useful. Do not require a direct
+MOVE from every source field to the group name.
+If the user asks for "fields of X", list the supported source fields belonging
+to X, not the names of destination group members. Show each source field's path
+to a destination member. Exclude destination members fed by unrelated sources.
+Preserve each MOVE's actual source and destination. If the path uses intermediate
+items, say "via" those items rather than claiming a direct MOVE to the final field.
 Use copybooks for inclusion and quality or explicit review predicates for unused/review
 questions; absent reference evidence is not proof of unused code.
 Metrics retain exact labels and provenance: LOC, physical lines, paragraphs and graph nodes
@@ -477,7 +509,26 @@ def review_answer(budget, instructions, payload, trace):
     instructions += '\nReturn every required response_schema field. The schema describes your REVIEW, not an answer or tool decision. On rejection identify repair=answer (facts already available), evidence (missing/wrong evidence), or request (wrong resolved intent). For request repair provide corrected_request preserving the original user meaning. Independently map the original request onto caller -> target: outgoing requires callers, incoming requires targets. The optional target field is for outgoing restrictions only; omit it for incoming.'
     for attempt in range(2):
         try:
-            review = budget.call(instructions, request, reserve=budget.output_reserve)
+            scoped_instructions = instructions
+            if payload.get('paragraph_flow'):
+                scoped_instructions += (
+                    '\nFor paragraph entry-condition questions, a recorded incoming edge whose to '
+                    'equals the exact requested paragraph supports its recorded branch condition. '
+                    'Accept a source-level explanation of that condition without requiring runtime '
+                    'reachability or proof that it is the only possible entry, unless the original '
+                    'question explicitly requests those guarantees. Complete edge inventory means '
+                    'complete within the analyzed static graph, not all possible executions. '
+                    'Source evidence showing the full IF condition and its controlled GO TO '
+                    'the requested paragraph also establishes that entry condition; a separate '
+                    'graph citation is not mandatory. Evaluate these source rows together, '
+                    'not the GO TO line in isolation. The controlling condition may be in the '
+                    'predecessor paragraph, not the destination body. Agreeing source and '
+                    'incoming-edge evidence are complementary, not a reason for rejection. '
+                    'Do not replace the requested destination with a similarly named child paragraph. '
+                    'Still reject unsupported claims of guaranteed execution or exclusive entry, '
+                    'and truncated compound conditions. If only wording overstates the evidence, '
+                    'use repair=answer rather than demanding the same evidence again.')
+            review = budget.call(scoped_instructions, request, reserve=budget.output_reserve)
             if isinstance(review, dict):
                 # Lossless envelope normalization; never change the review verdict.
                 repair = review.get('repair')
@@ -684,6 +735,14 @@ def answer_checks(question, candidate, tools, requirements, request=None):
         reasons.append('corpus_entity_answer_requires_evidence')
     cited_rows = [tools.evidence[i] for i in ids]
     cited_rows += [member for row in list(cited_rows) for member in row.get('member_rows', [])]
+    if candidate.get('mode') == 'technical' and candidate.get('status') == 'complete':
+        for context in getattr(tools, 'group_contexts', []):
+            fields = context['candidate_source_fields']
+            if fields and not any(re.search(r'(?<![A-Z0-9-])' + re.escape(name) +
+                                            r'(?![A-Z0-9-])', cleaned.upper()) for name in fields):
+                reasons.append('source_field_names_missing: this answer used a group-context lookup '
+                               f'for {context["source_prefix"]} but named no source fields from that interface. '
+                               'List supported source fields, not only destination group members.')
     reasons.extend(call_kind_errors(cleaned, list(tools.evidence.values())))
     if request and request.get('depth') == 'detailed' and candidate.get('status') == 'complete' and cited_rows:
         artifacts_used = {r.get('_artifact') for r in cited_rows} - {None, 'verified_collection_operation'}
@@ -803,6 +862,8 @@ most recent relevant request/answer, including unanswered requests. A new explic
 old topics. Never omit an explicitly named program or entity from CURRENT QUESTION.
 Do not carry a previous count operation into a new list question.
 Which entities asks for a list, not examples. Parameters or explanations can use output=other.
+"Which fields" asks for a list of field names, including when the question also
+names an interface, data group, map row or program.
 Ordinal ranges preserve both offset and limit: sixth through tenth is offset=5, limit=5.
 Distinguish existence from enumeration: asking whether files are available is output=summary,
 not an exhaustive list. Questions about your capabilities are scope=general, output=summary;
@@ -814,6 +875,16 @@ For a direct call-relationship request, include call_relation: incoming with tar
 for callers of a program, outgoing with callers for programs it invokes. Include
 targets only when the user restricts the called programs. Omit call_relation for
 unrelated questions; incidental call evidence does not create a relationship task.
+For a requested function or function number used when calling a routine, resolve the function
+selector and value passed in the caller's interface, not the routine's own callees.
+Do not assign a call_relation merely because this question mentions a call; the
+call is context for the requested parameter value. A prefix on an interface field
+is a search hint, not proof of its origin or its destination on a screen.
+"Which function of ROUTINE is used in CALLER?" can ask for the selector code;
+do not silently upgrade it to a demand for a documented function name. If no
+name mapping is analyzed, the selector value still answers the available part.
+Check whether a named item is a DATA DIVISION group or a PROCEDURE paragraph
+before treating it as a paragraph in the resolved question.
 Resolve references by semantic role, not merely the nearest noun: programs call programs,
 pass parameters, include copybooks, and read or write variables. A follow-up asking whether
 another program calls it refers to the previously discussed call target, not its parameters.
@@ -849,6 +920,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
     pending_tool_repair = None
     previous_candidate = None
     finalize_existing = False
+    repeated_no_progress = 0
     known_entities = tools.mentioned_entities(question)
     request = deepcopy(resolved_request)
     if request:
@@ -1000,6 +1072,8 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         'A paragraph name is not a CICS command. For paragraph explanations consider all supplied paragraph_context operations, including COPY-origin operations. '
                         'Verify call types against call_type and statement: do not describe CALL or CICS XCTL as CICS LINK, even in a grouped sentence. For detailed explanations require an explanation of available conditions and interfaces rather than only names. '
                         'Known call/copybook roles must not be denied merely because their program implementation is unavailable. '
+                        'For a question about which function or function number a caller uses with a routine, verify the caller-side selector assignment and call interface. A verified selector code answers which function the caller requested when no function-name mapping is available; report the code and qualify that its business meaning is unknown. Do not reject solely because the code has no documented function name or because it is not an intrinsic callee property. Do not infer the callee implementation. '
+                        'For a question about fields shown in a map or record, verify source assignments through intermediate data items and the output transfer. A field prefix alone is only a search hint. A level-numbered DATA DIVISION group is not a PROCEDURE paragraph. Writes to child fields become part of the parent group; when the prepared group is moved TO an output field, those child values are transferred. Distinguish this from a MOVE from output TO group. Do not reinterpret a field-lineage question as requiring direct MOVE statements into the parent group. If the question asks which fields OF an interface or program, the answer must name supported source fields of that interface; destination group members are not substitutes. Reject destination fields attributed to that interface when their actual source is unrelated. Check every asserted direct MOVE against its actual source and destination; if intermediates exist, require the answer to say via those intermediates. When a candidate field is omitted, check whether its path through a group or redefinition was inspected before claiming an exhaustive list. If the evidence supports the field paths but the answer omits the requested source-field list, reject with repair=answer, not repair=evidence. '
                         'Source rows marked is_comment are not executable paths. A list of jump sites without their branch conditions does not answer a request for conditions. '
                         'Commented-out declarations do not actively define data items. COPY membership must come from inclusion evidence, not filename extensions or a partial files page. '
                         'Review relevance even when the candidate labels itself conversational or clarification. '
@@ -1161,6 +1235,12 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
         except Exception as exc:
             candidate = None
             errors = [str(exc)]
+            if 'Identical tool request produced no new evidence' in str(exc):
+                pending_tool_repair = None
+                repeated_no_progress += 1
+                if repeated_no_progress >= 2:
+                    trace.append({'status': 'stopped_repeated_request', 'error': str(exc)})
+                    break
             if getattr(exc, 'failed_call', None):
                 pending_tool_repair = {'call': exc.failed_call, 'error': str(exc)}
             trace.append({'status': 'error', 'error': str(exc)[:500]})

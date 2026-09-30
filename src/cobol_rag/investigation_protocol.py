@@ -61,6 +61,7 @@ TOOL_SCHEMAS = {
     'copybooks': obj({'programs': STRINGS, 'where': QUERY['where'], 'order_by': S, **PAGE}, ['programs']),
     'source_range': obj({'program': S, 'source_file': S, 'start': {'type': 'integer', 'minimum': 1},
                          'end': {'type': 'integer', 'minimum': 1}}, ['program', 'start', 'end']),
+    'group_context': obj({'program': S, 'group': S, 'source_prefix': S}, ['program', 'group']),
     'query': obj(QUERY, ['programs', 'table']),
     'select': obj({'result_id': S, 'basis': {'enum': ['collection', 'displayed']},
                    'where': QUERY['where'], 'order_by': S, **PAGE}, ['result_id', 'basis']),
@@ -113,6 +114,7 @@ def tool_help():
                   'compare_groups compares two groups inside ONE saved result without intermediate IDs. For shared members across programs use group_by=program, left_value/right_value=the program identifiers, field=name, operation=intersection. Difference is left minus right; union combines both. It works for any table and grouping field.',
                   'order_by is a field string: name for ascending, -name for descending. Sorting precedes pagination.',
                   'source reads spans [[start,end]] or a paragraph body.',
+                  'group_context(program,group,source_prefix optional) reads a destination data group declaration, its child fields, and relevant source lines in paragraphs that prepare or transfer the group. Set group to the output record or map-row name and source_prefix to the input interface name. For "fields of SERVICE in SCREEN-ROW", use group=SCREEN-ROW, source_prefix=SERVICE. The returned source text still needs interpretation.',
                   'search mode literal finds source text; mode hybrid retrieves conceptual evidence.',
                   'Filters: {field,op:eq|neq|in|contains,value}. Multiple filters are AND.',
                   'Tables:'])

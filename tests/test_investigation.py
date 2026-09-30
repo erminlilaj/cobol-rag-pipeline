@@ -371,6 +371,54 @@ def test_flow_edges_preserves_exact_destination_and_direction(evidence, monkeypa
     assert outgoing['rows'][0]['to'] == 'BROWSE-ENTER'
 
 
+def test_entry_condition_context_keeps_static_scope_and_exact_target(evidence, monkeypatch):
+    monkeypatch.setattr(evidence, 'rows', lambda p, t: [
+        dict(program=p, _artifact='controlflow.cfg.json', _row_id='entry',
+             **{'from': 'ENTRY', 'to': 'BROWSE', 'condition': 'PHASE = 2', 'line': 20}),
+        dict(program=p, _artifact='controlflow.cfg.json', _row_id='child',
+             **{'from': 'BROWSE', 'to': 'BROWSE-ENTER', 'condition': 'ENTER KEY', 'line': 30})])
+    context = evidence.paragraph_flow_context('A', 'BROWSE')
+    assert context['incoming']['complete'] is True
+    assert context['incoming']['total'] == 1
+    assert context['incoming']['rows'][0]['condition'] == 'PHASE = 2'
+    assert context['outgoing']['rows'][0]['to'] == 'BROWSE-ENTER'
+    assert 'not runtime reachability' in context['evidence_scope']
+
+
+@pytest.mark.parametrize('passed', [True, False])
+def test_entry_condition_review_scope_does_not_override_verdict(passed):
+    from cobol_rag.investigation import review_answer
+    verdict = dict(passed=passed, issues=[] if passed else ['Wrong destination'], repair='answer')
+    class EntryBudget(FakeBudget):
+        def call(self, instructions, payload, **kwargs):
+            assert 'unless the original question explicitly requests those guarantees' in instructions
+            assert 'Still reject unsupported claims of guaranteed execution' in instructions
+            assert 'graph citation is not mandatory' in instructions
+            assert 'not the GO TO line in isolation' in instructions
+            return super().call(instructions, payload, **kwargs)
+    result = review_answer(EntryBudget([verdict]), 'Review', {
+        'question': 'What condition enters BROWSE?',
+        'evidence_contracts': [],
+        'paragraph_flow': [{'paragraph': 'BROWSE', 'incoming': {'total': 1}}]}, [])
+    assert result['passed'] is passed
+    assert result['issues'] == verdict['issues']
+
+
+def test_group_context_answer_names_source_field_not_only_destination(evidence):
+    from cobol_rag.investigation import answer_checks
+    evidence.group_contexts.append(dict(program='A', group='SCREEN-ROW',
+        source_prefix='SERVICE', candidate_source_fields=['SERVICE-VALUE']))
+    source_id = evidence.register(dict(program='A', _artifact='program.source_lines.jsonl',
+        source_file='A.CBL', line=10, text='MOVE SERVICE-VALUE TO SCREEN-VALUE.'))
+    candidate = dict(mode='technical', status='complete', evidence_ids=[source_id],
+                     answer='SCREEN-VALUE is the field from SERVICE.')
+    assert any('source_field_names_missing' in error for error in answer_checks(
+        'Which fields of SERVICE appear in SCREEN-ROW?', candidate, evidence, []))
+    candidate['answer'] = 'SERVICE-VALUE is copied to SCREEN-VALUE.'
+    assert not any('source_field_names_missing' in error for error in answer_checks(
+        'Which fields of SERVICE appear in SCREEN-ROW?', candidate, evidence, []))
+
+
 def test_parameter_preparation_and_copybook_categories_are_queryable(monkeypatch, tmp_path):
     monkeypatch.setattr('cobol_rag.investigation_tools.artifacts.analyzed_programs', lambda: ('A',))
     tools = EvidenceTools(AppConfig())

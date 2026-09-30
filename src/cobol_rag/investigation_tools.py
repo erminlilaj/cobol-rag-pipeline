@@ -131,6 +131,7 @@ class EvidenceTools:
         self.evidence = {}
         self._ids = {}
         self._cache = {}
+        self.group_contexts = []
 
     def mentioned_entities(self, text):
         """Reuse the existing corpus catalogue, without inferring question intent."""
@@ -466,7 +467,9 @@ class EvidenceTools:
             rows = self.rows(program, 'edges')
         except (ToolError, OSError) as error:
             return {'unavailable': str(error)}
-        result = {}
+        result = {'evidence_scope': 'Recorded static control-flow edges, not runtime reachability.',
+                  'entry_condition_basis': 'Conditions on incoming edges whose to equals this paragraph. '
+                  'Completeness covers the recorded edge inventory only, not every feasible execution path.'}
         for direction, key in (('incoming', 'to'), ('outgoing', 'from')):
             selected = [r for r in rows if str(r.get(key, '')).casefold() == paragraph.casefold()]
             result[direction] = {'total': len(selected), 'complete': len(selected) <= 20,
@@ -571,6 +574,68 @@ class EvidenceTools:
         if tool == 'source_range':
             start, end = args.pop('start'), args.pop('end')
             return self.execute('source', {**args, 'spans': [[start, end]]})
+        if tool == 'group_context':
+            program, group = args['program'].upper(), args['group'].upper()
+            source_prefix = str(args.get('source_prefix') or '').upper().rstrip('-')
+            filename = program + '.CBL'
+            source_rows = [r for r in self.rows(program, 'source')
+                           if str(r.get('source_file', '')).upper() == filename]
+            declarations = [(index, row) for index, row in enumerate(source_rows)
+                            if row.get('division') == 'DATA DIVISION'
+                            and (row.get('declaration') or {}).get('name') == group
+                            and (row.get('declaration') or {}).get('active')]
+            if len(declarations) != 1:
+                raise ToolError(f'Expected one active destination data-group declaration for {group}; found {len(declarations)}. '
+                                'For fields of an interface shown in a map row, group is the map-row data group '
+                                'and source_prefix is the interface name. Correct those roles before retrying.')
+            start, parent = declarations[0]
+            level = parent['declaration']['level']
+            layout = [parent]
+            for row in source_rows[start + 1:]:
+                if row.get('division') != 'DATA DIVISION':
+                    break
+                declaration = row.get('declaration') or {}
+                if declaration.get('active') and declaration.get('level', 99) <= level:
+                    break
+                if declaration.get('active') and declaration.get('level', 0) > level:
+                    layout.append(row)
+            members = {row['declaration']['name'] for row in layout}
+            group_pattern = re.compile(r'(?<![A-Z0-9-])' + re.escape(group) + r'(?![A-Z0-9-])')
+            procedures = [row for row in source_rows if row.get('division') == 'PROCEDURE DIVISION'
+                          and row.get('paragraph') and not row.get('is_comment')]
+            hosts = {row['paragraph'] for row in procedures
+                     if group_pattern.search(str(row.get('normalized', row.get('text', ''))).upper())}
+            names = [re.compile(r'(?<![A-Z0-9-])' + re.escape(name) + r'(?![A-Z0-9-])')
+                     for name in members]
+            relevant = [row for row in procedures if row['paragraph'] in hosts and
+                        (any(pattern.search(str(row.get('normalized', row.get('text', ''))).upper())
+                             for pattern in names) or
+                         source_prefix + '-' in str(row.get('normalized', row.get('text', ''))).upper()
+                         if source_prefix else any(pattern.search(
+                             str(row.get('normalized', row.get('text', ''))).upper()) for pattern in names))]
+            selected = [*layout, *relevant]
+            source_fields = sorted({name for row in relevant
+                for name in re.findall(r'\b' + re.escape(source_prefix) + r'-[A-Z0-9-]+\b',
+                    str(row.get('normalized', row.get('text', ''))).upper())}) if source_prefix else []
+            self.group_contexts.append({'program': program, 'group': group,
+                                        'source_prefix': source_prefix,
+                                        'candidate_source_fields': source_fields})
+            output_moves = [row for row in relevant if re.search(
+                r'\bMOVE\s+' + re.escape(group) + r'\s+TO\b',
+                str(row.get('normalized', row.get('text', ''))).upper())]
+            return {'rows': [{'evidence_id': self.register(row),
+                              **{key: row[key] for key in ('program', 'source_file', 'line',
+                                  'paragraph', 'text', 'declaration') if key in row}}
+                             for row in selected[:80]],
+                    'returned': min(len(selected), 80), 'total_matches': len(selected),
+                    'group': group, 'member_names': sorted(members - {group, 'FILLER'}),
+                    'preparation_paragraphs': sorted(hosts), 'source_prefix': source_prefix or None,
+                    'candidate_source_fields': source_fields,
+                    'output_transfers': [{'line': row['line'], 'paragraph': row['paragraph'],
+                                          'statement': row['text'].strip()} for row in output_moves],
+                    'complete': len(selected) <= 80,
+                    'limitation': 'Relevant source lines, not a proven complete value-flow graph. '
+                                  'Inspect surrounding statements for intermediate values and conditions.'}
         if tool == 'describe':
             identifier = args['identifier'].upper()
             if identifier in self.programs:

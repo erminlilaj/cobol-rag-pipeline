@@ -228,6 +228,12 @@ def normalize_decision(decision, tools):
         else:
             raise ToolError('Return a JSON object, not an array or scalar: ' + str(decision)[:400])
     decision = deepcopy(decision)
+    # Some JSON-mode models omit the envelope discriminator while returning a
+    # complete final response. Repair only this unambiguous shape; the normal
+    # evidence and answer checks still decide whether its claims are valid.
+    if ('action' not in decision and 'calls' not in decision and 'tool_calls' not in decision
+            and {'answer', 'mode', 'status', 'evidence_ids'} <= decision.keys()):
+        decision['action'] = 'final'
     if 'tool_calls' in decision:
         if 'calls' in decision and decision['calls'] != decision['tool_calls']:
             raise ToolError('Conflicting calls and tool_calls envelopes.')
@@ -921,6 +927,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
     previous_candidate = None
     finalize_existing = False
     repeated_no_progress = 0
+    previous_protocol_error = None
     known_entities = tools.mentioned_entities(question)
     request = deepcopy(resolved_request)
     if request:
@@ -1235,6 +1242,15 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
         except Exception as exc:
             candidate = None
             errors = [str(exc)]
+            # One format-repair retry is useful; repeating the identical JSON
+            # contract failure cannot produce evidence or improve the answer.
+            if str(exc).startswith('Invalid decision at '):
+                if str(exc) == previous_protocol_error:
+                    trace.append({'status': 'stopped_repeated_protocol_error', 'error': str(exc)[:500]})
+                    break
+                previous_protocol_error = str(exc)
+            else:
+                previous_protocol_error = None
             if 'Identical tool request produced no new evidence' in str(exc):
                 pending_tool_repair = None
                 repeated_no_progress += 1

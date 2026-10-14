@@ -91,8 +91,8 @@ def decision_schema():
                 'request_contract': REQUEST,
                 'coverage': {'type': 'array', 'items': obj({'requirement': S, 'status': {'enum': ['answered', 'unavailable']}}, ['requirement', 'status'])}}, ['action'])
     schema['allOf'] = [
-        {'if': {'properties': {'action': {'const': 'tools'}}}, 'then': {'required': ['calls']}},
-        {'if': {'properties': {'action': {'const': 'final'}}}, 'then': {'required': ['answer', 'mode', 'status', 'evidence_ids']}},
+        {'if': {'required': ['action'], 'properties': {'action': {'const': 'tools'}}}, 'then': {'required': ['calls']}},
+        {'if': {'required': ['action'], 'properties': {'action': {'const': 'final'}}}, 'then': {'required': ['answer', 'mode', 'status', 'evidence_ids']}},
     ]
     return schema
 

@@ -1013,6 +1013,39 @@ def test_action_schema_requires_final_evidence_and_mode():
     from jsonschema import validate, ValidationError
     with pytest.raises(ValidationError):
         validate({'action': 'final', 'answer': 'hello'}, schema())
+    with pytest.raises(ValidationError, match="'action' is a required property"):
+        validate({'answer': 'hello'}, schema())
+
+
+def test_actionless_complete_greeting_uses_normal_answer_review(evidence):
+    budget = FakeBudget([
+        dict(answer='Hello! How can I help?', mode='conversational', status='complete', evidence_ids=[]),
+        dict(passed=True, issues=[]),
+    ])
+    result = investigate('hi', AppConfig(), budget=budget,
+        resolved_request=dict(resolved_question='hi', scope='conversational', output='other', limit=None))
+    assert result['answer'] == 'Hello! How can I help?'
+    assert result['status'] == 'complete'
+    assert result['tool_calls'] == 0
+
+
+def test_actionless_final_is_not_inferred_from_incomplete_or_tool_response():
+    assert normalize_decision(dict(answer='Hello', mode='conversational', status='complete',
+                                   evidence_ids=[]), None)['action'] == 'final'
+    assert 'action' not in normalize_decision(dict(answer='Hello', mode='conversational',
+                                                  status='complete'), None)
+    assert 'action' not in normalize_decision(dict(answer='Hello', mode='conversational',
+                                                  status='complete', evidence_ids=[], calls=[]), None)
+
+
+def test_identical_protocol_error_stops_after_one_repair_attempt(evidence):
+    error = ToolError("Invalid decision at []: 'action' is a required property")
+    budget = FakeBudget([error, error, error])
+    result = investigate('hi', AppConfig(), budget=budget,
+        resolved_request=dict(resolved_question='hi', scope='conversational', output='other', limit=None))
+    assert result['status'] == 'failed'
+    assert budget.calls == 2
+    assert any(step.get('status') == 'stopped_repeated_protocol_error' for step in result['trace'])
 
 
 def test_count_followup_keeps_unit(evidence):

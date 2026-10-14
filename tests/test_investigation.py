@@ -338,13 +338,9 @@ def test_graph_list_checks_endpoints_not_table_label(evidence, monkeypatch):
 
 
 def test_social_claim_failure_can_rewrite_without_tools(evidence):
-    class CaptureBudget(FakeBudget):
-        def call(self, *args, **kwargs):
-            if self.calls == 1:
-                assert args[2]['properties']['action'] != {'const': 'tools'}
-            return super().call(*args, **kwargs)
-    budget = CaptureBudget([
-        dict(action='final', mode='conversational', status='complete', evidence_ids=[], answer='Good morning! Ask about A'),
+    budget = FakeBudget([
+        dict(action='final', mode='conversational', status='complete', evidence_ids=[], answer='Good morning! A has two variables.'),
+        dict(passed=False, issues=['Unsupported program fact'], repair='answer'),
         dict(action='final', mode='conversational', status='complete', evidence_ids=[], answer='Good morning!'),
         dict(passed=True, issues=[]),
     ])
@@ -352,6 +348,34 @@ def test_social_claim_failure_can_rewrite_without_tools(evidence):
         resolved_request=dict(resolved_question='Good morning!', scope='conversational', output='other', limit=None))
     assert result['status'] == 'complete', result.get('trace')
     assert result['tool_calls'] == 0
+
+
+def test_social_reply_is_not_a_corpus_claim_when_words_match_index(evidence):
+    from cobol_rag.investigation import answer_checks
+    evidence.programs = ('A', 'COBOL')
+    evidence.mentioned_entities = lambda text: [{'name': 'COBOL', 'program': 'COBOL',
+        'entity_type': 'program'}] if 'COBOL' in text.upper() else []
+    candidate = dict(answer="I'm doing well. How can I help with COBOL analysis today?",
+                     mode='conversational', status='complete', evidence_ids=[])
+    request = dict(output='other', scope='conversational')
+    assert not answer_checks('How are you today?', candidate, evidence, [], request)
+    assert 'corpus_entity_answer_requires_evidence' in answer_checks(
+        'Tell me about COBOL.', candidate, evidence, [], dict(output='other', scope='corpus'))
+
+
+def test_social_answer_finishes_when_corpus_contains_common_word(evidence, monkeypatch):
+    monkeypatch.setattr(EvidenceTools, 'mentioned_entities', lambda self, text: [
+        {'name': 'COBOL', 'program': 'COBOL', 'entity_type': 'program'}] if 'COBOL' in text.upper() else [])
+    budget = FakeBudget([
+        dict(action='final', mode='conversational', status='complete', evidence_ids=[],
+             answer="I'm doing well. How can I help with your COBOL analysis today?"),
+        dict(passed=True, issues=[]),
+    ])
+    request = dict(resolved_question='How are you today?', scope='conversational', output='other',
+                   depth='brief', limit=None, offset=0)
+    result = investigate('How are you today?', AppConfig(), budget=budget, resolved_request=request)
+    assert result['status'] == 'complete'
+    assert result['model_calls'] == 2
 
 
 def test_multiple_input_collections_require_selected_answer_set(evidence):
@@ -1184,6 +1208,25 @@ def test_large_file_inventory_is_explicitly_paginated(monkeypatch):
     assert any(step.get('review') == 'passed' for step in result['trace'])
 
 
+def test_large_file_page_accepts_grouped_total_and_unique_names(evidence, monkeypatch):
+    from cobol_rag.investigation import answer_checks
+    names = [f'FILE{i:02}.CBL' for i in range(19)] + [f'FILE{i:02}.CBL' for i in range(6)]
+    monkeypatch.setattr(evidence, 'rows', lambda p, t: [
+        dict(name=name, source_file=name, program=p, _artifact='program.source_lines.jsonl',
+             _row_id=str(i)) for i, name in enumerate(names)])
+    result = evidence.execute('query', dict(programs=['A'], table='files', limit=25))
+    evidence.evidence[result['collection_evidence_id']]['total_matches'] = 8745
+    candidate = dict(answer='Showing 25 of 8,745 program-file records (19 distinct names): '
+                     + ', '.join(dict.fromkeys(names)) + '. More remain; next offset 25.',
+                     mode='technical', status='partial', collection_output='list',
+                     evidence_ids=[result['collection_evidence_id']])
+    request = dict(output='list', limit=None, offset=0)
+    assert not answer_checks('What files are available?', candidate, evidence, [], request)
+    candidate['answer'] = candidate['answer'].replace('8,745', '8,000')
+    assert any('partial page' in error for error in answer_checks(
+        'What files are available?', candidate, evidence, [], request))
+
+
 def test_comment_list_answer_repairs_without_duplicate_retrieval(evidence, monkeypatch):
     monkeypatch.setattr(EvidenceTools, 'rows', lambda self, p, t: [
         dict(name='comments', program=p, line=i, text=f'* OLD {i}',
@@ -1204,6 +1247,28 @@ def test_comment_list_answer_repairs_without_duplicate_retrieval(evidence, monke
                          resolved_request=request)
     assert result['status'] == 'complete'
     assert sum(step.get('tool') == 'query' for step in result['trace']) == 1
+
+
+def test_identical_rejected_answers_stop_before_call_budget(evidence, monkeypatch):
+    monkeypatch.setattr(EvidenceTools, 'rows', lambda self, p, t: [
+        dict(name='comments', program=p, line=i, text=f'* OLD {i}',
+             classification='commented_out_code', _artifact='program.comments.json', _row_id=str(i))
+        for i in range(1, 4)])
+    bad = dict(action='final', mode='technical', status='complete',
+               answer='Line 1: `* OLD 1`', evidence_ids=['E1'])
+    budget = FakeBudget([
+        dict(action='tools', calls=[dict(tool='query', args=dict(programs=['A'], table='comments',
+             where=[dict(field='classification', op='eq', value='commented_out_code')]))]),
+        deepcopy(bad), deepcopy(bad),
+    ])
+    request = dict(resolved_question='Show commented code in A.', output='list', scope='corpus',
+                   depth='brief', limit=None, offset=0)
+    result = investigate('Show commented code in A.', AppConfig(), budget=budget,
+                         resolved_request=request)
+    assert result['status'] == 'failed'
+    assert result['model_calls'] == 3
+    assert any(step.get('status') == 'stopped_repeated_answer' for step in result['trace'])
+    assert 'budget' not in result['answer']
 
 
 def test_reviewer_cannot_replace_original_request(evidence):

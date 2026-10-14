@@ -516,6 +516,7 @@ def review_answer(budget, instructions, payload, trace):
             'does_not_establish': 'Absence outside the searched scope, or absence of calls in the reverse direction.'}
     instructions += '\nReturn every required response_schema field. The schema describes your REVIEW, not an answer or tool decision. On rejection identify repair=answer (facts already available), evidence (missing/wrong evidence), or request (wrong resolved intent). For request repair provide corrected_request preserving the original user meaning. Independently map the original request onto caller -> target: outgoing requires callers, incoming requires targets. The optional target field is for outgoing restrictions only; omit it for incoming.'
     for attempt in range(2):
+        review_started = time.monotonic()
         try:
             scoped_instructions = instructions
             if payload.get('paragraph_flow'):
@@ -567,7 +568,8 @@ def review_answer(budget, instructions, payload, trace):
             errors = [e.message for e in validator.iter_errors(review)]
         except (ValueError, TypeError) as exc:
             review, errors = None, [str(exc)]
-        trace.append({'review_response': review, 'review_protocol_errors': errors})
+        trace.append({'review_response': review, 'review_protocol_errors': errors,
+                      'duration_ms': round((time.monotonic() - review_started) * 1000, 2)})
         if not errors and not (attempt == 0 and empty_relations and review.get('passed') is False):
             return review
         if not errors:
@@ -751,11 +753,18 @@ def answer_checks(question, candidate, tools, requirements, request=None):
         reasons.append('program_claim_without_evidence')
     if ids and candidate.get('mode') != 'technical':
         reasons.append('evidence_based_answer_must_use_technical_mode')
-    mentioned_programs = set(re.findall(r'[A-Za-z0-9_-]+', answer.upper())) & set(tools.programs)
-    if mentioned_programs and not ids:
-        reasons.append('corpus_entity_answer_requires_evidence')
-    if not ids and tools.mentioned_entities(question + ' ' + answer):
-        reasons.append('corpus_entity_answer_requires_evidence')
+    # In a large corpus, ordinary words in a social reply can also be indexed
+    # identifiers. Token overlap is not a factual claim. The semantic reviewer
+    # still checks that the reply actually answers the original social request
+    # and does not assert unsupported program facts.
+    social_reply = (request and request.get('scope') in {'general', 'conversational'}
+                    and candidate.get('mode') in {'general', 'conversational'} and not ids)
+    if not social_reply:
+        mentioned_programs = set(re.findall(r'[A-Za-z0-9_-]+', answer.upper())) & set(tools.programs)
+        if mentioned_programs and not ids:
+            reasons.append('corpus_entity_answer_requires_evidence')
+        if not ids and tools.mentioned_entities(question + ' ' + answer):
+            reasons.append('corpus_entity_answer_requires_evidence')
     if request and request.get('scope') == 'corpus' and not ids and candidate.get('mode') != 'clarification':
         reasons.append('corpus_entity_answer_requires_evidence')
     cited_rows = [tools.evidence[i] for i in ids]
@@ -852,7 +861,9 @@ def answer_checks(question, candidate, tools, requirements, request=None):
         if request and request.get('limit') is None and len(bundles) == 1:
             page = bundles[0]
             if page.get('recipe', {}).get('args', {}).get('table') == 'files' and page['returned'] < page['total_matches']:
-                if candidate.get('status') != 'partial' or str(page['total_matches']) not in answer or not re.search(
+                counts = {int(value.replace(',', '').replace('.', '')) for value in re.findall(
+                    r'(?<![\w])(?:\d{1,3}(?:[,.]\d{3})+|\d+)(?![\w])', answer)}
+                if candidate.get('status') != 'partial' or page['total_matches'] not in counts or not re.search(
                         r'\b(?:more|remaining|next|additional)\b', answer, re.I):
                     reasons.append('Large file inventory is a partial page: state the exact total, list this page, and say more remain or give the next offset.')
         if len({digest(b.get('recipe')) for b in bundles}) > 1 and not rid:
@@ -960,6 +971,18 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
     pagination_notice = None
     repeated_no_progress = 0
     previous_protocol_error = None
+    repeated_answer = {'signature': None, 'count': 0}
+    def stopped_repeated_answer(reply, issues):
+        signature = (reply.get('answer'), reply.get('mode'), reply.get('status'),
+                     tuple(issues), len(tools.evidence))
+        if signature == repeated_answer['signature']:
+            repeated_answer['count'] += 1
+        else:
+            repeated_answer.update(signature=signature, count=1)
+        if repeated_answer['count'] < 2:
+            return False
+        trace.append({'status': 'stopped_repeated_answer', 'issues': list(issues)})
+        return True
     known_entities = tools.mentioned_entities(question)
     request = deepcopy(resolved_request)
     if request:
@@ -1020,6 +1043,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                 instructions += '\nRECOVERY: The answer failed evidence review. Your next response MUST request tools addressing the review feedback, not rephrase the same answer. Retrieve the missing relationship, filter, source locations or members. Do not reuse previous citation identifiers.'
                 payload['instruction'] = 'Retrieve evidence now. Return action=tools and calls; no answer.'
             payload = pack_observations(payload, instructions, context_window)
+            decision_started = time.monotonic()
             decision = normalize_decision(budget.call(instructions, payload, decision_contract, reserve=budget.maximum-core_limit+1), tools)
             if must_retrieve and decision.get('action') != 'tools':
                 raise ToolError('Evidence review requires a new tool request before another final answer.')
@@ -1027,6 +1051,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                 request = deepcopy(decision['request_contract'])
                 trace.append({'resolved_request': request})
             trace.append({'action': decision.get('action'), 'mode': decision.get('mode'),
+                          'duration_ms': round((time.monotonic() - decision_started) * 1000, 2),
                           'response_fields': sorted(decision)})
             if not requirements:
                 proposed = decision.get('requirements', [])
@@ -1056,6 +1081,10 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                 if errors:
                     previous_candidate = deepcopy(candidate)
                     trace.append({'validation_errors': errors, 'candidate_excerpt': candidate['answer'][:800]})
+                    if stopped_repeated_answer(candidate, errors):
+                        errors = ['Repeated identical answer failed validation without new evidence.', *errors]
+                        candidate = None
+                        break
                     if request and request.get('scope') in {'general', 'conversational'} and not known_entities:
                         errors.append('Rewrite the reply without optional unsupported corpus claims. A general/social reply does not require retrieval.')
                         must_retrieve = False
@@ -1120,6 +1149,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         'Review relevance even when the candidate labels itself conversational or clarification. '
                         'This assistant supports ordinary social conversation as well as COBOL questions. '
                         'For greetings, thanks, and other purely social requests, a relevant polite reply MUST pass without evidence or a technical task. '
+                        'Generic wording such as offering COBOL analysis help is not a factual claim about an indexed program, even when a corpus identifier happens to match a word in that wording. Reject an unsupported factual assertion about a specific program. '
                         'Do not invent an implicit technical requirement for a social request. '
                         'A code question cannot be answered by a greeting or an unsupported claim that no context exists. '
                         'The assistant CAN list source files, inspect source paragraphs, count variables, query copybooks, and read quality/dead-code findings. '
@@ -1128,6 +1158,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         'General knowledge is allowed only if it does not assert unverified program facts. '
                         'A complete label needs all requested information; a partial answer must explain its gaps. '
                         'A requested collection list must declare collection_output=list and include every requested member; count/summary cannot replace it. For a very large corpus-wide files inventory, a verified page is acceptable only as status=partial when it lists every returned member, gives the exact total and explicitly offers the next page. Do not call that page the complete inventory. '
+                        'The files collection counts program-file source-member records; the same filename may occur in several programs. A page may therefore contain fewer distinct filenames than records. Check the distinct names and label the total as records, not distinct files. '
                         'A prose enumeration is a valid list. Do not require bullets, explanations, or behavioral detail for a names-only request unless the user explicitly asks for them. '
                         'Do not invent output requirements from the general explanation guidance; explanation_goals may be empty. '
                         'Missing evidence is not evidence of absence. Citations alone are not proof. '
@@ -1187,6 +1218,10 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     if review.get('passed') is not True or relation_errors:
                         errors = list(review.get('issues') or ([] if relation_errors else ['semantic_review_failed'])) + relation_errors
                         trace.append({'review': 'rejected', 'issues': errors})
+                        if stopped_repeated_answer(candidate, errors):
+                            errors = ['Repeated identical answer failed review without new evidence.', *errors]
+                            candidate = None
+                            break
                         if review.get('repair') == 'request' and review.get('corrected_request'):
                             # A reviewer may diagnose interpretation, but cannot
                             # weaken the user's immutable request to fit an answer.
@@ -1249,6 +1284,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     raise ToolError('Identical tool request produced no new evidence; refine it or answer.')
                 seen.add(key)
                 tool_calls += 1
+                tool_started = time.monotonic()
                 try:
                     result = tools.execute(call['tool'], call['args'])
                     pending_tool_repair = None
@@ -1257,13 +1293,16 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     observations.append({'call': call, 'result': view})
                     if broad_files and result.get('total_matches', 0) > result.get('returned', 0):
                         finalize_existing = True
+                        distinct_files = len({row.get('name') for row in result.get('rows', []) if row.get('name')})
                         pagination_notice = ('This is a large verified file inventory. Answer with status=partial, '
-                            'cite the collection_evidence_id, list EVERY file in the returned page, '
-                            f'state that this shows {result["returned"]} of {result["total_matches"]} files, '
+                            'cite the collection_evidence_id, list EVERY DISTINCT filename in the returned page, '
+                            f'state that this shows {result["returned"]} of {result["total_matches"]} program-file records '
+                            f'containing {distinct_files} distinct filenames (duplicates belong to different programs), '
                             f'and say more remain and the next offset is {result["offset"] + result["returned"]}. '
                             'Do not claim the page is the complete inventory or request more pages now.')
                     trace.append({'tool': call['tool'], 'args': call['args'], 'status': 'ok',
-                                  'result_id': result.get('result_id'), 'returned': result.get('returned')})
+                                  'result_id': result.get('result_id'), 'returned': result.get('returned'),
+                                  'duration_ms': round((time.monotonic() - tool_started) * 1000, 2)})
                 except (ToolError, ValueError, KeyError, OSError) as exc:
                     diagnostic = {'call': call, 'error': str(exc)}
                     if hasattr(exc, 'suggested_where') and call['tool'] == 'query':
@@ -1284,7 +1323,8 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                                     except ToolError:
                                         pass
                     observations.append(diagnostic)
-                    trace.append({'tool': call.get('tool'), 'status': 'error', 'error': str(exc)})
+                    trace.append({'tool': call.get('tool'), 'status': 'error', 'error': str(exc),
+                                  'duration_ms': round((time.monotonic() - tool_started) * 1000, 2)})
         except Exception as exc:
             candidate = None
             errors = [str(exc)]
@@ -1316,8 +1356,10 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                 # Explicitly fail instead of presenting metadata as evidence.
                 break
     if candidate is None:
-        return {'answer': 'I could not verify a complete answer within the investigation budget. '
-                'The request was not treated as an unknown question, but the evidence or interpretation still needs clarification.',
+        stopped = any(step.get('status') == 'stopped_repeated_answer' for step in trace)
+        return {'answer': ('I could not verify this answer because the same unsupported response failed validation twice.'
+                           if stopped else 'I could not verify a complete answer within the investigation budget. '
+                           'The request was not treated as an unknown question, but the evidence or interpretation still needs clarification.'),
                 'mode': 'clarification', 'status': 'failed', 'errors': errors or ['budget_exhausted'],
                 'evidence_ids': [], 'tools': tools, 'trace': trace, 'model_calls': budget.calls, 'tool_calls': tool_calls,
                 'requirements': requirements}

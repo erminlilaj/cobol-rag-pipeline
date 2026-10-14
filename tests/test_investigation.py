@@ -106,6 +106,30 @@ def test_requested_page_must_match_result(evidence, monkeypatch):
     assert any('Requested page differs' in e for e in answer_checks('Show sixth through tenth.', candidate, evidence, [], request))
 
 
+def test_comment_inventory_uses_source_positions_not_table_label(evidence, monkeypatch):
+    from cobol_rag.investigation import answer_checks
+    monkeypatch.setattr(evidence, 'rows', lambda p, t: [
+        dict(name='comments', program=p, line=i, text=f'* OLD CODE {i}',
+             classification='commented_out_code', _artifact='program.comments.json', _row_id=str(i))
+        for i in range(1, 16)])
+    result = evidence.execute('query', dict(programs=['A'], table='comments',
+        where=[dict(field='classification', op='eq', value='commented_out_code')], limit=100))
+    request = dict(output='list', limit=None, offset=0)
+    candidate = dict(answer='\n'.join(f'Line {i}: `* OLD CODE {i}`' for i in range(1, 16)),
+        mode='technical', status='complete', collection_output='list',
+        evidence_ids=[result['collection_evidence_id']])
+    assert not answer_checks('Show commented code in A.', candidate, evidence, [], request)
+    candidate['answer'] = 'Line 1: `* OLD CODE 1`'
+    assert any('omits returned members' in e for e in answer_checks(
+        'Show commented code in A.', candidate, evidence, [], request))
+    # Citing a source row cannot make the 15-member query disappear.
+    source_id = evidence.register(dict(program='A', line=1, text='* OLD CODE 1',
+        _artifact='program.source_lines.jsonl'))
+    candidate['evidence_ids'] = [source_id]
+    assert any('omits returned members' in e for e in answer_checks(
+        'Show commented code in A.', candidate, evidence, [], request))
+
+
 def test_comparison_members_do_not_duplicate_large_payloads(evidence, monkeypatch):
     from cobol_rag.investigation import result_directory, call_review_errors
     monkeypatch.setattr(evidence, 'rows', lambda p, t: [dict(name='SVC', target='SVC', caller=p,
@@ -1132,6 +1156,54 @@ class FakeBudget:
         if isinstance(result, Exception):
             raise result
         return result
+
+
+def test_large_file_inventory_is_explicitly_paginated(monkeypatch):
+    monkeypatch.setattr('cobol_rag.investigation_tools.artifacts.analyzed_programs',
+                        lambda: ('A', 'B', 'C'))
+    def rows(self, program, table):
+        assert table == 'files'
+        return [dict(name=f'{program}{i:02}.CBL', source_file=f'{program}{i:02}.CBL',
+                     program=program, _artifact='program.source_lines.jsonl',
+                     _row_id=f'{program}:{i}') for i in range(10)]
+    monkeypatch.setattr(EvidenceTools, 'rows', rows)
+    names = [f'{program}{i:02}.CBL' for program in 'ABC' for i in range(10)][:25]
+    answer = 'Showing 25 of 30 files: ' + ', '.join(names) + '. More remain; ask for the next 25.'
+    budget = FakeBudget([
+        dict(action='tools', calls=[dict(tool='files', args=dict(programs=['A', 'B', 'C']))]),
+        dict(action='final', mode='technical', status='partial', answer=answer, evidence_ids=['E1']),
+        dict(passed=True, issues=[]),
+    ])
+    request = dict(resolved_question='What files are available?', output='list', scope='corpus',
+                   depth='brief', limit=None, offset=0)
+    result = investigate('What files are available?', AppConfig(), budget=budget,
+                         resolved_request=request)
+    assert result['status'] == 'partial'
+    assert any(step.get('tool') == 'files' and step.get('args', {}).get('limit') == 25
+               for step in result['trace'])
+    assert any(step.get('review') == 'passed' for step in result['trace'])
+
+
+def test_comment_list_answer_repairs_without_duplicate_retrieval(evidence, monkeypatch):
+    monkeypatch.setattr(EvidenceTools, 'rows', lambda self, p, t: [
+        dict(name='comments', program=p, line=i, text=f'* OLD {i}',
+             classification='commented_out_code', _artifact='program.comments.json', _row_id=str(i))
+        for i in range(1, 4)])
+    budget = FakeBudget([
+        dict(action='tools', calls=[dict(tool='query', args=dict(programs=['A'], table='comments',
+            where=[dict(field='classification', op='eq', value='commented_out_code')]))]),
+        dict(action='final', mode='technical', status='complete', answer='Line 1: `* OLD 1`',
+             evidence_ids=['E1']),
+        dict(action='final', mode='technical', status='complete',
+             answer='Line 1: `* OLD 1`; Line 2: `* OLD 2`; Line 3: `* OLD 3`', evidence_ids=['E1']),
+        dict(passed=True, issues=[]),
+    ])
+    request = dict(resolved_question='Show commented code in A.', output='list', scope='corpus',
+                   depth='brief', limit=None, offset=0)
+    result = investigate('Show commented code in A.', AppConfig(), budget=budget,
+                         resolved_request=request)
+    assert result['status'] == 'complete'
+    assert sum(step.get('tool') == 'query' for step in result['trace']) == 1
 
 
 def test_reviewer_cannot_replace_original_request(evidence):

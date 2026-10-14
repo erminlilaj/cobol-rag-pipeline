@@ -94,7 +94,9 @@ are different units. Source excerpts must contain actual text, not just line num
 For collections, programs selects owners, where filters record properties. Count queries may
 use limit=0: total_matches is the count; returned=0 is not absence. Lists require the requested
 members, not only counts. Select the requested filters/order/page into a result_id; alphabetical
-order is order_by=name. An unlimited list requires all matching pages. For a requested subset,
+order is order_by=name. An unlimited list requires all matching pages except very large
+corpus-wide file inventories: show a verified page, exact total, next offset, and status=partial.
+For a requested subset,
 do not substitute the full inventory. Declare collection_output=list/count/summary and cite
 the selected collection_evidence_id and result_id. Additional citations may explain context.
 Compare sets with intersection/difference/union. Preserve source_file and program provenance.
@@ -708,7 +710,24 @@ def collection_names(bundle):
         fields = {p.get('field') for p in predicates}
         projection = ['from'] if 'to' in fields else ['to'] if 'from' in fields else ['from', 'to']
         return {str(row[key]) for row in rows for key in projection if row.get(key)}
+    if recipe.get('args', {}).get('table') == 'comments':
+        # Comment rows share the synthetic name "comments". Their source
+        # positions, not that table label, identify the requested items.
+        return {f"{row.get('program', '')}:{row['line']}" for row in rows if row.get('line') is not None}
     return {str(row['name']) for row in rows if row.get('name')}
+
+
+def missing_collection_members(bundle, answer):
+    names = collection_names(bundle)
+    recipe = bundle.get('recipe', {})
+    while recipe.get('tool') == 'select':
+        recipe = recipe.get('args', {}).get('parent', {})
+    if recipe.get('args', {}).get('table') == 'comments':
+        positions = {int(match.group(1) or match.group(2)) for match in re.finditer(
+            r'\b(?:line|riga)\s+(\d+)\b|^\s*(?:[-*]\s*)?(\d+)\s*:', answer, re.I | re.M)}
+        return sorted(name for name in names if int(name.rsplit(':', 1)[1]) not in positions)
+    tokens = {token.rstrip('.') for token in re.findall(r'[A-Za-z0-9_$.-]+', answer.upper())}
+    return sorted(name for name in names if name.upper() not in tokens)
 
 
 def answer_checks(question, candidate, tools, requirements, request=None):
@@ -798,6 +817,14 @@ def answer_checks(question, candidate, tools, requirements, request=None):
     bundles = [r for r in tools.evidence.values()
                if r.get('_artifact') == 'verified_collection_operation'
                and r.get('result_id') in cited_results]
+    if request and request.get('output') == 'list' and not cited_results and ids:
+        # Source-line citations must not evade a collection query already
+        # executed in this turn. This matters for commented-code inventories.
+        available = [r for r in tools.evidence.values()
+                     if r.get('_artifact') == 'verified_collection_operation']
+        if len(available) == 1:
+            bundles = available
+            cited_results = {available[0]['result_id']}
     # A selected result defines the answer set. Other cited collections may
     # explain its members without becoming additional requested members.
     if rid in cited_results:
@@ -822,16 +849,20 @@ def answer_checks(question, candidate, tools, requirements, request=None):
     if candidate.get('collection_output') == 'list' and cited_results:
         if not bundles:
             reasons.append('List output needs the collection_evidence_id to verify page completeness.')
-        tokens = {token.rstrip('.') for token in re.findall(r'[A-Za-z0-9_$.-]+', answer.upper())}
+        if request and request.get('limit') is None and len(bundles) == 1:
+            page = bundles[0]
+            if page.get('recipe', {}).get('args', {}).get('table') == 'files' and page['returned'] < page['total_matches']:
+                if candidate.get('status') != 'partial' or str(page['total_matches']) not in answer or not re.search(
+                        r'\b(?:more|remaining|next|additional)\b', answer, re.I):
+                    reasons.append('Large file inventory is a partial page: state the exact total, list this page, and say more remain or give the next offset.')
         if len({digest(b.get('recipe')) for b in bundles}) > 1 and not rid:
             inputs = list(dict.fromkeys(b['result_id'] for b in bundles))
             reasons.append('Multiple input collections do not define the answer set. Select or compare the requested members and return its result_id; cite other collections only as context. '
                            'For a set comparison call tool="compare" with args={"left_id": "' + inputs[0] + '", "right_id": "' + inputs[1] + '", "field": "name", "operation": "intersection", "limit": 100}. '
                            'Choose intersection, difference, or union according to the request. Use result IDs, not evidence IDs. Then cite the returned collection_evidence_id and return the new result_id.')
-        missing = sorted({name for bundle in bundles for name in collection_names(bundle)
-                          if name.upper() not in tokens}) if len(bundles) == 1 or rid else []
+        missing = sorted({name for bundle in bundles for name in missing_collection_members(bundle, answer)}) if len(bundles) == 1 or rid else []
         if missing:
-            reasons.append('Requested list omits returned members: ' + ', '.join(missing) +
+            reasons.append('Requested list omits returned members: ' + ', '.join(missing[:25]) +
                            '. Check whether the cited result matches the ORIGINAL request. If a subset or set comparison was requested, execute select/compare_groups to produce that result and cite its collection_evidence_id and result_id. Never expand the answer to an unwanted inventory. For a combined multi-program result use compare_groups(result_id, group_by="program", left_value=first program, right_value=second program, field="name", operation="intersection") for shared members, or difference for exclusive members. If the full inventory was requested, include all its members.')
     contract = response_contract(question)
     if contract.exact_item_count and request and request.get('output') == 'list' and contract.format == 'default':
@@ -926,6 +957,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
     pending_tool_repair = None
     previous_candidate = None
     finalize_existing = False
+    pagination_notice = None
     repeated_no_progress = 0
     previous_protocol_error = None
     known_entities = tools.mentioned_entities(question)
@@ -966,6 +998,8 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
             if finalize_existing and not must_retrieve:
                 decision_contract['properties']['action'] = {'const': 'final'}
                 instructions += '\nThe requested tool result already exists in observations. Use it to produce a final answer with its evidence IDs; if insufficient, state the specific limitation. Do not request the identical tool again.'
+                if pagination_notice:
+                    instructions += '\n' + pagination_notice
                 finalize_existing = False
             if pending_tool_repair:
                 # Repair the failed operation in a small, isolated context.
@@ -1027,7 +1061,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         must_retrieve = False
                     elif not tools.evidence and any(e in errors for e in ('unknown_evidence_reference', 'program_claim_without_evidence', 'corpus_entity_answer_requires_evidence')):
                         must_retrieve = True
-                    elif any(e.startswith(('Multiple input collections', 'Requested collection is incomplete', 'Requested list omits returned members')) for e in errors):
+                    elif any(e.startswith(('Multiple input collections', 'Requested collection is incomplete')) for e in errors):
                         must_retrieve = True
                     if must_retrieve and not recovery_granted:
                         core_limit = min(budget.maximum - budget.output_reserve,
@@ -1093,7 +1127,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         'Reject claims that these capabilities are unavailable without a corresponding tool error. '
                         'General knowledge is allowed only if it does not assert unverified program facts. '
                         'A complete label needs all requested information; a partial answer must explain its gaps. '
-                        'A requested collection list must declare collection_output=list and include every requested member; count/summary cannot replace it. '
+                        'A requested collection list must declare collection_output=list and include every requested member; count/summary cannot replace it. For a very large corpus-wide files inventory, a verified page is acceptable only as status=partial when it lists every returned member, gives the exact total and explicitly offers the next page. Do not call that page the complete inventory. '
                         'A prose enumeration is a valid list. Do not require bullets, explanations, or behavioral detail for a names-only request unless the user explicitly asks for them. '
                         'Do not invent output requirements from the general explanation guidance; explanation_goals may be empty. '
                         'Missing evidence is not evidence of absence. Citations alone are not proof. '
@@ -1182,6 +1216,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                 raise ToolError('Request one to six read-only tool calls.')
             errors = []
             for call in calls:
+                broad_files = False
                 if request and call.get('tool') == 'describe' and request.get('depth') == 'detailed':
                     call['args']['depth'] = 'detailed'
                 if request and request.get('output') == 'list' and call.get('tool') in {
@@ -1189,8 +1224,12 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     # Transport pages are not the requested answer size. Supply
                     # a useful bounded page for a list instead of count-only data.
                     args = call['args']
-                    needed = min(request.get('limit') or 100, 100)
-                    args['limit'] = max(args.get('limit', needed), needed)
+                    broad_files = ((call['tool'] == 'files' or
+                                    (call['tool'] == 'query' and args.get('table') == 'files'))
+                                   and request.get('limit') is None
+                                   and len(args.get('programs') or tools.programs) > 2)
+                    needed = 25 if broad_files else min(request.get('limit') or 100, 100)
+                    args['limit'] = needed if broad_files else max(args.get('limit', needed), needed)
                 if request and request.get('output') != 'count' and call.get('tool') in {
                         'variable_access', 'flow_edges', 'query', 'callees', 'callers', 'select', 'compare', 'compare_groups', 'copybooks', 'files', 'inventory'} and call['args'].get('limit') == 0:
                     # Access counts cannot explain locations, conditions or
@@ -1216,6 +1255,13 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     must_retrieve = False
                     view = tool_view(result)
                     observations.append({'call': call, 'result': view})
+                    if broad_files and result.get('total_matches', 0) > result.get('returned', 0):
+                        finalize_existing = True
+                        pagination_notice = ('This is a large verified file inventory. Answer with status=partial, '
+                            'cite the collection_evidence_id, list EVERY file in the returned page, '
+                            f'state that this shows {result["returned"]} of {result["total_matches"]} files, '
+                            f'and say more remain and the next offset is {result["offset"] + result["returned"]}. '
+                            'Do not claim the page is the complete inventory or request more pages now.')
                     trace.append({'tool': call['tool'], 'args': call['args'], 'status': 'ok',
                                   'result_id': result.get('result_id'), 'returned': result.get('returned')})
                 except (ToolError, ValueError, KeyError, OSError) as exc:

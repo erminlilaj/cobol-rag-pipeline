@@ -41,6 +41,10 @@ Honor source_role: boundary comments have no established paragraph ownership.
 Static fallthrough edges do not establish execution after an expanded terminating operation.
 Incoming paragraph edges explain entry conditions; the body explains what happens after entry.
 Use flow_edges for internal paragraph transfers, never external callers/callees.
+A whole-program control-flow question needs the program-wide graph: use
+flow_edges(programs) or query(programs,table="edges"), with graph_nodes if needed.
+Use paragraph and direction only for a specific paragraph. CFG edges are static
+possibilities, not a single guaranteed execution sequence.
 A graph CALL edge may represent PERFORM; inspect source_operation or the statement.
 
 Call relationships are caller -> target. callees queries outgoing calls of programs;
@@ -48,6 +52,9 @@ callers queries incoming calls to target. Preserve both roles. Distinguish CALL,
 and XCTL. Empty incoming evidence says nothing about outgoing calls. For parameters
 read the matching call record; parameter_writes records preparation. Query both inventories
 then compare for shared/exclusive members. Cite the derived result, not only its inputs.
+When a complete call inventory has total_matches=0, answer that no matching
+external calls are recorded in that exact caller/target scope. Do not turn a
+verified empty result into a generic failure or claim global nonexistence.
 When asked which function or function number a caller uses with an external routine,
 look for a function-selector field prepared before the call in its parameter area.
 The selector may use a copybook/interface prefix rather than the callee's program name.
@@ -1195,7 +1202,12 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     relation_errors = call_review_errors(review, contracts)
                     if request and request.get('call_relation'):
                         if not any(c.get('relation') for c in contracts):
-                            relation_errors.append('Requested call relationship needs typed call evidence.')
+                            available_relations = [{'evidence_id': i, 'relation': r['relation']}
+                                for i, r in tools.evidence.items() if r.get('relation')]
+                            if available_relations and not call_review_errors(review, available_relations):
+                                relation_errors.append('Cite the already retrieved typed call inventory for this relationship.')
+                            else:
+                                relation_errors.append('Requested call relationship needs typed call evidence.')
                         requested_relation = request['call_relation']
                         role = 'callers' if requested_relation.get('direction') == 'outgoing' else 'targets'
                         if requested_relation.get(role):
@@ -1213,7 +1225,15 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         reviewed_targets = set(reviewed.get('targets', []))
                         if reviewed.get('target'):
                             reviewed_targets.add(reviewed['target'])
-                        if expected_targets and reviewed.get('direction') != 'not_requested' and {t.upper() for t in expected_targets} != {t.upper() for t in reviewed_targets}:
+                        # An outgoing resolver relation without callers is
+                        # incomplete: its lone named identifier may be the
+                        # caller, not a restricted callee. The independently
+                        # reviewed relation and typed evidence settle that
+                        # role. Keep strict target preservation when the
+                        # resolver actually identified caller(s), including
+                        # intentional self-call questions.
+                        enforce_targets = requested_relation.get('direction') != 'outgoing' or bool(requested_relation.get('callers'))
+                        if enforce_targets and expected_targets and reviewed.get('direction') != 'not_requested' and {t.upper() for t in expected_targets} != {t.upper() for t in reviewed_targets}:
                             relation_errors.append('Requested callee changed during investigation; preserve the resolved target.')
                     if review.get('passed') is not True or relation_errors:
                         errors = list(review.get('issues') or ([] if relation_errors else ['semantic_review_failed'])) + relation_errors
@@ -1232,7 +1252,8 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         candidate = None
                         # Rejection may need prose repair, not additional retrieval.
                         # Direction contradictions still require corrected evidence.
-                        must_retrieve = bool(relation_errors) or review.get('repair') in {'evidence', 'request'}
+                        citation_only = relation_errors == ['Cite the already retrieved typed call inventory for this relationship.']
+                        must_retrieve = (bool(relation_errors) and not citation_only) or review.get('repair') in {'evidence', 'request'}
                         if not recovery_granted:
                             core_limit = min(budget.maximum - budget.output_reserve,
                                              core_limit + getattr(budget, 'recovery_reserve', 0))

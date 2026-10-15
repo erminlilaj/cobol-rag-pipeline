@@ -337,6 +337,48 @@ def test_graph_list_checks_endpoints_not_table_label(evidence, monkeypatch):
     assert any('PREP' in e for e in answer_checks('Which paragraphs enter FAIL?', candidate, evidence, [], dict(output='list')))
 
 
+def test_program_wide_flow_edges_do_not_require_a_paragraph(evidence, monkeypatch):
+    monkeypatch.setattr(evidence, 'rows', lambda p, t: [
+        dict(name='edges', program=p, _artifact='controlflow.cfg.json', _row_id='edge1',
+             **{'from': 'MAIN', 'to': 'PREP', 'condition': 'READY'}),
+        dict(name='edges', program=p, _artifact='controlflow.cfg.json', _row_id='edge2',
+             **{'from': 'PREP', 'to': 'DONE', 'condition': None})])
+    all_edges = evidence.execute('flow_edges', dict(programs=['A']))
+    assert all_edges['total_matches'] == 2
+    assert [(r['from'], r['to']) for r in all_edges['rows']] == [('MAIN', 'PREP'), ('PREP', 'DONE')]
+    assert evidence.execute('flow_edges', dict(programs=['A'], paragraph='PREP',
+                                         direction='outgoing'))['total_matches'] == 1
+    with pytest.raises(ToolError, match='needs direction'):
+        evidence.execute('flow_edges', dict(programs=['A'], paragraph='PREP'))
+
+
+def test_program_wide_flow_answer_uses_graph_evidence(evidence, monkeypatch):
+    monkeypatch.setattr(EvidenceTools, 'rows', lambda self, p, t: [
+        dict(name='edges', program=p, _artifact='controlflow.cfg.json', _row_id='edge1',
+             **{'from': 'MAIN', 'to': 'PREP', 'condition': 'READY'}),
+        dict(name='edges', program=p, _artifact='controlflow.cfg.json', _row_id='edge2',
+             **{'from': 'PREP', 'to': 'DONE', 'condition': None})])
+    budget = FakeBudget([
+        dict(action='tools', calls=[dict(tool='flow_edges', args=dict(programs=['A']))]),
+        dict(action='final', mode='technical', status='complete', evidence_ids=['E1'],
+             answer='The static graph records MAIN to PREP when READY, then PREP to DONE. [E1]'),
+        dict(passed=True, issues=[]),
+    ])
+    result = investigate('What is the control flow inside A?', AppConfig(), budget=budget,
+                         resolved_request=dict(resolved_question='What is the control flow inside A?',
+                                               output='summary', scope='corpus', depth='standard', limit=None))
+    assert result['status'] == 'complete', result['trace']
+
+
+def test_source_member_resolves_unique_cross_platform_analyzer_path(evidence, monkeypatch):
+    monkeypatch.setattr(evidence, 'rows', lambda p, t: [
+        dict(program=p, source_file='A.CBL', line=12, paragraph='MAIN', text='PERFORM PREP.',
+             _artifact='program.source_lines.jsonl', _row_id='line12')])
+    result = evidence.execute('source_range', dict(program='A',
+        source_file=r'D:\analysis\input\A.CBL', start=12, end=12))
+    assert result['rows'][0]['text'] == 'PERFORM PREP.'
+
+
 def test_social_claim_failure_can_rewrite_without_tools(evidence):
     budget = FakeBudget([
         dict(action='final', mode='conversational', status='complete', evidence_ids=[], answer='Good morning! A has two variables.'),
@@ -750,6 +792,25 @@ def test_reviewer_cannot_substitute_a_retrieved_callee(evidence):
     result = investigate('Does A call it too?', AppConfig(), budget=budget)
     assert result['status'] == 'failed'
     assert any('Requested callee changed' in issue for step in result['trace'] for issue in step.get('issues', []))
+
+
+def test_empty_outgoing_calls_survive_incomplete_resolver_relation(evidence):
+    # A resolver that misplaced the only named program into targets must not
+    # override a reviewer-confirmed caller and a complete empty outgoing set.
+    request = dict(resolved_question='What external calls are inside B?', output='list',
+                   limit=None, scope='corpus', depth='brief',
+                   call_relation=dict(direction='outgoing', targets=['B']))
+    budget = FakeBudget([
+        dict(action='tools', calls=[dict(tool='callees', args=dict(programs=['B']))]),
+        dict(action='final', mode='technical', status='complete',
+             answer='No external calls are recorded for B in the analyzed inventory. [E1]',
+             evidence_ids=['E1']),
+        dict(passed=True, issues=[], requested_call_relation=dict(direction='outgoing', callers=['B'])),
+    ])
+    result = investigate('What external calls are inside B?', AppConfig(), budget=budget,
+                         resolved_request=request)
+    assert result['status'] == 'complete', result['trace']
+    assert result['answer'].startswith('No external calls')
 
 
 def test_displayed_and_whole_collection_are_distinct(evidence):

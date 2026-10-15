@@ -551,9 +551,15 @@ class EvidenceTools:
         if tool == 'files':
             return self.execute('query', {**args, 'programs': args.get('programs') or list(self.programs), 'table': 'files'})
         if tool == 'flow_edges':
-            direction, paragraph = args.pop('direction'), args.pop('paragraph')
-            return self.execute('query', {**args, 'table': 'edges', 'where': [
-                {'field': 'to' if direction == 'incoming' else 'from', 'op': 'eq', 'value': paragraph}]})
+            direction, paragraph = args.pop('direction', None), args.pop('paragraph', None)
+            if paragraph:
+                if not direction:
+                    raise ToolError('flow_edges needs direction when a paragraph is selected.')
+                where = [{'field': 'to' if direction == 'incoming' else 'from',
+                          'op': 'eq', 'value': paragraph}]
+            else:
+                where = []  # Program-wide CFG; there is no paragraph to orient around.
+            return self.execute('query', {**args, 'table': 'edges', 'where': where})
         if tool == 'variable_access':
             variables = args.pop('variables')
             if any(not name or '*' in name or '?' in name for name in variables):
@@ -827,7 +833,13 @@ class EvidenceTools:
             filename = args.get('source_file') or args['program'].upper() + '.CBL'
             available = sorted({r.get('source_file', '') for r in rows})
             if filename.upper() not in {name.upper() for name in available}:
-                matches = [name for name in available if Path(name).stem.upper() == filename.upper()]
+                # Analyzers may record a source path from another OS. Resolve
+                # its basename only when the analyzed program has one exact
+                # matching member; never guess among duplicate basenames.
+                basename = filename.replace('\\', '/').rsplit('/', 1)[-1]
+                matches = [name for name in available if name.upper() == basename.upper()]
+                if not matches:
+                    matches = [name for name in available if Path(name).stem.upper() == basename.upper()]
                 if len(matches) == 1:
                     filename = matches[0]
             rows = [r for r in rows if r.get('source_file', '').upper() == filename.upper()]

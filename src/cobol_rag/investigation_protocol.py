@@ -49,7 +49,7 @@ TOOL_SCHEMAS = {
     'data_dependencies': obj({'programs': STRINGS, 'source': S, 'target': S,
         'max_depth': {'type': 'integer', 'minimum': 1, 'maximum': 6}}, ['programs', 'source', 'target']),
     'flow_edges': obj({'programs': STRINGS, 'paragraph': S,
-        'direction': {'enum': ['incoming', 'outgoing']}, **PAGE}, ['programs', 'paragraph', 'direction']),
+        'direction': {'enum': ['incoming', 'outgoing']}, **PAGE}, ['programs']),
     'inventory': obj(PAGE),
     'files': obj({'programs': STRINGS, **PAGE}),
     'callers': obj({'target': TARGET, 'programs': STRINGS, **PAGE}, ['target']),
@@ -103,6 +103,7 @@ def tool_help():
         lines.append(name + '(' + ', '.join(schema['properties']) + ')')
     lines.extend(['inventory lists analyzed PROGRAMS, not files.',
                   'query reads a table for explicit programs; limit:0 counts, limit:N pages.',
+                  'flow_edges(programs) lists program-wide static CFG edges; paginate if incomplete. flow_edges(programs,paragraph,direction) restricts to incoming/outgoing edges of one paragraph. Do not use an empty paragraph for a whole-program question.',
                   'data_dependencies(programs,source,target,max_depth) traces indirect static read/write dependency paths between named variables. Prefer it for propagation questions, then inspect source/definitions for formatting and conditions. No path is not a proof of global absence.',
                   'describe(identifier) resolves a program or entity and reads its evidence for explanations. Use it rather than answering from old citations.',
                   'copybooks(programs) reads actual COPY inclusions. Filename extensions do NOT identify all copybooks.',

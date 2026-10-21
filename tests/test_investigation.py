@@ -1,11 +1,12 @@
 """Contract checks for investigation, using small synthetic evidence and no LLM."""
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 import time
 
 import pytest
 
-from cobol_rag.config import AppConfig
+from cobol_rag.config import AppConfig, InvestigationConfig
 from cobol_rag.investigation import investigate, tool_view, normalize_decision
 from cobol_rag.investigation_tools import EvidenceTools, ToolError
 
@@ -377,6 +378,29 @@ def test_source_member_resolves_unique_cross_platform_analyzer_path(evidence, mo
     result = evidence.execute('source_range', dict(program='A',
         source_file=r'D:\analysis\input\A.CBL', start=12, end=12))
     assert result['rows'][0]['text'] == 'PERFORM PREP.'
+
+
+def test_large_profile_reads_larger_bounded_source_window(evidence, monkeypatch):
+    monkeypatch.setattr(EvidenceTools, 'rows', lambda self, p, t: [
+        dict(program=p, source_file='A.CBL', line=i, paragraph='MAIN', text=f'LINE {i}',
+             _artifact='program.source_lines.jsonl', _row_id=f'line{i}') for i in range(1, 201)])
+    standard = EvidenceTools(AppConfig())
+    large = EvidenceTools(replace(AppConfig(), investigation=InvestigationConfig(
+        profile='large', source_line_limit=240)))
+    with pytest.raises(ToolError, match='120 lines'):
+        standard.execute('source_range', dict(program='A', start=1, end=200))
+    assert large.execute('source_range', dict(program='A', start=1, end=200))['returned'] == 200
+
+
+def test_large_profile_env_keeps_standard_defaults_untouched(monkeypatch):
+    from cobol_rag.config import _apply_env_overrides
+    monkeypatch.delenv('COBOL_RAG_INVESTIGATION_PROFILE', raising=False)
+    assert _apply_env_overrides({}).get('investigation') is None
+    monkeypatch.setenv('COBOL_RAG_INVESTIGATION_PROFILE', 'large')
+    settings = InvestigationConfig(**_apply_env_overrides({})['investigation'])
+    assert (settings.profile, settings.max_model_calls, settings.max_tool_calls) == ('large', 24, 40)
+    assert (settings.context_window, settings.source_line_limit, settings.preview_chars) == (32768, 240, 18000)
+    assert InvestigationConfig().profile == 'standard'
 
 
 def test_social_claim_failure_can_rewrite_without_tools(evidence):

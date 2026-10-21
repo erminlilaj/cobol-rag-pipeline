@@ -114,6 +114,7 @@ def health() -> Any:
         "llm": settings.llm.model,
         "embedding": settings.embedding.model,
         "investigation_enabled": settings.investigation.enabled,
+        "investigation_profile": settings.investigation.profile,
     }
 
 @app.post("/api/chat")

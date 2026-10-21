@@ -82,16 +82,23 @@ class ObservabilityConfig:
 class InvestigationConfig:
     enabled: bool = False
     memory_enabled: bool = False
+    profile: str = "standard"
     max_model_calls: int = 16
     max_tool_calls: int = 20
     timeout_seconds: int = 240
     context_window: int = 16384
+    source_line_limit: int = 120
+    preview_chars: int = 10000
 
     def __post_init__(self):
+        if self.profile not in {"standard", "large"}:
+            raise ValueError('Investigation profile requires standard or large.')
         if not 8192 <= self.context_window <= 131072:
             raise ValueError('Investigation context_window requires 8192..131072 tokens.')
-        if not 3 <= self.max_model_calls <= 16 or not 1 <= self.max_tool_calls <= 40 or not 10 <= self.timeout_seconds <= 600:
-            raise ValueError('Investigation limits require 3..16 model calls, 1..40 tool calls and 10..600 seconds.')
+        if not 3 <= self.max_model_calls <= 32 or not 1 <= self.max_tool_calls <= 60 or not 10 <= self.timeout_seconds <= 900:
+            raise ValueError('Investigation limits require 3..32 model calls, 1..60 tool calls and 10..900 seconds.')
+        if not 20 <= self.source_line_limit <= 500 or not 1000 <= self.preview_chars <= 50000:
+            raise ValueError('Investigation source/preview limits are out of range.')
 
 
 @dataclass(frozen=True)
@@ -155,6 +162,16 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         _set_nested(result, ("investigation", "enabled"), investigation.lower() in {"1", "true", "yes", "on"})
     if memory := os.getenv("COBOL_RAG_MEMORY_ENABLED"):
         _set_nested(result, ("investigation", "memory_enabled"), memory.lower() in {"1", "true", "yes", "on"})
+    if profile := os.getenv("COBOL_RAG_INVESTIGATION_PROFILE"):
+        profile = profile.strip().lower()
+        if profile == "large":
+            result.setdefault("investigation", {}).update({
+                "profile": "large", "max_model_calls": 24, "max_tool_calls": 40,
+                "timeout_seconds": 480, "context_window": 32768,
+                "source_line_limit": 240, "preview_chars": 18000,
+            })
+        else:
+            _set_nested(result, ("investigation", "profile"), profile)
     return result
 
 

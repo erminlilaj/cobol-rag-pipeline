@@ -648,11 +648,12 @@ class EvidenceTools:
                 result = self.execute('query', {'programs': [identifier], 'table': 'summary'})
                 if args.get('depth') == 'detailed':
                     result['detail_coverage'] = {}
+                    sample_limit = 16 if self.config.investigation.profile == 'large' else 8
                     for table in ('calls', 'edges', 'cics'):
                         try:
                             records = self.rows(identifier, table)
-                            result['detail_coverage'][table] = {'total': len(records), 'returned': min(8, len(records))}
-                            for record in records[:8]:
+                            result['detail_coverage'][table] = {'total': len(records), 'returned': min(sample_limit, len(records))}
+                            for record in records[:sample_limit]:
                                 row = {k: record[k] for k in ('program', '_artifact', 'name', 'caller', 'target',
                                     'paragraph', 'line_start', 'line', 'statement', 'parameters', 'commarea', 'length', 'call_type',
                                     'from', 'to', 'type', 'condition', 'evidence', 'command') if k in record}
@@ -830,6 +831,7 @@ class EvidenceTools:
             return {'evidence_id': self.register(row), **row}
         if tool == 'source':
             rows = self.rows(args['program'], 'source')
+            source_limit = self.config.investigation.source_line_limit
             filename = args.get('source_file') or args['program'].upper() + '.CBL'
             available = sorted({r.get('source_file', '') for r in rows})
             if filename.upper() not in {name.upper() for name in available}:
@@ -857,12 +859,12 @@ class EvidenceTools:
                     raise ToolError('Source spans must be [[start,end], ...].')
                 if any(type(n) is not int or n < 1 for s in spans for n in s) or any(s[1] < s[0] for s in spans):
                     raise ToolError('Invalid source span.')
-                if sum(b-a+1 for a,b in spans) > 120:
-                    raise ToolError('Source window exceeds 120 lines; request smaller spans.')
+                if sum(b-a+1 for a,b in spans) > source_limit:
+                    raise ToolError(f'Source window exceeds {source_limit} lines; request smaller spans.')
                 requested = list(dict.fromkeys(n for a,b in spans for n in range(a,b+1)))
                 rows = [r for r in rows if r['line'] in requested]
-            if len(rows) > 120:
-                raise ToolError('Paragraph exceeds 120 lines; read smaller source spans.')
+            if len(rows) > source_limit:
+                raise ToolError(f'Paragraph exceeds {source_limit} lines; read smaller source spans.')
             missing = [n for n in requested if n not in {r['line'] for r in rows}]
             return {'rows': [{'evidence_id': self.register(r), **r} for r in rows], 'returned': len(rows),
                     'paragraph_operations': self.paragraph_operations(args['program'], args['paragraph']) if args.get('paragraph') else [],

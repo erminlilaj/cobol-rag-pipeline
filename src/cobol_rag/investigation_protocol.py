@@ -1,6 +1,7 @@
 """Shared, data-driven contracts for the investigation model and executor."""
 
 TABLE_INFO = {
+    'connections': ('corpus relationship edges', 'Explicit directed program calls, JCL job-step execution, DD dataset access, and COPY inclusion across published analyzed programs. Use kind/source/target filters and inspect coverage before absence claims.'),
     'parameter_writes': ('call parameter preparation sites', 'Flat records: caller, target, parameter (COMMAREA), variable, paragraph, line_start, statement, call_line. Recorded writes_before_call, not proof of every possible runtime path.'),
     'variables': ('recorded variables', 'Variable declarations and use: name, controls_flow, origin, relationships, evidence.'),
     'variable_access': ('recorded variable access evidence', 'Flat pageable records: variable/name, access_kind (read, write, read_write, control, subscript), paragraph, line_start, statement. Unlocated analyzer expressions use unlocated_ prefixed access_kind and null line_start; these are not additional physical locations. Write sites show data sources.'),
@@ -53,6 +54,7 @@ PAGE = {'offset': {'type': 'integer', 'minimum': 0}, 'limit': {'type': 'integer'
 QUERY = {'programs': STRINGS, 'table': {'type': 'string', 'enum': list(TABLE_INFO)},
          'where': {'type': 'array', 'items': FILTER}, 'order_by': S, **PAGE}
 TOOL_SCHEMAS = {
+    'connections': obj({'where': QUERY['where'], 'order_by': S, **PAGE}),
     'data_dependencies': obj({'programs': STRINGS, 'source': S, 'target': S,
         'max_depth': {'type': 'integer', 'minimum': 1, 'maximum': 6}}, ['programs', 'source', 'target']),
     'flow_edges': obj({'programs': STRINGS, 'paragraph': S,
@@ -109,6 +111,7 @@ def tool_help():
     for name, schema in TOOL_SCHEMAS.items():
         lines.append(name + '(' + ', '.join(schema['properties']) + ')')
     lines.extend(['inventory lists analyzed PROGRAMS, not files.',
+                  'connections reads the published corpus graph without guessing a program list. Each row has kind, source, target, program, evidence and source_artifact. Filter kind=program_call for cross-program call topology or kind=jcl_exec for job-step execution; DD edges are separate. Missing artifact coverage blocks global absence claims.',
                   'query reads a table for explicit programs; limit:0 counts, limit:N pages.',
                   'For JCL questions, query jcl_jobs, jcl_steps, jcl_reads, jcl_writes, jcl_sysout, jcl_unknowns, or jcl_deletes for the named program. These are linked job-step records, not a complete inventory of every supplied JCL member. Preserve job, step, DD and source provenance; do not infer dataset direction from DD presence alone.',
                   'flow_edges(programs) lists program-wide static CFG edges; paginate if incomplete. flow_edges(programs,paragraph,direction) restricts to incoming/outgoing edges of one paragraph. Do not use an empty paragraph for a whole-program question.',

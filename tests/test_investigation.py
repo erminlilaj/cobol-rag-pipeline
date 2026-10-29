@@ -419,6 +419,30 @@ def test_jcl_tables_keep_step_and_dataset_provenance(monkeypatch):
     assert tools.rows('A', 'jcl_writes') == []
 
 
+def test_corpus_connections_filter_and_cover_missing_analysis(monkeypatch, tmp_path):
+    from pathlib import Path
+    root = Path(tmp_path)
+    graph = {'schema_version': 1, 'known_jcl_jobs': ['JOB', 'UNLINKED'],
+             'jobs_without_analyzed_program_link': ['UNLINKED'],
+             'coverage': {'A': {'architecture.call_parameters.json': 'available'},
+                                                'B': {'architecture.call_parameters.json': 'missing'}},
+             'limitations': ['Only published programs are covered.'],
+             'edges': [{'kind': 'program_call', 'source': 'A', 'target': 'B', 'program': 'A',
+                        'source_artifact': 'architecture.call_parameters.json',
+                        'evidence': {'line_start': 42}},
+                       {'kind': 'jcl_exec', 'source': 'JOB/RUN', 'target': 'A', 'program': 'A',
+                        'source_artifact': 'jcl.file_io.json', 'evidence': {}}]}
+    (root / 'corpus.relationships.json').write_text(__import__('json').dumps(graph))
+    monkeypatch.setattr('cobol_rag.investigation_tools.artifacts.analyzed_programs', lambda: ('A', 'B'))
+    monkeypatch.setattr('cobol_rag.investigation_tools.artifacts.find_final_scripts_root', lambda: root)
+    tools = EvidenceTools(AppConfig())
+    result = tools.execute('connections', {'where': [{'field': 'kind', 'op': 'eq', 'value': 'program_call'}]})
+    assert (result['total_matches'], result['rows'][0]['target']) == (1, 'B')
+    summary = tools.evidence[result['collection_evidence_id']]
+    assert summary['coverage']['B']['architecture.call_parameters.json'] == 'missing'
+    assert summary['jobs_without_analyzed_program_link'] == ['UNLINKED']
+
+
 def test_social_claim_failure_can_rewrite_without_tools(evidence):
     budget = FakeBudget([
         dict(action='final', mode='conversational', status='complete', evidence_ids=[], answer='Good morning! A has two variables.'),

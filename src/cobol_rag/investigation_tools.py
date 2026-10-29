@@ -320,7 +320,27 @@ class EvidenceTools:
         if depth > 6:
             raise ToolError('Result reference nesting exceeded; issue a fresh query.')
         tool, args = recipe['tool'], recipe['args']
-        if tool == 'inventory':
+        if tool == 'connections':
+            base = artifacts.find_final_scripts_root()
+            path = Path(base) / 'corpus.relationships.json' if base else None
+            if path is None or not path.is_file():
+                raise ToolError('Corpus relationship analysis is unavailable; rerun the platform pipeline with the corpus graph builder.')
+            try:
+                graph = json.loads(path.read_text(encoding='utf-8'))
+            except (OSError, ValueError) as error:
+                raise ToolError(f'Corpus relationship artifact cannot be read: {error}') from error
+            if graph.get('schema_version') != 1 or not isinstance(graph.get('edges'), list):
+                raise ToolError('Corpus relationship artifact has an unsupported schema.')
+            rows = []
+            for edge in graph['edges']:
+                if not isinstance(edge, dict):
+                    continue
+                row = dict(edge)
+                row['name'] = f"{row.get('kind')}:{row.get('source')}->{row.get('target')}"
+                row['_artifact'] = 'corpus.relationships.json'
+                row['_row_id'] = digest(row)
+                rows.append(row)
+        elif tool == 'inventory':
             rows = []
             for p in self.programs:
                 row = {'name': p, 'program': p, '_artifact': 'corpus.registry.json'}
@@ -450,6 +470,19 @@ class EvidenceTools:
             if relation:
                 relation = {**relation, 'refinement_filters': args.get('where', [])}
             return relation
+        if recipe['tool'] == 'connections':
+            filters = args.get('where', [])
+            if not any(p.get('field') == 'kind' and p.get('op') == 'eq'
+                       and p.get('value') == 'program_call' for p in filters):
+                return None
+            source_filters = [p for p in filters if p.get('field') == 'source' and p.get('op') in {'eq', 'in'}]
+            target_filters = [p for p in filters if p.get('field') == 'target' and p.get('op') in {'eq', 'in'}]
+            callers = [str(value).upper() for p in source_filters
+                       for value in (p['value'] if isinstance(p.get('value'), list) else [p.get('value')])]
+            return {'edge': 'caller -> target', 'caller_scope': callers or list(self.programs),
+                    'target_filters': target_filters, 'filters': filters,
+                    'direction': 'incoming_to_target' if target_filters else 'outgoing_from_callers',
+                    'absence_scope': 'Only indexed callers with available published call artifacts are covered.'}
         if recipe['tool'] != 'query' or args.get('table') != 'calls':
             return None
         target_filters = [p for p in args.get('where', []) if p.get('field') == 'target']
@@ -728,7 +761,7 @@ class EvidenceTools:
             target = args.pop('target')
             return self.execute('query', {**args, 'programs': args.get('programs') or list(self.programs),
                 'table': 'calls', 'where': [{'field': 'target', 'op': 'in' if isinstance(target, list) else 'eq', 'value': target}]})
-        if tool in {'inventory', 'query', 'select', 'compare', 'compare_groups'}:
+        if tool in {'connections', 'inventory', 'query', 'select', 'compare', 'compare_groups'}:
             if any(k in args for k in ('parent', 'left', 'right', 'displayed_ids')):
                 raise ToolError('Internal replay fields cannot be supplied by the model.')
             grouped = tool == 'compare_groups'
@@ -770,6 +803,8 @@ class EvidenceTools:
             def result_unit(recipe):
                 if recipe['tool'] == 'inventory':
                     return 'analyzed programs'
+                if recipe['tool'] == 'connections':
+                    return TABLE_INFO['connections'][0]
                 if recipe['tool'] == 'select':
                     return result_unit(recipe['args']['parent'])
                 return TABLE_INFO.get(recipe['args'].get('table'), ('set members', ''))[0]
@@ -781,6 +816,13 @@ class EvidenceTools:
                        'programs': sorted({r['program'] for r in rows if r.get('program')} or set(args.get('programs', []))),
                        'source_artifacts': sorted({r['_artifact'] for r in rows if r.get('_artifact')}),
                        'relation': relation, '_artifact': 'verified_collection_operation'}
+            if tool == 'connections':
+                base = artifacts.find_final_scripts_root()
+                graph = json.loads((Path(base) / 'corpus.relationships.json').read_text(encoding='utf-8'))
+                summary['coverage'] = graph.get('coverage', {})
+                summary['limitations'] = graph.get('limitations', [])
+                summary['known_jcl_jobs'] = graph.get('known_jcl_jobs', [])
+                summary['jobs_without_analyzed_program_link'] = graph.get('jobs_without_analyzed_program_link', [])
             table = recipe['args'].get('table')
             summary['evidence_scope'] = {
                 'variable_access': 'Recorded access sites only. Zero accesses does not prove a variable is undeclared; query variables for existence.',
@@ -794,6 +836,15 @@ class EvidenceTools:
                     'complete': summary['complete'], 'collection_evidence_id': self.register(summary),
                     'available_fields': sorted({k for r in rows[:20] for k in r if not k.startswith('_')}),
                     'rows': [{'evidence_id': self.register({**r, 'result_id': rid, 'relation': relation}), **r} for r in shown]}
+            if tool == 'connections':
+                gaps = [{'program': program, 'artifact': artifact, 'status': status}
+                        for program, statuses in summary['coverage'].items()
+                        for artifact, status in statuses.items() if status != 'available']
+                result['coverage_summary'] = {'programs': len(summary['coverage']),
+                    'gaps_count': len(gaps), 'gaps_preview': gaps[:20],
+                    'known_jcl_jobs': len(summary['known_jcl_jobs']),
+                    'jobs_without_analyzed_program_link': len(summary['jobs_without_analyzed_program_link'])}
+                result['limitations'] = summary['limitations']
             if tool == 'query' and table == 'variable_access':
                 # Bounded, explicitly labelled windows, not guessed full statements.
                 # The model can expand these through source when a branch is longer.

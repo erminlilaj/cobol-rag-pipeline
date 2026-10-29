@@ -88,6 +88,13 @@ TABLES = {
     'calls': ('architecture.call_parameters.json', 'calls'),
     'parameter_writes': ('architecture.call_parameters.json', 'calls'),
     'cics': ('architecture.cics_operations.json', 'content.operations'),
+    'jcl_jobs': ('jcl.file_io.json', 'content.matching_jobs'),
+    'jcl_steps': ('jcl.file_io.json', 'content.matching_steps'),
+    'jcl_reads': ('jcl.file_io.json', 'content.reads'),
+    'jcl_writes': ('jcl.file_io.json', 'content.writes'),
+    'jcl_sysout': ('jcl.file_io.json', 'content.sysout'),
+    'jcl_unknowns': ('jcl.file_io.json', 'content.unknowns'),
+    'jcl_deletes': ('jcl.file_io.json', 'content.deletes'),
     'copybooks': ('architecture.copybooks.json', 'content.inclusions'),
     'edges': ('controlflow.cfg.json', 'edges'),
     'graph_nodes': ('controlflow.cfg.json', 'nodes'),
@@ -280,6 +287,11 @@ class EvidenceTools:
         result = []
         for item in raw:
             row = dict(item) if isinstance(item, dict) else {'name': str(item)}
+            if table.startswith('jcl_'):
+                # A stable member identity is needed for list validation and paging.
+                # The table name alone would collapse every DD/step into one member.
+                row['name'] = '/'.join(str(row[key]) for key in ('job', 'step', 'ddname', 'dsn')
+                                     if row.get(key) not in (None, '')) or str(row.get('source') or table)
             if table == 'variable_access' and isinstance(row.get('line_start'), int) and row['line_start'] < 1:
                 row['recorded_line_start'] = row['line_start']
                 row['line_start'] = None

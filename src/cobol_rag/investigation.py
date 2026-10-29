@@ -55,6 +55,10 @@ then compare for shared/exclusive members. Cite the derived result, not only its
 When a complete call inventory has total_matches=0, answer that no matching
 external calls are recorded in that exact caller/target scope. Do not turn a
 verified empty result into a generic failure or claim global nonexistence.
+JCL evidence uses jcl_jobs, jcl_steps, jcl_reads, jcl_writes, jcl_sysout,
+jcl_unknowns and jcl_deletes. A JCL EXEC PGM step invokes a program; two
+programs in consecutive steps do not thereby call each other. An imported JCL
+library is not itself program linkage. Report uncertain DD access as uncertain.
 When asked which function or function number a caller uses with an external routine,
 look for a function-selector field prepared before the call in its parameter area.
 The selector may use a copybook/interface prefix rather than the callee's program name.

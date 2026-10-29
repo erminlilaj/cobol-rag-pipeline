@@ -403,6 +403,22 @@ def test_large_profile_env_keeps_standard_defaults_untouched(monkeypatch):
     assert InvestigationConfig().profile == 'standard'
 
 
+def test_jcl_tables_keep_step_and_dataset_provenance(monkeypatch):
+    payload = {'content': {'matching_jobs': [{'job': 'JOB1'}],
+                           'matching_steps': [{'job': 'JOB1', 'step': 'RUN', 'program': 'A'}],
+                           'reads': [{'job': 'JOB1', 'step': 'RUN', 'ddname': 'INPUT', 'dsn': 'DATA.IN'}],
+                           'writes': [], 'sysout': [], 'unknowns': [], 'deletes': []}}
+    monkeypatch.setattr('cobol_rag.investigation_tools.artifacts.analyzed_programs', lambda: ('A',))
+    tools = EvidenceTools(AppConfig())
+    monkeypatch.setattr(tools, 'root', lambda program: __import__('pathlib').Path('/tmp'))
+    monkeypatch.setattr(tools, 'load', lambda program, artifact: payload)
+    assert tools.rows('A', 'jcl_steps')[0]['step'] == 'RUN'
+    read = tools.rows('A', 'jcl_reads')[0]
+    assert (read['job'], read['ddname'], read['_artifact']) == ('JOB1', 'INPUT', 'jcl.file_io.json')
+    assert read['name'] == 'JOB1/RUN/INPUT/DATA.IN'
+    assert tools.rows('A', 'jcl_writes') == []
+
+
 def test_social_claim_failure_can_rewrite_without_tools(evidence):
     budget = FakeBudget([
         dict(action='final', mode='conversational', status='complete', evidence_ids=[], answer='Good morning! A has two variables.'),

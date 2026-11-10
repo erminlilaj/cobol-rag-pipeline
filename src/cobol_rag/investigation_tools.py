@@ -185,6 +185,108 @@ class EvidenceTools:
             self._cache[key] = json.loads(path.read_text(encoding='utf-8'))
         return deepcopy(self._cache[key])
 
+    def jcl_details(self, evidence_id, scope):
+        """Follow a registered JCL step to its detailed artifact and source."""
+        anchor = self.evidence.get(evidence_id, {})
+        if anchor.get('_artifact') != 'jcl.file_io.json' or not all(
+                isinstance(anchor.get(key), str) and anchor[key]
+                for key in ('program', 'job', 'step', 'source_artifact')):
+            raise ToolError('Use a jcl_steps row evidence ID, not a collection ID or a file path.')
+        program = anchor['program']
+        root = self.root(program).resolve()
+        runs = next((parent for parent in root.parents if parent.name == '.runs'), None)
+        run = runs / program if runs else None
+        jcl = (root / 'jcl').resolve()
+        if not (jcl.is_relative_to(root) or (run and jcl.is_relative_to(run / 'analysis'))):
+            raise ToolError('JCL artifact directory escapes the approved program roots.')
+        relative = Path(anchor['source_artifact'])
+        if relative.is_absolute() or '..' in relative.parts or not re.fullmatch(
+                r'jcl\.steps\..+\.json', relative.name):
+            raise ToolError('Invalid JCL step artifact reference.')
+        if relative.parts[0] == 'jcl':
+            relative = Path(*relative.parts[1:])
+        path = jcl / relative
+
+        def read_artifact(member, expected_type):
+            resolved = member.resolve()
+            if not resolved.is_relative_to(jcl) or not resolved.is_file() or resolved.stat().st_size > 2_000_000:
+                raise ToolError(f'JCL artifact {member.name} is missing or outside the approved directory.')
+            try:
+                value = json.loads(resolved.read_text(encoding='utf-8'))
+            except (OSError, ValueError) as error:
+                raise ToolError(f'Cannot read JCL artifact {member.name}.') from error
+            if not isinstance(value, dict) or value.get('type') != expected_type or value.get('job') != anchor['job']:
+                raise ToolError(f'JCL artifact {member.name} does not match the recorded job.')
+            return value
+
+        step = read_artifact(path, 'jcl.steps')
+        if (step.get('step'), step.get('program') or step.get('target')) != (anchor['step'], program):
+            raise ToolError('JCL artifact does not match the recorded step and program.')
+        if scope == 'job':
+            summary_path = path.parent / 'jcl.summary.json'
+            summary = read_artifact(summary_path, 'jcl.summary')
+            members = sorted(path.parent.glob('jcl.steps.*.json'))
+            if len(members) > 100:
+                raise ToolError('Job has more than 100 step artifacts; cannot verify a whole-job inventory in one lookup.')
+            inventory = [read_artifact(member, 'jcl.steps') for member in members]
+            invocations = [item for item in inventory if item.get('scope') in {'job', 'expanded_local_procedure'}
+                           or item.get('invoked_by_step')]
+            direct_programs = sorted({item['program'] for item in invocations
+                                      if isinstance(item.get('program'), str) and '&' not in item['program']})
+            unresolved = summary.get('unresolved_procedures')
+            expected = summary.get('execution_steps_count')
+            # An uninvoked PROC member can have a job-like name. It cannot
+            # establish job-wide absence, even if all its definitions are visible.
+            anchor_invoked = any(item.get('step') == anchor['step'] and item.get('program') == program
+                                 for item in invocations)
+            warnings = summary.get('warnings', [])
+            complete = (anchor_invoked and type(expected) is int and len(invocations) == expected
+                        and len({item.get('step') for item in invocations}) == expected
+                        and isinstance(unresolved, list) and not unresolved
+                        and not any(re.search(r'unresolved procedure|procedure expansion stopped|has no PEND',
+                                              str(warning), re.I) for warning in warnings or [])
+                        and all(isinstance(item.get('program'), str) and item['program']
+                                and '&' not in item['program'] for item in invocations))
+            row = {'_artifact': 'jcl.job_details', 'program': program, 'job': anchor['job'],
+                   'source_file': Path(str(summary.get('source') or '')).name or anchor.get('source_file'),
+                   'source': summary.get('source'), 'source_artifact': str(summary_path.relative_to(jcl)),
+                   'complete_execution_inventory': complete, 'linked_step_is_invocation': anchor_invoked,
+                   'expected_execution_steps': expected, 'recorded_execution_steps': len(invocations),
+                   'invoked_programs': direct_programs, 'unresolved_procedures': unresolved,
+                   'steps': [{key: item.get(key) for key in ('step', 'program', 'scope', 'invoked_by_step',
+                              'source', 'source_lines', 'conditions')} for item in invocations],
+                   'evidence_scope': 'Static job invocation inventory only; excludes uninvoked PROC definitions and does not prove runtime execution.'}
+        else:
+            source = str(step.get('source') or '')
+            row = {key: step.get(key) for key in ('job', 'step', 'program', 'scope', 'defined_in_proc',
+                   'invoked_by_step', 'exec_kind', 'target', 'parameters', 'dds', 'source_lines')}
+            row.update(_artifact='jcl.step_details', source=source,
+                       source_file=Path(source.replace('\\', '/')).name or anchor.get('source_file'),
+                       source_artifact=str(path.relative_to(jcl)))
+            row['exec_source'] = None
+            span = step.get('source_lines')
+            member = Path(source)
+            approved = [root / 'jcl']
+            if run:
+                approved.append(run / 'analysis' / 'work' / 'program_packages' / program / 'jcl')
+            if isinstance(span, dict):
+                first, last = span.get('start'), span.get('end')
+                if (type(first) is int and type(last) is int and 1 <= first <= last
+                        and last - first < self.config.investigation.source_line_limit
+                        and member.is_absolute() and member.suffix.lower() in {'.jcl', '.txt', '.proc', '.prc'}):
+                    resolved = member.resolve()
+                    if (any(resolved.is_relative_to(directory) for directory in approved)
+                            and resolved.is_file() and resolved.stat().st_size <= 2_000_000):
+                        try:
+                            lines = resolved.read_text(encoding='utf-8').splitlines()
+                        except (OSError, UnicodeError):
+                            lines = []
+                        if last <= len(lines):
+                            row['exec_source'] = [{'line': n, 'text': lines[n - 1]} for n in range(first, last + 1)]
+            if row['exec_source'] is None:
+                row['exec_source_limitation'] = 'Exact JCL source unavailable in the approved package. Do not quote reconstructed text.'
+        return {**row, 'evidence_id': self.register(row)}
+
     def rows(self, program, table):
         program = str(program).upper()
         root = self.root(program)
@@ -620,6 +722,8 @@ class EvidenceTools:
             raise ToolError(str(error)) from error
         if tool == 'data_dependencies':
             return self.data_dependencies(args)
+        if tool == 'jcl_details':
+            return self.jcl_details(args['evidence_id'], args.get('jcl_scope', 'step'))
         if tool == 'files':
             return self.execute('query', {**args, 'programs': args.get('programs') or list(self.programs), 'table': 'files'})
         if tool == 'flow_edges':
@@ -896,6 +1000,9 @@ class EvidenceTools:
                 result['limitations'] = summary['limitations']
             if 'jcl_coverage' in summary:
                 result['jcl_coverage'] = summary['jcl_coverage']
+            if tool == 'query' and table == 'jcl_steps':
+                result['detail_tool'] = ('Pass a step row evidence_id to jcl_details for EXEC text, PARM, '
+                                         'all DDs, or the same-job execution inventory.')
             if tool == 'query' and table == 'variable_access':
                 # Bounded, explicitly labelled windows, not guessed full statements.
                 # The model can expand these through source when a branch is longer.

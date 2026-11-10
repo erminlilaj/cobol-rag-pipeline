@@ -62,6 +62,11 @@ library is not itself program linkage. Report uncertain DD access as uncertain.
 For empty JCL results use jcl_coverage: distinguish no analyzed jobs, unknown
 coverage, no linked steps, and linked steps with no matching recorded DDs.
 Answer job and step using their recorded fields and cite their JCL source.
+For exact JCL EXEC text, PARM or DD statements, look up the step with jcl_steps,
+then call jcl_details on its row evidence ID with jcl_scope=step. Use the actual
+EXEC source for quotes and inspect parameters for PARM; named datasets alone do
+not list all DDs. For other steps/programs in the same job, use jcl_scope=job.
+Keep procedure definitions separate from job invocations and honor coverage.
 When asked which function or function number a caller uses with an external routine,
 look for a function-selector field prepared before the call in its parameter area.
 The selector may use a copybook/interface prefix rather than the callee's program name.
@@ -266,6 +271,11 @@ def normalize_decision(decision, tools):
             raise ToolError('Conflicting calls and tool_calls envelopes.')
         decision['calls'] = decision.pop('tool_calls')
         decision.setdefault('action', 'tools')
+    if ('action' not in decision and set(decision) <= {'calls', 'requirements', 'request_contract'}
+            and isinstance(decision.get('calls'), (list, dict)) and decision['calls']):
+        # The model already selected a tool action. Restore only its envelope;
+        # tool names, arguments and the current action schema still apply.
+        decision['action'] = 'tools'
     if decision.get('action') in TOOL_SCHEMAS:
         decision = {'action': 'tools', 'requirements': decision.get('requirements', []),
                     'calls': [{'tool': decision['action'], 'args': decision.get('args', {})}]}
@@ -695,8 +705,14 @@ def call_review_errors(review, contracts):
 def call_kind_errors(answer, rows):
     """Reject unambiguous grouped call-kind claims contradicted by retrieved calls."""
     errors = []
+    call_types = {'CICS LINK': 'CICSLINK', 'CICS XCTL': 'CICSXCTL', 'CALL': 'CALL', 'COBOL CALL': 'CALL'}
+    facts = {}
+    for row in rows:
+        if row.get('program') and row.get('target') and row.get('call_type'):
+            facts.setdefault((row['program'].upper(), row['target'].upper()), set()).add(row['call_type'].upper())
     for sentence in re.split(r'[.\n]', answer):
-        tokens = set(re.findall(r'[A-Z0-9_-]+', sentence.upper()))
+        upper = sentence.upper()
+        tokens = set(re.findall(r'[A-Z0-9_-]+', upper))
         if re.search(r'(?:\bCOBOL\s+CALL\b|\bvia\s+CALL\b|`CALL`)', sentence, re.I):
             for row in rows:
                 if row.get('source_operation') == 'PERFORM' and row.get('from') in tokens and row.get('to') in tokens:
@@ -708,16 +724,25 @@ def call_kind_errors(answer, rows):
                 counts = row.get('call_inventory_counts')
                 if row.get('program') in tokens and counts is not None and claimed != counts.get('CICS' + kind.upper(), 0):
                     errors.append(f'Call count/unit contradiction: {row["program"]} has {counts.get("CICS" + kind.upper(), 0)} CICS {kind.upper()} calls, not {claimed}.')
-        kinds = set(re.findall(r'\bCICS\s+(LINK|XCTL)\b', sentence.upper()))
-        if len(kinds) != 1:
-            continue  # Mixed-kind explanations need semantic review, not proximity guesses.
-        expected = 'CICS' + next(iter(kinds))
-        facts = {}
-        for row in rows:
-            if row.get('program') in tokens and row.get('target') in tokens and row.get('call_type'):
-                facts.setdefault((row['program'], row['target']), set()).add(row['call_type'].upper())
+        attached = {}
+        for target, kind in re.findall(
+                r'(?<![A-Z0-9_-])([A-Z0-9_-]+)`?\s*\(\s*(?:VIA\s+)?`?(CICS\s+(?:LINK|XCTL)|(?:COBOL\s+)?CALL)`?\s*\)', upper):
+            attached.setdefault(target, set()).add(call_types[' '.join(kind.split())])
+        kinds = set(re.findall(r'\bCICS\s+(LINK|XCTL)\b', upper))
+        without_cics_verb = re.sub(r'\bCICS\s+(?:LINK|XCTL)\s+CALL\b', '', upper)
+        grouped = not attached and len(kinds) == 1 and not re.search(r'\bCALL\b', without_cics_verb)
+        # Only an explicit attachment or a homogeneous grouped assertion is
+        # safe to check here. Ambiguous prose is left to semantic review.
+        owners = {program for program, target in facts if program in tokens and target in tokens}
+        if len(owners) != 1:
+            continue
         for (program, target), actual in facts.items():
-            if expected not in actual:
+            if program not in owners or target not in tokens:
+                continue
+            expected_kinds = attached.get(target, set())
+            if grouped:
+                expected_kinds = {'CICS' + next(iter(kinds))}
+            for expected in sorted(expected_kinds - actual):
                 errors.append(f'Call-kind contradiction: {program} -> {target} is {sorted(actual)}, not {expected}.')
     return errors
 
@@ -857,6 +882,27 @@ def answer_checks(question, candidate, tools, requirements, request=None):
                                f'for {context["source_prefix"]} but named no source fields from that interface. '
                                'List supported source fields, not only destination group members.')
     reasons.extend(call_kind_errors(cleaned, list(tools.evidence.values())))
+    jcl_detail = request.get('jcl_detail') if request else None
+    step_details = [row for row in cited_rows if row.get('_artifact') == 'jcl.step_details']
+    job_details = [row for row in cited_rows if row.get('_artifact') == 'jcl.job_details']
+    if request and request.get('jcl_scope') == 'job' and candidate.get('status') == 'complete':
+        if not any(row.get('complete_execution_inventory') for row in job_details):
+            reasons.append('Whole-job claims require a cited complete jcl_details job result. '
+                           'A program-scoped JCL result is insufficient; report unresolved job coverage as partial.')
+    if jcl_detail and candidate.get('status') == 'complete':
+        key, expected_type = {'exec': ('exec_source', list), 'parm': ('parameters', dict),
+                              'dds': ('dds', list)}[jcl_detail]
+        details = [row for row in step_details if isinstance(row.get(key), expected_type)]
+        if not details:
+            reasons.append(f'JCL {jcl_detail} requires cited step details containing {key}; '
+                           'step names, line ranges, or named datasets alone are insufficient.')
+        if jcl_detail == 'dds':
+            tokens = {token.rstrip('.') for token in re.findall(r'[A-Z0-9_$#@.-]+', cleaned.upper())}
+            missing_dds = sorted({dd['ddname'].upper() for row in details for dd in row['dds']
+                                  if isinstance(dd, dict) and isinstance(dd.get('ddname'), str)
+                                  and dd['ddname'].upper() not in tokens})
+            if missing_dds:
+                reasons.append('JCL answer omits recorded DD names: ' + ', '.join(missing_dds))
     if request and request.get('depth') == 'detailed' and candidate.get('status') == 'complete' and cited_rows:
         artifacts_used = {r.get('_artifact') for r in cited_rows} - {None, 'verified_collection_operation'}
         if artifacts_used and artifacts_used <= {'program.summary.json'}:
@@ -876,6 +922,8 @@ def answer_checks(question, candidate, tools, requirements, request=None):
         from cobol_rag.scope import source_addresses_in
         requested = source_addresses_in(question)
         present = {r.get('line') for i,r in tools.evidence.items() if i in ids and r.get('_artifact') == 'program.source_lines.jsonl'}
+        if jcl_detail == 'exec':
+            present.update(line['line'] for row in step_details for line in row.get('exec_source') or [])
         if any(b-a > 120 or any(n not in present for n in range(a,b+1))
                for a,b in ((r['line_start'],r['line_end']) for r in requested)):
             reasons.append('requested_source_addresses_not_covered')
@@ -905,7 +953,14 @@ def answer_checks(question, candidate, tools, requirements, request=None):
     bundles = [r for r in tools.evidence.values()
                if r.get('_artifact') == 'verified_collection_operation'
                and r.get('result_id') in cited_results]
-    if request and request.get('output') == 'list' and not cited_results and ids:
+    if (jcl_detail and step_details) or (request and request.get('jcl_scope') == 'job' and job_details):
+        # The locator collection is supporting provenance, not the requested
+        # DD/EXEC/PARM or job-wide result, even when cited alongside details.
+        locators = {bundle['result_id'] for bundle in bundles
+                    if bundle.get('recipe', {}).get('args', {}).get('table') == 'jcl_steps'}
+        cited_results -= locators
+        bundles = [bundle for bundle in bundles if bundle['result_id'] not in locators]
+    if request and request.get('output') == 'list' and not cited_results and ids and not (step_details or job_details):
         # Source-line citations must not evade a collection query already
         # executed in this turn. This matters for commented-code inventories.
         available = [r for r in tools.evidence.values()
@@ -997,6 +1052,10 @@ not an exhaustive list. Questions about your capabilities are scope=general, out
 Asking what/which files are available requests output=list, not a sample or summary.
 How many analyzed files asks for a corpus count of source members, not the number of programs;
 do not inherit a program restriction from an earlier unrelated question.
+For JCL, set jcl_scope=job when the question asks about the whole job (such as what
+else it runs), or jcl_scope=step for individual step details. Set jcl_detail=exec,
+parm, or dds only when the request asks for that specific step detail. A question
+asking for job and step names alone does not need these fields.
 questions about particular program contents still require corpus evidence. Social requests
 and general questions must not inherit a previous technical topic.
 Preserve caller -> target meaning in the standalone question.
@@ -1174,6 +1233,14 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         must_retrieve = True
                     elif any(e.startswith(('Multiple input collections', 'Requested collection is incomplete')) for e in errors):
                         must_retrieve = True
+                    elif any(e.startswith(('Whole-job claims require', 'JCL exec requires',
+                                           'JCL parm requires', 'JCL dds requires')) for e in errors):
+                        detail_artifact = ('jcl.job_details' if request.get('jcl_scope') == 'job'
+                                           else 'jcl.step_details')
+                        must_retrieve = not any(row.get('_artifact') == detail_artifact for row in tools.evidence.values())
+                        if not must_retrieve:
+                            errors.append('Use the retrieved JCL details, citing them. If a required fact '
+                                          'or whole-job coverage is unavailable, report that gap as partial.')
                     if must_retrieve and not recovery_granted:
                         core_limit = min(budget.maximum - budget.output_reserve,
                                          core_limit + getattr(budget, 'recovery_reserve', 0))
@@ -1248,6 +1315,9 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         'total_matches is the exact full count within recipe.args.programs and its predicates, never an estimate. complete describes ONLY whether all detail rows were returned on this page. A count-only query intentionally has returned=0 and may have complete=false; this does not weaken its exact total_matches or its program scope. Do not demand detail rows or an extra verification query to support that count. '
                         'A controls_flow=true query proves the returned members meet that filter even if row previews omit the field. '
                         'total_matches=0 means no matches within the stated scope. Relation metadata describes the query, NOT the existence of an edge. '
+                        'For claims about all or no other programs in a JCL job, require cited jcl.job_details with complete_execution_inventory=true. '
+                        'A program-scoped step query is not whole-job evidence even when filtered by job. Procedure definitions are not invocations. '
+                        'For a bounded JCL answer, distinguish no PARM in a verified parameters object from unavailable step details, and an exact EXEC quote from parsed metadata. '
                         'If a scoped callers query is empty, saying no callers were found and thus no passed parameters are recorded FULLY answers callers-and-parameters within that scope; do not demand parameters for nonexistent edges. '
                         'Enforce evidence_scope: access-site absence cannot prove declaration absence; COPY inclusion cannot prove unused status. Quality claims require quality or copybook-review findings. '
                         'Use source_operation and source statement for graph edges: CFG type CALL can represent PERFORM, not a COBOL CALL. A terminating ABEND cannot be followed by a runtime fallthrough solely because a static graph has that edge. '

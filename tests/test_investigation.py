@@ -419,6 +419,126 @@ def test_jcl_tables_keep_step_and_dataset_provenance(monkeypatch):
     assert tools.rows('A', 'jcl_writes') == []
 
 
+@pytest.fixture
+def jcl_package(tmp_path, monkeypatch):
+    import json
+    runs = tmp_path / '.runs'
+    root = runs / '_corpus' / 'rag' / 'final_scripts' / 'A'
+    root.mkdir(parents=True)
+    output = runs / 'A' / 'analysis' / 'output' / 'jcl'
+    job = output / 'MYJOB'
+    job.mkdir(parents=True)
+    (root / 'jcl').symlink_to(output, target_is_directory=True)
+    source = runs / 'A' / 'analysis' / 'work' / 'program_packages' / 'A' / 'jcl' / 'MYJOB.JCL'
+    source.parent.mkdir(parents=True)
+    source.write_text("//MYJOB JOB\n//RUN EXEC PGM=A,\n// PARM='TEST'\n//SYSOUT DD SYSOUT=*\n")
+    step = dict(type='jcl.steps', job='MYJOB', step='RUN', program='A', scope='job',
+                exec_kind='program', source=str(source), source_lines={'start': 2, 'end': 3},
+                parameters={'PARM': "'TEST'"}, dds=[dict(ddname='IN', dsn='DATA.IN'),
+                                                     dict(ddname='SYSOUT', sysout='*')])
+    (job / 'jcl.steps.RUN.json').write_text(json.dumps(step))
+    (job / 'jcl.steps.NEXT.json').write_text(json.dumps(dict(step, step='NEXT', program='NOT_INDEXED')))
+    (job / 'jcl.steps.PROC_UNUSED.json').write_text(json.dumps(dict(
+        step, step='PROC.UNUSED', program='NOT_INVOKED', scope='procedure_definition')))
+    summary = dict(type='jcl.summary', job='MYJOB', source=str(source),
+                   execution_steps_count=2, unresolved_procedures=[], warnings=[])
+    (job / 'jcl.summary.json').write_text(json.dumps(summary))
+    anchor = dict(job='MYJOB', step='RUN', program='A', source=str(source),
+                  source_artifact='MYJOB/jcl.steps.RUN.json', dds_count=2)
+    (root / 'jcl.file_io.json').write_text(json.dumps(dict(content=dict(
+        matching_steps=[anchor], known_jobs=['MYJOB']))))
+    monkeypatch.setattr('cobol_rag.investigation_tools.artifacts.analyzed_programs', lambda: ('A',))
+    monkeypatch.setattr(EvidenceTools, 'root', lambda self, program: root)
+    return job, step, summary
+
+
+@pytest.mark.parametrize(('question', 'facet', 'output', 'answer'), [
+    ('Show the EXEC statement for A.', 'exec', 'other', "//RUN EXEC PGM=A,\n// PARM='TEST'"),
+    ('What PARM does the JCL give A?', 'parm', 'other', "PARM is 'TEST'."),
+    ('Which DDs are defined for the step that runs A?', 'dds', 'list', 'IN and SYSOUT.'),
+])
+def test_jcl_step_details_answer_from_existing_package(jcl_package, question, facet, output, answer):
+    budget = FakeBudget([
+        dict(calls=[dict(tool='query', args=dict(programs=['A'], table='jcl_steps'))]),
+        dict(action='tools', calls=[dict(tool='jcl_details', args=dict(evidence_id='E2', jcl_scope='step'))]),
+        dict(action='final', mode='technical', status='complete', answer=answer, evidence_ids=['E2', 'E3']),
+        dict(passed=True, issues=[]),
+    ])
+    result = investigate(question, AppConfig(), budget=budget, resolved_request=dict(
+        resolved_question=question, scope='corpus', output=output, limit=None, jcl_scope='step', jcl_detail=facet))
+    assert result['status'] == 'complete', result.get('trace')
+    details = result['tools'].evidence['E3']
+    assert details['exec_source'] == [{'line': 2, 'text': '//RUN EXEC PGM=A,'},
+                                     {'line': 3, 'text': "// PARM='TEST'"}]
+    assert details['parameters']['PARM'] == "'TEST'"
+    assert [dd['ddname'] for dd in details['dds']] == ['IN', 'SYSOUT']
+
+
+def test_jcl_job_scope_includes_unindexed_programs_and_requires_job_evidence(jcl_package):
+    from cobol_rag.investigation import answer_checks
+    tools = EvidenceTools(AppConfig())
+    step = tools.execute('query', dict(programs=['A'], table='jcl_steps'))['rows'][0]
+    question = 'Does the same JCL job run other programs besides A?'
+    request = dict(output='other', jcl_scope='job')
+    candidate = dict(answer='No other programs run.', mode='technical', status='complete',
+                     evidence_ids=[step['evidence_id']])
+    assert any('Whole-job claims require' in error for error in
+               answer_checks(question, candidate, tools, [], request))
+    detail = tools.execute('jcl_details', dict(evidence_id=step['evidence_id'], jcl_scope='job'))
+    assert detail['complete_execution_inventory']
+    assert detail['invoked_programs'] == ['A', 'NOT_INDEXED']
+    candidate.update(answer='Step NEXT runs NOT_INDEXED.', evidence_ids=[detail['evidence_id']])
+    assert not answer_checks(question, candidate, tools, [], request)
+
+
+def test_jcl_unresolved_job_and_outside_source_are_not_complete_evidence(jcl_package, tmp_path):
+    import json
+    job, step, summary = jcl_package
+    (job / 'jcl.summary.json').write_text(json.dumps(dict(summary, unresolved_procedures=['UNKNOWN'])))
+    outside = tmp_path / 'OUTSIDE.JCL'
+    outside.write_text('secret\n' * 4)
+    (job / 'jcl.steps.RUN.json').write_text(json.dumps(dict(step, source=str(outside))))
+    tools = EvidenceTools(AppConfig())
+    steps = tools.execute('query', dict(programs=['A'], table='jcl_steps'))
+    eid = steps['rows'][0]['evidence_id']
+    assert not tools.execute('jcl_details', dict(evidence_id=eid, jcl_scope='job'))['complete_execution_inventory']
+    detail = tools.execute('jcl_details', dict(evidence_id=eid))
+    assert detail['exec_source'] is None
+    assert detail['parameters'] == {'PARM': "'TEST'"}
+    with pytest.raises(ToolError, match='row evidence ID'):
+        tools.execute('jcl_details', dict(evidence_id=steps['collection_evidence_id']))
+    bad = tools.register(dict(steps['rows'][0], source_artifact='../jcl.steps.RUN.json'))
+    with pytest.raises(ToolError, match='Invalid JCL step artifact reference'):
+        tools.execute('jcl_details', dict(evidence_id=bad))
+
+
+def test_jcl_procedure_definition_is_not_a_job_invocation(jcl_package):
+    import json
+    job, step, summary = jcl_package
+    (job / 'jcl.steps.RUN.json').write_text(json.dumps(dict(step, scope='procedure_definition', parameters={})))
+    (job / 'jcl.summary.json').write_text(json.dumps(dict(summary, execution_steps_count=1)))
+    tools = EvidenceTools(AppConfig())
+    eid = tools.execute('query', dict(programs=['A'], table='jcl_steps'))['rows'][0]['evidence_id']
+    detail = tools.execute('jcl_details', dict(evidence_id=eid, jcl_scope='job'))
+    assert not detail['linked_step_is_invocation']
+    assert not detail['complete_execution_inventory']
+    assert detail['invoked_programs'] == ['NOT_INDEXED']
+    step_detail = tools.execute('jcl_details', dict(evidence_id=eid))
+    assert step_detail['scope'] == 'procedure_definition'
+    assert step_detail['parameters'] == {}  # Known empty, not unavailable.
+
+
+def test_jcl_dd_guard_keeps_dds_without_named_datasets(jcl_package):
+    from cobol_rag.investigation import answer_checks
+    tools = EvidenceTools(AppConfig())
+    eid = tools.execute('query', dict(programs=['A'], table='jcl_steps'))['rows'][0]['evidence_id']
+    detail = tools.execute('jcl_details', dict(evidence_id=eid))
+    candidate = dict(answer='IN is defined.', mode='technical', status='complete',
+                     evidence_ids=[detail['evidence_id']])
+    assert 'JCL answer omits recorded DD names: SYSOUT' in answer_checks(
+        'Which DDs are defined?', candidate, tools, [], dict(output='list', jcl_detail='dds'))
+
+
 @pytest.mark.parametrize('suffix', ['', ' Cite the JCL source.'])
 def test_jcl_job_step_prose_passes_collection_validation(monkeypatch, suffix):
     monkeypatch.setattr('cobol_rag.investigation_tools.artifacts.analyzed_programs', lambda: ('A',))
@@ -690,6 +810,32 @@ def test_grouped_call_kind_claim_must_match_retrieved_calls():
     rows[0]['call_inventory_counts'] = {'CICSLINK': 1, 'CICSXCTL': 1}
     assert call_kind_errors('A makes two CICS LINK calls and one CICS XCTL call.', rows)
     assert not call_kind_errors('A makes one CICS LINK call and one CICS XCTL call.', rows)
+
+
+def test_call_kind_claims_are_checked_per_target_not_per_sentence():
+    from cobol_rag.investigation import call_kind_errors
+    rows = [dict(program='PD1DF', target=target, call_type=kind) for target, kind in
+            [('PD0UTI01', 'CICSLINK'), ('PDODF', 'CALL'), ('PDOTDF', 'CALL')]]
+    reply = 'PD1DF calls three external programs: PD0UTI01 (via CICS LINK), PDODF (via CALL), and PDOTDF (via CALL).'
+    assert not call_kind_errors(reply, rows)
+    errors = call_kind_errors(reply.replace('PDODF (via CALL)', 'PDODF (via CICS LINK)'), rows)
+    assert len(errors) == 1 and 'PDODF' in errors[0]
+    assert not call_kind_errors('PD1DF uses CICS LINK to PD0UTI01 and a CALL to PDODF.', rows)
+
+
+def test_calls_only_envelope_is_repaired_but_invalid_calls_remain_invalid():
+    from jsonschema import ValidationError, validate
+    from cobol_rag.investigation_protocol import decision_schema, validate_tool
+    call = dict(tool='source_range', args=dict(program='A', source_file='MYJOB.JCL', start=2, end=3))
+    result = normalize_decision(dict(calls=[call]), None)
+    assert result == dict(action='tools', calls=[call])
+    validate(result, decision_schema())
+    for malformed in [dict(calls=[]), dict(calls=[call], answer='Conflict'),
+                      dict(calls=[dict(tool='invent_tool', args={})])]:
+        with pytest.raises(ValidationError):
+            validate(normalize_decision(malformed, None), decision_schema())
+    with pytest.raises(ValueError):
+        validate_tool('source_range', {'program': 'A'})
 
 
 def test_detailed_explanation_cannot_claim_complete_with_only_overview(evidence):

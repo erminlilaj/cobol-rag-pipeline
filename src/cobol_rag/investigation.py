@@ -55,10 +55,13 @@ then compare for shared/exclusive members. Cite the derived result, not only its
 When a complete call inventory has total_matches=0, answer that no matching
 external calls are recorded in that exact caller/target scope. Do not turn a
 verified empty result into a generic failure or claim global nonexistence.
-JCL evidence uses jcl_jobs, jcl_steps, jcl_reads, jcl_writes, jcl_sysout,
-jcl_unknowns and jcl_deletes. A JCL EXEC PGM step invokes a program; two
+JCL evidence uses jcl_jobs, jcl_steps, jcl_datasets, jcl_reads, jcl_writes,
+jcl_sysout, jcl_unknowns and jcl_deletes. A JCL EXEC PGM step invokes a program; two
 programs in consecutive steps do not thereby call each other. An imported JCL
 library is not itself program linkage. Report uncertain DD access as uncertain.
+For empty JCL results use jcl_coverage: distinguish no analyzed jobs, unknown
+coverage, no linked steps, and linked steps with no matching recorded DDs.
+Answer job and step using their recorded fields and cite their JCL source.
 When asked which function or function number a caller uses with an external routine,
 look for a function-selector field prepared before the call in its parameter area.
 The selector may use a copybook/interface prefix rather than the callee's program name.
@@ -205,7 +208,8 @@ def tool_view(result, limit=10000):
                          'parameters', 'parameter', 'call_line', 'categories', 'classification_note',
                          'needs_review', 'proven_unused', 'review_source', 'review_proof_level', 'review_limitations',
                          'controls_flow', 'classification', 'source_file', 'source_role', 'is_comment', 'declaration', 'variable', 'access_kind',
-                         'identity', 'purpose_comments', 'metrics', 'metric_facts', 'outgoing_calls', 'length', 'evidence', 'steps', 'source', 'variables', 'limitation') if k in r}
+                         'identity', 'purpose_comments', 'metrics', 'metric_facts', 'outgoing_calls', 'length', 'evidence', 'steps', 'source', 'variables', 'limitation',
+                         'job', 'step', 'ddname', 'dsn', 'access_type', 'source_lines', 'citation') if k in r}
                         for r in result['rows']]
         view['preview_incomplete'] = True
         view['instruction'] = 'Inspect evidence fields or request another page for omitted details.'
@@ -381,6 +385,26 @@ def normalize_decision(decision, tools):
                 else:
                     predicates.append(predicate)
             args['where'] = predicates
+        if call.get('tool') == 'query' and 'programs' not in args:
+            table = args.get('table')
+            if table == 'files':
+                # The files tool explicitly supports an omitted corpus scope.
+                args.pop('table')
+                call['tool'] = 'files'
+            elif isinstance(table, str) and table.startswith('jcl_') and isinstance(args.get('where'), list):
+                # Owner and the program field are the same on these tables.
+                # Use only an explicit positive predicate; don't guess scope.
+                for predicate in args['where']:
+                    if not isinstance(predicate, dict) or predicate.get('field') != 'program':
+                        continue
+                    value = predicate.get('value')
+                    if predicate.get('op') == 'eq' and isinstance(value, str) and value:
+                        args['programs'] = [value]
+                        break
+                    if predicate.get('op') == 'in' and isinstance(value, list) and value and all(
+                            isinstance(owner, str) and owner for owner in value):
+                        args['programs'] = value
+                        break
     # Coalesce independent, unpaged lookups of the same relation into its
     # supported target set. This preserves scope while avoiding needless calls.
     grouped, calls = {}, []
@@ -702,7 +726,7 @@ def collection_contracts(tools, ids):
     """Keep executed predicates and counts out of lossy prose previews."""
     result_ids = {tools.evidence[i].get('result_id') for i in ids if i in tools.evidence}
     return [{key: row[key] for key in ('result_id', 'recipe', 'unit', 'total_matches',
-                'offset', 'returned', 'complete', 'programs', 'relation', 'evidence_scope') if key in row}
+                'offset', 'returned', 'complete', 'programs', 'relation', 'evidence_scope', 'jcl_coverage') if key in row}
             for row in tools.evidence.values()
             if row.get('_artifact') == 'verified_collection_operation'
             and row.get('result_id') in result_ids]
@@ -743,13 +767,47 @@ def collection_names(bundle):
 def missing_collection_members(bundle, answer):
     names = collection_names(bundle)
     recipe = bundle.get('recipe', {})
+    predicates = []
     while recipe.get('tool') == 'select':
+        predicates.extend(recipe.get('args', {}).get('where', []))
         recipe = recipe.get('args', {}).get('parent', {})
-    if recipe.get('args', {}).get('table') == 'comments':
+    table = recipe.get('args', {}).get('table')
+    if table == 'comments':
         positions = {int(match.group(1) or match.group(2)) for match in re.finditer(
             r'\b(?:line|riga)\s+(\d+)\b|^\s*(?:[-*]\s*)?(\d+)\s*:', answer, re.I | re.M)}
         return sorted(name for name in names if int(name.rsplit(':', 1)[1]) not in positions)
-    tokens = {token.rstrip('.') for token in re.findall(r'[A-Za-z0-9_$.-]+', answer.upper())}
+    graph = recipe.get('tool') == 'connections'
+    if graph or table in {'jcl_steps', 'jcl_reads', 'jcl_writes', 'jcl_unknowns', 'jcl_deletes', 'jcl_sysout'}:
+        # The key is a storage identity, not a required spelling. Require the
+        # fields of each member in the same sentence/line, or the literal key.
+        clauses = [{token.rstrip('.') for token in re.findall(r'[A-Z0-9_$#@./-]+', chunk)}
+                   for chunk in re.split(r'\n|(?<=[.!?;])\s+', answer.upper().replace('->', ' → '))]
+        missing = set()
+        rows = bundle.get('member_rows', [])
+        predicates.extend(recipe.get('args', {}).get('where', []))
+        fixed = {p.get('field') for p in predicates if p.get('op') == 'eq'}
+        endpoints = {'source', 'target'} - fixed or {'source', 'target'}
+        if len(rows) == 1:
+            clauses = [set().union(*clauses)]
+        for row in rows:
+            if not row.get('name'):
+                continue
+            name = str(row['name'])
+            if graph:
+                fields = {str(row[key]).upper() for key in endpoints if row.get(key)}
+                def named(value, tokens):
+                    return value in tokens or ('/' in value and set(value.split('/')) <= tokens)
+                if fields and any(all(named(value, tokens) for value in fields) for tokens in clauses):
+                    continue
+                missing.add(name)
+                continue
+            fields = {str(row[key]).upper() for key in ('job', 'step', 'ddname', 'dsn')
+                      if row.get(key) not in (None, '')}
+            if not any(name.upper() in tokens or (fields and fields <= tokens)
+                       for tokens in clauses):
+                missing.add(name)
+        return sorted(missing)
+    tokens = {token.rstrip('.') for token in re.findall(r'[A-Za-z0-9_$#@.-]+', answer.upper())}
     return sorted(name for name in names if name.upper() not in tokens)
 
 
@@ -937,6 +995,8 @@ Ordinal ranges preserve both offset and limit: sixth through tenth is offset=5, 
 Distinguish existence from enumeration: asking whether files are available is output=summary,
 not an exhaustive list. Questions about your capabilities are scope=general, output=summary;
 Asking what/which files are available requests output=list, not a sample or summary.
+How many analyzed files asks for a corpus count of source members, not the number of programs;
+do not inherit a program restriction from an earlier unrelated question.
 questions about particular program contents still require corpus evidence. Social requests
 and general questions must not inherit a previous technical topic.
 Preserve caller -> target meaning in the standalone question.
@@ -1291,7 +1351,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                 if request and call.get('tool') == 'describe' and request.get('depth') == 'detailed':
                     call['args']['depth'] = 'detailed'
                 if request and request.get('output') == 'list' and call.get('tool') in {
-                        'query', 'select', 'compare', 'inventory', 'files', 'copybooks', 'callees', 'callers'}:
+                        'query', 'select', 'compare', 'compare_programs', 'inventory', 'files', 'copybooks', 'callees', 'callers'}:
                     # Transport pages are not the requested answer size. Supply
                     # a useful bounded page for a list instead of count-only data.
                     args = call['args']
@@ -1301,8 +1361,12 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                                    and len(args.get('programs') or tools.programs) > 2)
                     needed = 25 if broad_files else min(request.get('limit') or 100, 100)
                     args['limit'] = needed if broad_files else max(args.get('limit', needed), needed)
+                if request and request.get('output') == 'count' and (
+                        call.get('tool') == 'files' or
+                        (call.get('tool') == 'query' and call['args'].get('table') == 'files')):
+                    call['args']['limit'] = 0
                 if request and request.get('output') != 'count' and call.get('tool') in {
-                        'variable_access', 'flow_edges', 'query', 'callees', 'callers', 'select', 'compare', 'compare_groups', 'copybooks', 'files', 'inventory'} and call['args'].get('limit') == 0:
+                        'variable_access', 'flow_edges', 'query', 'callees', 'callers', 'select', 'compare', 'compare_groups', 'compare_programs', 'copybooks', 'files', 'inventory'} and call['args'].get('limit') == 0:
                     # Access counts cannot explain locations, conditions or
                     # propagation. Preserve the predicates but include rows.
                     call['args']['limit'] = 100

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 
@@ -90,6 +91,7 @@ TABLES = {
     'cics': ('architecture.cics_operations.json', 'content.operations'),
     'jcl_jobs': ('jcl.file_io.json', 'content.matching_jobs'),
     'jcl_steps': ('jcl.file_io.json', 'content.matching_steps'),
+    'jcl_datasets': ('jcl.file_io.json', ''),
     'jcl_reads': ('jcl.file_io.json', 'content.reads'),
     'jcl_writes': ('jcl.file_io.json', 'content.writes'),
     'jcl_sysout': ('jcl.file_io.json', 'content.sysout'),
@@ -188,20 +190,37 @@ class EvidenceTools:
         root = self.root(program)
         if table in {'files', 'source', 'paragraphs'}:
             self.path(program, 'program.source_lines.jsonl')
-            raw = source_semantics(artifacts._read_source_lines(root, program))
+            artifact = 'program.source_lines.jsonl'
+            if table == 'files':
+                # The source-map generator already records this inventory.
+                # A corpus-wide count must not parse every physical source line.
+                try:
+                    meta = self.load(program, 'program.source_lines.meta.json')
+                    members = meta.get('files', []) if isinstance(meta, dict) else []
+                    if (isinstance(members, list) and members and all(
+                            isinstance(item, dict) and isinstance(item.get('source_file'), str)
+                            and item['source_file'] and type(item.get('line_count')) is int
+                            and item['line_count'] > 0 for item in members)
+                            and len({item['source_file'] for item in members}) == len(members)):
+                        counts = {item['source_file']: item['line_count'] for item in members}
+                    else:
+                        counts = {}
+                except (ToolError, OSError, ValueError):
+                    counts = {}
+                if not counts:
+                    counts = Counter(r['source_file'] for r in artifacts._read_source_lines(root, program))
+                raw = [{'name': name, 'source_file': name, 'extension': Path(name).suffix,
+                        'recorded_lines': count} for name, count in sorted(counts.items())]
+            else:
+                raw = source_semantics(artifacts._read_source_lines(root, program))
             if not raw:
                 raise ToolError('Analysis gap: physical source map unavailable.')
-            artifact = 'program.source_lines.jsonl'
             if table == 'paragraphs':
                 names = sorted({(r['source_file'], r.get('paragraph')) for r in raw
                                 if r.get('paragraph') and r.get('paragraph') != program
                                 and r.get('division') == 'PROCEDURE DIVISION'
                                 and r['source_file'].upper() == program + '.CBL'})
                 raw = [{'name': name, 'source_file': source} for source, name in names]
-            if table == 'files':
-                names = sorted({r['source_file'] for r in raw})
-                raw = [{'name': n, 'source_file': n, 'extension': Path(n).suffix,
-                        'recorded_lines': sum(r['source_file'] == n for r in raw)} for n in names]
         elif table in {'summary', 'metrics'}:
             artifact = 'program.summary.json'
             summary = self.load(program, artifact)
@@ -245,6 +264,12 @@ class EvidenceTools:
                        for call in raw for detail in call.get('parameter_details', [])
                        for variable in detail.get('variables', [])
                        for site in variable.get('writes_before_call', [])]
+            elif table == 'jcl_datasets':
+                content = payload.get('content', {})
+                raw = [dict(row, name=row['dsn'], access_type=row.get('access_type') or access)
+                       for bucket, access in (('reads', 'read'), ('writes', 'write'),
+                           ('unknowns', 'unknown'), ('deletes', 'delete'), ('sysout', 'sysout'))
+                       for row in content.get(bucket, []) if isinstance(row, dict) and row.get('dsn')]
             elif table == 'copybooks':
                 classifications = payload.get('content', {}).get('classified', {})
                 raw = [dict(row, categories=[category for category, members in classifications.items()
@@ -287,11 +312,13 @@ class EvidenceTools:
         result = []
         for item in raw:
             row = dict(item) if isinstance(item, dict) else {'name': str(item)}
-            if table.startswith('jcl_'):
+            if table.startswith('jcl_') and table != 'jcl_datasets':
                 # A stable member identity is needed for list validation and paging.
                 # The table name alone would collapse every DD/step into one member.
                 row['name'] = '/'.join(str(row[key]) for key in ('job', 'step', 'ddname', 'dsn')
                                      if row.get(key) not in (None, '')) or str(row.get('source') or table)
+            if table.startswith('jcl_') and isinstance(row.get('source'), str) and row['source']:
+                row.setdefault('source_file', Path(row['source'].replace('\\', '/')).name)
             if table == 'variable_access' and isinstance(row.get('line_start'), int) and row['line_start'] < 1:
                 row['recorded_line_start'] = row['line_start']
                 row['line_start'] = None
@@ -761,11 +788,20 @@ class EvidenceTools:
             target = args.pop('target')
             return self.execute('query', {**args, 'programs': args.get('programs') or list(self.programs),
                 'table': 'calls', 'where': [{'field': 'target', 'op': 'in' if isinstance(target, list) else 'eq', 'value': target}]})
-        if tool in {'connections', 'inventory', 'query', 'select', 'compare', 'compare_groups'}:
+        if tool in {'connections', 'inventory', 'query', 'select', 'compare', 'compare_groups', 'compare_programs'}:
             if any(k in args for k in ('parent', 'left', 'right', 'displayed_ids')):
                 raise ToolError('Internal replay fields cannot be supplied by the model.')
+            direct = tool == 'compare_programs'
             grouped = tool == 'compare_groups'
-            if grouped:
+            if direct:
+                def program_query(owner):
+                    return {'tool': 'query', 'args': {'programs': [owner], 'table': args['table'],
+                                                    'where': args.get('where', [])}}
+                args = {'left': program_query(args['left_value']), 'right': program_query(args['right_value']),
+                        'operation': args['operation'], 'field': args.get('field', 'name'),
+                        'offset': args.get('offset', 0), 'limit': args.get('limit', 100)}
+                tool = 'compare'
+            elif grouped:
                 saved = self.saved(args['result_id'])
                 rows, _ = self.evaluate(saved['recipe'])
                 key = args['group_by']
@@ -784,7 +820,7 @@ class EvidenceTools:
                     raise ToolError('Select basis must be collection or displayed.')
                 args['parent'] = saved['recipe']
                 args['displayed_ids'] = saved['displayed_ids']
-            if tool == 'compare' and not grouped:
+            if tool == 'compare' and not (grouped or direct):
                 args['left'] = self.saved(args.pop('left_id', ''))['recipe']
                 args['right'] = self.saved(args.pop('right_id', ''))['recipe']
             offset, limit = args.pop('offset', 0), args.pop('limit', 100)
@@ -830,6 +866,19 @@ class EvidenceTools:
                 'edges': 'Static graph edges. Use source_operation/evidence for COBOL verbs; graph CALL can mean PERFORM. No runtime feasibility proof.',
                 'calls': 'Recorded caller-to-target relationships within this query scope. If total_matches=0, there are no matching call parameters to report in this scope.',
             }.get(table, 'Only the recorded facts and applied predicates in this collection are established.')
+            if tool == 'query' and table and table.startswith('jcl_'):
+                summary['source_artifacts'] = ['jcl.file_io.json']
+                summary['programs'] = sorted({program.upper() for program in args['programs']})
+                summary['evidence_scope'] = ('Recorded JCL links and DD evidence only. No matching rows does not '
+                    'prove that a program never runs in JCL or that no JCL was supplied.')
+                summary['jcl_coverage'] = []
+                for program in summary['programs']:
+                    content = self.load(program, 'jcl.file_io.json').get('content', {})
+                    jobs = content.get('known_jobs')
+                    steps = content.get('matching_steps')
+                    summary['jcl_coverage'].append({'program': program,
+                        'known_jobs': len(jobs) if isinstance(jobs, list) else None,
+                        'linked_steps': len(steps) if isinstance(steps, list) else None})
             result = {'result_id': rid, 'unit': unit, 'relation': relation,
                     'offset': offset, 'evidence_scope': summary['evidence_scope'],
                     'total_matches': len(rows), 'returned': len(shown),
@@ -845,6 +894,8 @@ class EvidenceTools:
                     'known_jcl_jobs': len(summary['known_jcl_jobs']),
                     'jobs_without_analyzed_program_link': len(summary['jobs_without_analyzed_program_link'])}
                 result['limitations'] = summary['limitations']
+            if 'jcl_coverage' in summary:
+                result['jcl_coverage'] = summary['jcl_coverage']
             if tool == 'query' and table == 'variable_access':
                 # Bounded, explicitly labelled windows, not guessed full statements.
                 # The model can expand these through source when a branch is longer.

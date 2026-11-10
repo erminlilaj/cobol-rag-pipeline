@@ -419,6 +419,78 @@ def test_jcl_tables_keep_step_and_dataset_provenance(monkeypatch):
     assert tools.rows('A', 'jcl_writes') == []
 
 
+@pytest.mark.parametrize('suffix', ['', ' Cite the JCL source.'])
+def test_jcl_job_step_prose_passes_collection_validation(monkeypatch, suffix):
+    monkeypatch.setattr('cobol_rag.investigation_tools.artifacts.analyzed_programs', lambda: ('A',))
+    monkeypatch.setattr(EvidenceTools, 'root', lambda self, program: __import__('pathlib').Path('/tmp'))
+    monkeypatch.setattr(EvidenceTools, 'load', lambda self, program, artifact: {
+        'content': {'matching_steps': [dict(job='MYJOB', step='PROC.RUN', program='A',
+            source='/jcl/MYJOB.JCL', source_lines=[29, 30])], 'known_jobs': ['MYJOB']}})
+    question = 'Which JCL job and step execute A?' + suffix
+    budget = FakeBudget([
+        dict(action='tools', calls=[dict(tool='query', args=dict(table='jcl_steps',
+            where=[dict(field='program', op='eq', value='A')]))]),
+        dict(action='final', mode='technical', status='complete',
+             answer='Job MYJOB runs A in step PROC.RUN (MYJOB.JCL, lines 29–30) [E2].',
+             evidence_ids=['E2']),
+        dict(passed=True, issues=[]),
+    ])
+    result = investigate(question, AppConfig(), budget=budget,
+        resolved_request=dict(resolved_question=question, scope='corpus', output='list', limit=None))
+    assert result['status'] == 'complete', result.get('trace')
+    assert result['tools'].evidence['E2']['source_file'] == 'MYJOB.JCL'
+    from cobol_rag.investigation import missing_collection_members
+    bundle = result['tools'].evidence['E1']
+    assert missing_collection_members(bundle, 'MYJOB and the wrong step OTHER.RUN') == ['MYJOB/PROC.RUN']
+    assert missing_collection_members(bundle, 'MYJOB/PROC.RUN') == []
+
+
+def test_jcl_dataset_table_keeps_unknown_direction_and_empty_coverage(monkeypatch):
+    monkeypatch.setattr('cobol_rag.investigation_tools.artifacts.analyzed_programs', lambda: ('A', 'B'))
+    monkeypatch.setattr(EvidenceTools, 'root', lambda self, program: __import__('pathlib').Path('/tmp'))
+    monkeypatch.setattr(EvidenceTools, 'load', lambda self, program, artifact: {'content': {
+        'known_jobs': ['JOB'], 'matching_steps': [{'job': 'JOB'}] if program == 'A' else [],
+        'reads': [dict(job='JOB', step='RUN', ddname='INPUT', dsn='DATA.IN')] if program == 'A' else [],
+        'unknowns': [dict(job='JOB', step='RUN', ddname='MAYBE', dsn='DATA.MAYBE')] if program == 'A' else [],
+        'sysout': [dict(job='JOB', step='RUN', ddname='PRINT', sysout='*')] if program == 'A' else [],
+    }})
+    tools = EvidenceTools(AppConfig())
+    result = tools.execute('query', dict(table='jcl_datasets', programs=['A', 'B']))
+    assert [(row['name'], row['access_type']) for row in result['rows']] == [
+        ('DATA.IN', 'read'), ('DATA.MAYBE', 'unknown')]
+    assert result['jcl_coverage'] == [dict(program='A', known_jobs=1, linked_steps=1),
+                                     dict(program='B', known_jobs=1, linked_steps=0)]
+    empty = tools.execute('query', dict(table='jcl_datasets', programs=['B']))
+    assert empty['total_matches'] == 0 and empty['jcl_coverage'][0]['known_jobs'] == 1
+
+
+def test_compare_programs_needs_no_result_handles(evidence, monkeypatch):
+    monkeypatch.setattr(evidence, 'rows', lambda program, table: [
+        dict(name=name, program=program, _artifact=table, _row_id=f'{program}:{name}')
+        for name in ('SHARED', f'{program}-ONLY')])
+    result = evidence.execute('compare_programs', dict(table='copybooks', left_value='A',
+        right_value='B', operation='intersection'))
+    assert [row['name'] for row in result['rows']] == ['SHARED']
+    assert {member['program'] for member in result['rows'][0]['members']} == {'A', 'B'}
+
+
+def test_corpus_file_count_uses_source_map_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr('cobol_rag.investigation_tools.artifacts.analyzed_programs', lambda: ('A', 'B'))
+    monkeypatch.setattr(EvidenceTools, 'root', lambda self, program: tmp_path)
+    monkeypatch.setattr(EvidenceTools, 'path', lambda self, program, artifact: tmp_path / artifact)
+    monkeypatch.setattr(EvidenceTools, 'load', lambda self, program, artifact: {'files': [
+        dict(source_file=f'{program}.CBL', line_count=100),
+        dict(source_file='COMMON.CPY', line_count=10)]})
+    def no_full_scan(*args):
+        pytest.fail('The full source map should not be scanned for a count.')
+    monkeypatch.setattr('cobol_rag.investigation_tools.artifacts._read_source_lines', no_full_scan)
+    tools = EvidenceTools(AppConfig())
+    decision = normalize_decision(dict(action='query', args=dict(table='files', limit=0)), tools)
+    call = decision['calls'][0]
+    result = tools.execute(call['tool'], call['args'])
+    assert (result['unit'], result['total_matches'], result['returned']) == ('source members per program', 4, 0)
+
+
 def test_corpus_connections_filter_and_cover_missing_analysis(monkeypatch, tmp_path):
     from pathlib import Path
     root = Path(tmp_path)
@@ -441,6 +513,9 @@ def test_corpus_connections_filter_and_cover_missing_analysis(monkeypatch, tmp_p
     summary = tools.evidence[result['collection_evidence_id']]
     assert summary['coverage']['B']['architecture.call_parameters.json'] == 'missing'
     assert summary['jobs_without_analyzed_program_link'] == ['UNLINKED']
+    from cobol_rag.investigation import missing_collection_members
+    assert missing_collection_members(summary, 'A calls B.') == []
+    assert missing_collection_members(summary, 'A calls C.') == ['program_call:A->B']
 
 
 def test_social_claim_failure_can_rewrite_without_tools(evidence):

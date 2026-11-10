@@ -462,6 +462,7 @@ h1 {
 
 .waiting-game-tabs {
     display: flex;
+    flex-wrap: wrap;
     gap: 7px;
     margin: 12px 0 9px;
 }
@@ -486,7 +487,9 @@ h1 {
 
 .waiting-game-tab:focus-visible,
 .bug-cell:focus-visible,
-.memory-card:focus-visible {
+.memory-card:focus-visible,
+.game-control:focus-visible,
+.waiting-game-panel:focus-visible {
     outline: 2px solid var(--accent-2);
     outline-offset: 2px;
 }
@@ -566,6 +569,40 @@ h1 {
     background: rgba(92, 200, 167, 0.14);
     color: #8ce2c8;
     cursor: default;
+}
+
+.dino-canvas,
+.snake-canvas {
+    display: block;
+    width: 100%;
+    max-width: 460px;
+    height: auto;
+    margin: 0 auto 9px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    image-rendering: pixelated;
+}
+
+.snake-canvas { max-width: 400px; }
+
+.game-control {
+    min-height: 32px;
+    font-size: 0.8rem;
+}
+
+.snake-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    justify-content: center;
+}
+
+.snake-controls .game-control {
+    width: 42px;
+}
+
+.snake-controls .snake-restart {
+    width: auto;
 }
 
 @keyframes target-pulse {

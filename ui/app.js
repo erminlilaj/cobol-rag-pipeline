@@ -491,6 +491,11 @@ function createWaitingExperience() {
         memoryMatched: new Set(),
         memoryLocked: false,
         memoryMoves: 0,
+        dino: {running: false, over: false, y: 0, velocity: 0, obstacles: [420], score: 0},
+        snake: {running: false, over: false, body: [{x: 5, y: 5}, {x: 4, y: 5}],
+            direction: {x: 1, y: 0}, nextDirection: {x: 1, y: 0}, food: {x: 12, y: 5}, score: 0},
+        dinoCanvas: null,
+        snakeCanvas: null,
         destroyed: false,
         timeouts: new Set(),
     };
@@ -508,6 +513,8 @@ function createWaitingExperience() {
         [
             ['bug', 'Bug Hunt'],
             ['memory', 'COBOL Match'],
+            ['dino', 'Dino Run'],
+            ['snake', 'Snake'],
         ].forEach(([game, label]) => {
             const button = document.createElement('button');
             const selected = gameState.activeGame === game;
@@ -520,6 +527,7 @@ function createWaitingExperience() {
                 gameState.activeGame = game;
                 renderTabs();
                 renderGame();
+                if (game === 'dino' || game === 'snake') panel.focus();
             });
             tabs.appendChild(button);
         });
@@ -615,12 +623,204 @@ function createWaitingExperience() {
         renderMemory();
     }
 
-    function renderGame() {
-        if (gameState.activeGame === 'memory') {
-            renderMemory();
-        } else {
-            renderBugHunt();
+    function drawDino() {
+        const canvas = gameState.dinoCanvas;
+        if (!canvas?.isConnected || gameState.activeGame !== 'dino') return;
+        const ctx = canvas.getContext('2d');
+        const dino = gameState.dino;
+        ctx.fillStyle = '#f3f4f2';
+        ctx.fillRect(0, 0, 460, 160);
+        ctx.fillStyle = '#323b43';
+        ctx.fillRect(0, 125, 460, 2);
+        ctx.fillRect(51, 99 - dino.y, 23, 26);
+        ctx.fillRect(68, 103 - dino.y, 11, 6);
+        ctx.fillRect(45, 112 - dino.y, 8, 5);
+        ctx.fillRect(55, 125 - dino.y, 5, 8);
+        ctx.fillRect(68, 125 - dino.y, 5, 8);
+        ctx.fillStyle = '#f3f4f2';
+        ctx.fillRect(68, 104 - dino.y, 3, 3);
+        ctx.fillStyle = '#323b43';
+        for (const x of dino.obstacles) {
+            ctx.fillRect(x + 6, 99, 8, 26);
+            ctx.fillRect(x, 108, 7, 5);
+            ctx.fillRect(x + 17, 104, 6, 5);
         }
+        ctx.font = 'bold 16px monospace';
+        ctx.fillText(`HI ${String(dino.score).padStart(5, '0')}`, 326, 25);
+        if (!dino.running) {
+            ctx.textAlign = 'center';
+            ctx.font = 'bold 19px monospace';
+            ctx.fillText(dino.over ? 'GAME OVER' : 'DINO RUN', 230, 75);
+            ctx.textAlign = 'left';
+        }
+    }
+
+    function jumpDino() {
+        const dino = gameState.dino;
+        if (dino.over) Object.assign(dino, {running: false, over: false, y: 0,
+            velocity: 0, obstacles: [420], score: 0});
+        dino.running = true;
+        if (dino.y === 0) dino.velocity = 11;
+        drawDino();
+    }
+
+    function renderDino() {
+        panel.innerHTML = '';
+        const status = document.createElement('div');
+        status.className = 'waiting-game-status';
+        status.innerHTML = '<span>Jump over the cacti · Space or ↑</span>';
+        const canvas = document.createElement('canvas');
+        canvas.className = 'dino-canvas';
+        canvas.width = 460;
+        canvas.height = 160;
+        canvas.setAttribute('aria-label', 'Dino runner game');
+        const jump = document.createElement('button');
+        jump.type = 'button';
+        jump.className = 'btn secondary-btn game-control';
+        jump.textContent = gameState.dino.over ? 'Restart Dino' : 'Jump';
+        jump.addEventListener('click', jumpDino);
+        gameState.dinoCanvas = canvas;
+        panel.append(status, canvas, jump);
+        drawDino();
+    }
+
+    function tickDino() {
+        const dino = gameState.dino;
+        if (gameState.activeGame !== 'dino' || !dino.running) return;
+        dino.y = Math.max(0, dino.y + dino.velocity);
+        dino.velocity = dino.y ? dino.velocity - 0.7 : 0;
+        dino.obstacles = dino.obstacles.map(x => x - 5);
+        if (dino.obstacles[0] < -24) {
+            dino.obstacles.shift();
+            dino.score += 1;
+        }
+        if (!dino.obstacles.length || dino.obstacles[dino.obstacles.length - 1] < 230) {
+            dino.obstacles.push(460 + Math.floor(Math.random() * 90));
+        }
+        if (dino.obstacles.some(x => x < 79 && x + 23 > 51 && dino.y < 27)) {
+            dino.running = false;
+            dino.over = true;
+            renderDino();
+        } else {
+            drawDino();
+        }
+    }
+
+    function drawSnake() {
+        const canvas = gameState.snakeCanvas;
+        if (!canvas?.isConnected || gameState.activeGame !== 'snake') return;
+        const ctx = canvas.getContext('2d');
+        const snake = gameState.snake;
+        ctx.fillStyle = '#f3f4f2';
+        ctx.fillRect(0, 0, 400, 200);
+        ctx.fillStyle = '#4b8b78';
+        snake.body.forEach(({x, y}) => ctx.fillRect(x * 20 + 1, y * 20 + 1, 18, 18));
+        ctx.fillStyle = '#c75858';
+        ctx.fillRect(snake.food.x * 20 + 2, snake.food.y * 20 + 2, 16, 16);
+        if (!snake.running) {
+            ctx.fillStyle = '#27313a';
+            ctx.font = 'bold 18px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText(snake.over ? 'GAME OVER' : 'SNAKE', 200, 94);
+            ctx.textAlign = 'left';
+        }
+    }
+
+    function steerSnake(x, y) {
+        const snake = gameState.snake;
+        if (snake.over) return;
+        if (x === -snake.direction.x && y === -snake.direction.y) return;
+        snake.nextDirection = {x, y};
+        snake.running = true;
+        drawSnake();
+    }
+
+    function renderSnake() {
+        panel.innerHTML = '';
+        const status = document.createElement('div');
+        status.className = 'waiting-game-status';
+        status.innerHTML = `<span>Collect the red squares · arrow keys</span><strong>Score: ${gameState.snake.score}</strong>`;
+        const canvas = document.createElement('canvas');
+        canvas.className = 'snake-canvas';
+        canvas.width = 400;
+        canvas.height = 200;
+        canvas.setAttribute('aria-label', 'Snake game board');
+        const controls = document.createElement('div');
+        controls.className = 'snake-controls';
+        [['↑', 0, -1], ['←', -1, 0], ['↓', 0, 1], ['→', 1, 0]].forEach(([label, x, y]) => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'btn secondary-btn game-control';
+            button.textContent = label;
+            button.setAttribute('aria-label', `Move ${label}`);
+            button.addEventListener('click', () => steerSnake(x, y));
+            controls.appendChild(button);
+        });
+        if (gameState.snake.over) {
+            const restart = document.createElement('button');
+            restart.type = 'button';
+            restart.className = 'btn secondary-btn game-control snake-restart';
+            restart.textContent = 'Restart';
+            restart.addEventListener('click', () => {
+                gameState.snake = {running: false, over: false, body: [{x: 5, y: 5}, {x: 4, y: 5}],
+                    direction: {x: 1, y: 0}, nextDirection: {x: 1, y: 0}, food: {x: 12, y: 5}, score: 0};
+                renderSnake();
+            });
+            controls.appendChild(restart);
+        }
+        gameState.snakeCanvas = canvas;
+        panel.append(status, canvas, controls);
+        drawSnake();
+    }
+
+    function tickSnake() {
+        const snake = gameState.snake;
+        if (gameState.activeGame !== 'snake' || !snake.running) return;
+        snake.direction = snake.nextDirection;
+        const head = {x: snake.body[0].x + snake.direction.x, y: snake.body[0].y + snake.direction.y};
+        const eating = head.x === snake.food.x && head.y === snake.food.y;
+        const occupied = eating ? snake.body : snake.body.slice(0, -1);
+        if (head.x < 0 || head.x >= 20 || head.y < 0 || head.y >= 10 ||
+            occupied.some(part => part.x === head.x && part.y === head.y)) {
+            snake.running = false;
+            snake.over = true;
+            renderSnake();
+            return;
+        }
+        snake.body.unshift(head);
+        if (eating) {
+            snake.score += 1;
+            const free = [];
+            for (let y = 0; y < 10; y += 1) for (let x = 0; x < 20; x += 1) {
+                if (!snake.body.some(part => part.x === x && part.y === y)) free.push({x, y});
+            }
+            if (free.length) snake.food = free[Math.floor(Math.random() * free.length)];
+            else { snake.running = false; snake.over = true; }
+            renderSnake();
+        } else {
+            snake.body.pop();
+            drawSnake();
+        }
+    }
+
+    panel.tabIndex = 0;
+    panel.addEventListener('keydown', event => {
+        if (gameState.activeGame === 'dino' && (event.key === ' ' || event.key === 'ArrowUp')) {
+            event.preventDefault();
+            jumpDino();
+        }
+        if (gameState.activeGame === 'snake') {
+            const direction = {ArrowUp: [0, -1], ArrowDown: [0, 1],
+                ArrowLeft: [-1, 0], ArrowRight: [1, 0]}[event.key];
+            if (direction) { event.preventDefault(); steerSnake(...direction); }
+        }
+    });
+
+    function renderGame() {
+        if (gameState.activeGame === 'memory') renderMemory();
+        else if (gameState.activeGame === 'dino') renderDino();
+        else if (gameState.activeGame === 'snake') renderSnake();
+        else renderBugHunt();
     }
 
     renderTabs();
@@ -638,12 +838,16 @@ function createWaitingExperience() {
         }
         moveBug();
     }, 1350);
+    const dinoInterval = setInterval(tickDino, 40);
+    const snakeInterval = setInterval(tickSnake, 145);
 
     function destroy() {
         if (gameState.destroyed) return;
         gameState.destroyed = true;
         clearInterval(elapsedInterval);
         clearInterval(bugInterval);
+        clearInterval(dinoInterval);
+        clearInterval(snakeInterval);
         gameState.timeouts.forEach(timeout => clearTimeout(timeout));
         gameState.timeouts.clear();
     }

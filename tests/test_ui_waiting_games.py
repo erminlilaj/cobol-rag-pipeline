@@ -14,12 +14,16 @@ class WaitingGamesAssetTest(unittest.TestCase):
         cls.api = (root / "src" / "cobol_rag" / "api.py").read_text(encoding="utf-8")
         cls.chat = (root / "src" / "cobol_rag" / "chat.py").read_text(encoding="utf-8")
 
-    def test_two_games_are_available_in_the_waiting_component(self) -> None:
+    def test_four_games_are_available_in_the_waiting_component(self) -> None:
         self.assertIn("function createWaitingExperience()", self.script)
         self.assertIn("Bug Hunt", self.script)
         self.assertIn("COBOL Match", self.script)
         self.assertIn("Catch the moving bug.", self.script)
         self.assertIn("Match the COBOL keywords.", self.script)
+        self.assertIn("Dino Run", self.script)
+        self.assertIn("Snake", self.script)
+        self.assertIn("function tickDino()", self.script)
+        self.assertIn("function tickSnake()", self.script)
 
     def test_waiting_component_is_always_destroyed_however_the_request_ends(self) -> None:
         # The component belongs to one request, so it now lives in askOne. The
@@ -73,9 +77,13 @@ class WaitingGamesAssetTest(unittest.TestCase):
             ".bug-grid",
             ".memory-grid",
             ".memory-card.matched",
+            ".dino-canvas",
+            ".snake-canvas",
         ):
             self.assertIn(selector, self.styles)
         self.assertIn("@media (prefers-reduced-motion: reduce)", self.styles)
+        self.assertIn("clearInterval(dinoInterval)", self.script)
+        self.assertIn("clearInterval(snakeInterval)", self.script)
 
     def test_ui_assets_are_versioned_and_served_without_stale_browser_caching(self) -> None:
         self.assertIn("style.css?v=waiting-games-", self.index)

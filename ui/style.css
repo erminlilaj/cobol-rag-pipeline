@@ -754,6 +754,72 @@ h1 {
     color: var(--text);
 }
 
+.batch-open-btn {
+    width: auto;
+    min-height: 48px;
+    flex: none;
+    white-space: nowrap;
+}
+
+.batch-dialog {
+    width: min(680px, calc(100% - 28px));
+    max-height: calc(100dvh - 28px);
+    padding: 20px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: var(--shadow);
+}
+
+.batch-dialog::backdrop {
+    background: rgba(0, 0, 0, 0.58);
+}
+
+.batch-dialog h2 {
+    margin: 0 0 8px;
+    font-size: 1.15rem;
+}
+
+#batch-help, #batch-count {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.9rem;
+}
+
+#batch-input {
+    display: block;
+    width: 100%;
+    min-height: 125px;
+    max-height: 48vh;
+    margin: 14px 0;
+    padding: 12px;
+    resize: vertical;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--text);
+}
+
+.batch-footer, .batch-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.batch-footer {
+    justify-content: space-between;
+}
+
+.batch-actions .btn {
+    width: auto;
+}
+
+.batch-actions .btn:disabled {
+    cursor: not-allowed;
+}
+
 .send-btn {
     width: 48px;
     height: 48px;

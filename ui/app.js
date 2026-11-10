@@ -8,6 +8,10 @@ const stopButton = document.getElementById('stop-btn');
 const queueBar = document.getElementById('queue-bar');
 const queueStatus = document.getElementById('queue-status');
 const queueList = document.getElementById('queue-list');
+const batchDialog = document.getElementById('batch-dialog');
+const batchInput = document.getElementById('batch-input');
+const batchCount = document.getElementById('batch-count');
+const batchRunButton = document.getElementById('batch-run-btn');
 const statusIndicator = document.getElementById('status-indicator');
 const collectionLabel = document.getElementById('collection-label');
 const treeFilter = document.getElementById('tree-filter');
@@ -655,7 +659,7 @@ let runningRequest = null;
 
 function splitQuestions(text) {
     return text
-        .split('\n')
+        .split(/\r\n|\n|\r/)
         .map(line => line.trim())
         .filter(Boolean);
 }
@@ -737,13 +741,9 @@ async function drainQueue() {
     }
 }
 
-async function sendMessage() {
-    const questions = splitQuestions(chatInput.value);
+async function enqueueQuestions(questions) {
     if (!questions.length) return;
-
-    chatInput.value = '';
-    chatInput.style.height = 'auto';
-    pendingQuestions.push(...questions);
+    pendingQuestions = pendingQuestions.concat(questions);
     renderQueue();
 
     // Already draining means this batch was appended to the running queue and
@@ -751,6 +751,37 @@ async function sendMessage() {
     if (runningRequest || sendButton.hidden) return;
     await drainQueue();
 }
+
+async function sendMessage() {
+    const questions = splitQuestions(chatInput.value);
+    if (!questions.length) return;
+    chatInput.value = '';
+    chatInput.style.height = 'auto';
+    await enqueueQuestions(questions);
+}
+
+function updateBatchCount() {
+    const count = splitQuestions(batchInput.value).length;
+    batchCount.textContent = `${count} question${count === 1 ? '' : 's'}`;
+    batchRunButton.disabled = count === 0;
+}
+
+document.getElementById('open-batch-btn').addEventListener('click', () => {
+    updateBatchCount();
+    batchDialog.showModal();
+});
+batchInput.addEventListener('input', updateBatchCount);
+document.getElementById('batch-cancel-btn').addEventListener('click', () => batchDialog.close());
+document.getElementById('batch-form').addEventListener('submit', event => {
+    event.preventDefault();
+    if (!batchDialog.open) return;
+    const questions = splitQuestions(batchInput.value);
+    if (!questions.length) return;
+    batchInput.value = '';
+    updateBatchCount();
+    batchDialog.close();
+    void enqueueQuestions(questions);
+});
 
 async function stopChat() {
     if (runningRequest) {

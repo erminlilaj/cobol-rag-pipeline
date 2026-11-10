@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>COBOL RAG Pipeline</title>
-    <link rel="stylesheet" href="style.css?v=waiting-games-stop-and-queue-20260824">
+    <link rel="stylesheet" href="style.css?v=waiting-games-batch-questions-20261110">
 </head>
 <body>
     <div class="app-container">
@@ -87,7 +87,8 @@
             </div>
 
             <div class="chat-input-container">
-                <textarea id="chat-input" placeholder="Ask a question — or put one question per line to queue several." rows="1" onkeydown="handleEnter(event)"></textarea>
+                <textarea id="chat-input" placeholder="Ask a question" aria-label="Ask a question" rows="1" onkeydown="handleEnter(event)"></textarea>
+                <button id="open-batch-btn" type="button" class="btn secondary-btn batch-open-btn" aria-haspopup="dialog" aria-controls="batch-dialog">Paste questions</button>
                 <button id="send-btn" class="send-btn" onclick="sendMessage()" title="Send (Shift+Enter for a new line)">
                     <span>➤</span>
                 </button>
@@ -96,6 +97,21 @@
                 </button>
             </div>
         </main>
+
+        <dialog id="batch-dialog" class="batch-dialog" aria-labelledby="batch-title" aria-describedby="batch-help">
+            <form id="batch-form">
+                <h2 id="batch-title">Paste questions</h2>
+                <p id="batch-help">Paste one question per line. Blank lines are ignored. Questions run in order in this chat.</p>
+                <textarea id="batch-input" aria-label="Questions, one per line" aria-describedby="batch-help" rows="12" autofocus></textarea>
+                <div class="batch-footer">
+                    <p id="batch-count" aria-live="polite">0 questions</p>
+                    <div class="batch-actions">
+                        <button id="batch-cancel-btn" class="btn secondary-btn" type="button">Cancel</button>
+                        <button id="batch-run-btn" class="btn primary-btn" type="submit" disabled>Run questions</button>
+                    </div>
+                </div>
+            </form>
+        </dialog>
 
         <div id="modal" class="modal">
             <div class="modal-content">
@@ -107,6 +123,6 @@
         </div>
     </div>
     <script src="chat-export.js?v=chat-export-20260924"></script>
-    <script src="app.js?v=chat-export-20260924"></script>
+    <script src="app.js?v=batch-questions-20261110"></script>
 </body>
 </html>

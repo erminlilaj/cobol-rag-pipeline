@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 
 import chromadb
@@ -11,8 +13,27 @@ from llama_index.core.schema import Document, TextNode
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.chroma import ChromaVectorStore
+from pydantic import PrivateAttr
 
 from cobol_rag.config import AppConfig
+
+Measure = Callable[[str], AbstractContextManager[None]]
+
+
+class _TimedEmbedding(OllamaEmbedding):
+    _measure: Measure = PrivateAttr()
+
+    def get_text_embedding_batch(self, texts, show_progress=False, **kwargs):
+        with self._measure("embed via Ollama"):
+            return super().get_text_embedding_batch(texts, show_progress=show_progress, **kwargs)
+
+
+class _TimedChromaStore(ChromaVectorStore):
+    _measure: Measure = PrivateAttr()
+
+    def add(self, nodes, **kwargs):
+        with self._measure("write vectors to Chroma"):
+            return super().add(nodes, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -28,6 +49,7 @@ class IndexResources:
     chroma_collection: Collection
     vector_store: ChromaVectorStore
     index: VectorStoreIndex
+    measure: Measure | None = None
 
 
 def build_llm(
@@ -98,33 +120,40 @@ def build_embedder(config: AppConfig) -> OllamaEmbedding:
     )
 
 
-def configure_llamaindex(config: AppConfig) -> LlamaIndexRuntime:
+def configure_llamaindex(config: AppConfig, *, measure: Measure | None = None) -> LlamaIndexRuntime:
     """Configure LlamaIndex global settings from the project config."""
     if config.embedding.provider != "ollama":
         raise ValueError(f"Unsupported embedding provider: {config.embedding.provider}")
 
     llm = build_llm(config)
-    embed_model = OllamaEmbedding(
+    embedder_class = _TimedEmbedding if measure is not None else OllamaEmbedding
+    embed_model = embedder_class(
         model_name=config.embedding.model,
         base_url=config.embedding.base_url,
         embed_batch_size=config.index.batch_size,
     )
+    if isinstance(embed_model, _TimedEmbedding) and measure is not None:
+        embed_model._measure = measure
 
     Settings.llm = llm
     Settings.embed_model = embed_model
     return LlamaIndexRuntime(llm=llm, embed_model=embed_model)
 
 
-def open_index(config: AppConfig) -> IndexResources:
+def open_index(config: AppConfig, *, measure: Measure | None = None) -> IndexResources:
     """Open the configured Chroma collection and wrap it with LlamaIndex."""
-    runtime = configure_llamaindex(config)
+    runtime = configure_llamaindex(config, measure=measure)
     config.paths.chroma_dir.mkdir(parents=True, exist_ok=True)
 
     chroma_client = chromadb.PersistentClient(path=str(config.paths.chroma_dir))
     chroma_collection = chroma_client.get_or_create_collection(
         name=config.index.collection
     )
-    vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+    if measure is None:
+        vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+    else:
+        vector_store = _TimedChromaStore(chroma_collection=chroma_collection)
+        vector_store._measure = measure
     index = VectorStoreIndex.from_vector_store(
         vector_store=vector_store,
         embed_model=runtime.embed_model,
@@ -136,6 +165,7 @@ def open_index(config: AppConfig) -> IndexResources:
         chroma_collection=chroma_collection,
         vector_store=vector_store,
         index=index,
+        measure=measure,
     )
 
 
@@ -145,7 +175,9 @@ def collection_count(resources: IndexResources) -> int:
 
 def delete_source(resources: IndexResources, source_id: str) -> None:
     """Delete all Chroma records for a normalized source id if present."""
-    resources.chroma_collection.delete(where={"source_id": source_id})
+    measure = getattr(resources, "measure", None)
+    with measure("delete old vectors from Chroma") if measure else nullcontext():
+        resources.chroma_collection.delete(where={"source_id": source_id})
 
 
 def upsert_document(

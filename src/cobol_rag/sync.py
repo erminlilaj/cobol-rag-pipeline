@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from cobol_rag.bundle import find_bm25_index, list_bundle_chunks, resolve_index_path
 from cobol_rag.config import AppConfig
-from cobol_rag.index import open_index, upsert_document
+from cobol_rag.index import delete_source, open_index, upsert_document
 from cobol_rag.loaders import LoadedDocument, LoaderError, load_path
+from cobol_rag.sync_progress import SyncProgress
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,8 @@ def build_sync_plan(
     config: AppConfig,
     dry_run: bool = True,
     target: Path | None = None,
+    *,
+    progress: SyncProgress | None = None,
 ) -> SyncPlan:
     """Build a sync plan from config inbox or an explicit target path.
 
@@ -58,36 +62,38 @@ def build_sync_plan(
     chunks_manifest.json are loaded.
     """
     manifest_path = get_manifest_path(config)
-    manifest = read_manifest(manifest_path)
+    with progress.phase("read existing manifest") if progress else nullcontext():
+        manifest = read_manifest(manifest_path)
     failures: list[str] = []
     bm25_path: Path | None = None
 
     sync_root = target or config.paths.inbox_dir
-    index_path = resolve_index_path(sync_root)
-
-    if target is not None:
-        chunk_files = list_bundle_chunks(index_path)
-        if chunk_files is not None:
-            loaded: list[LoadedDocument] = []
-            for file_path in chunk_files:
-                try:
-                    loaded.extend(load_path(file_path, config=config))
-                except LoaderError as err:
-                    failures.append(str(err))
+    with progress.phase("load incoming documents") if progress else nullcontext():
+        index_path = resolve_index_path(sync_root)
+        if target is not None:
+            chunk_files = list_bundle_chunks(index_path)
+            if chunk_files is not None:
+                loaded: list[LoadedDocument] = []
+                for file_path in chunk_files:
+                    try:
+                        loaded.extend(load_path(file_path, config=config))
+                    except LoaderError as err:
+                        failures.append(str(err))
+            else:
+                loaded = load_path(index_path, config=config)
+            bm25_path = find_bm25_index(index_path)
         else:
-            loaded = load_path(index_path, config=config)
-        bm25_path = find_bm25_index(index_path)
-    else:
-        loaded = load_path(config.paths.inbox_dir, config=config)
+            loaded = load_path(config.paths.inbox_dir, config=config)
 
-    current_items = [_plan_item(document=doc, manifest=manifest) for doc in loaded]
-    current_source_ids = {item.source_id for item in current_items}
-    remove_items = _obsolete_items(
-        manifest=manifest,
-        sync_root=index_path,
-        current_source_ids=current_source_ids,
-    )
-    items = current_items + remove_items
+    with progress.phase("compare incoming documents with manifest") if progress else nullcontext():
+        current_items = [_plan_item(document=doc, manifest=manifest) for doc in loaded]
+        current_source_ids = {item.source_id for item in current_items}
+        remove_items = _obsolete_items(
+            manifest=manifest,
+            sync_root=index_path,
+            current_source_ids=current_source_ids,
+        )
+        items = current_items + remove_items
 
     return SyncPlan(
         collection=config.index.collection,
@@ -100,21 +106,26 @@ def build_sync_plan(
     )
 
 
-def apply_sync_plan(config: AppConfig, plan: SyncPlan) -> None:
-    resources = open_index(config)
-    for item in plan.items:
-        if item.action in {"add", "update"}:
-            if item.loaded_document is None:
+def apply_sync_plan(config: AppConfig, plan: SyncPlan, *, progress: SyncProgress | None = None) -> None:
+    with progress.phase("open Chroma") if progress else nullcontext():
+        resources = open_index(config, measure=progress.measure) if progress else open_index(config)
+    total = None if progress is None else sum(
+        item.action == "remove" or (item.action in {"add", "update"} and item.loaded_document is not None)
+        for item in plan.items
+    )
+    with progress.phase("apply changes", total=total) if progress else nullcontext():
+        for item in plan.items:
+            if item.action in {"add", "update"} and item.loaded_document is not None:
+                upsert_document(resources, item.loaded_document.document, chunk_mode=config.index.chunk_mode)
+            elif item.action == "remove":
+                delete_source(resources, item.source_id)
+            else:
                 continue
-            upsert_document(
-                resources,
-                item.loaded_document.document,
-                chunk_mode=config.index.chunk_mode,
-            )
-        elif item.action == "remove":
-            resources.chroma_collection.delete(where={"source_id": item.source_id})
-    existing_raw = _read_manifest_raw(plan.manifest_path)
-    write_manifest(plan.manifest_path, plan, existing_raw=existing_raw)
+            if progress:
+                progress.advance()
+    with progress.phase("save manifest") if progress else nullcontext():
+        existing_raw = _read_manifest_raw(plan.manifest_path)
+        write_manifest(plan.manifest_path, plan, existing_raw=existing_raw)
 
 
 def get_manifest_path(config: AppConfig) -> Path:

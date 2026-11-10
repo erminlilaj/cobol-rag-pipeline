@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from cobol_rag.remove import RemovePlan, apply_remove_plan, build_remove_plan
 from cobol_rag.reset import ResetPlan, apply_reset_plan, build_reset_plan
 from cobol_rag.retrieve import RetrievalResult, retrieve as retrieve_documents
 from cobol_rag.sync import SyncPlan, apply_sync_plan, build_sync_plan
+from cobol_rag.sync_progress import SyncProgress
 
 app = typer.Typer(
     help="Flexible local RAG pipeline for COBOL analysis artifacts.",
@@ -166,6 +168,11 @@ def sync(
         "-c",
         help="Path to the YAML config file.",
     ),
+    show_progress: bool = typer.Option(
+        True,
+        "--progress/--no-progress",
+        help="Show live sync progress and timings on stderr.",
+    ),
 ) -> None:
     """Plan or apply inbox/bundle synchronization.
 
@@ -178,10 +185,17 @@ def sync(
         cobol-rag sync --apply /path/to/program.report/knowledge-base_rag
     """
     settings = load_config(path)
-    plan = build_sync_plan(settings, dry_run=dry_run, target=target)
-    if not dry_run:
-        apply_sync_plan(settings, plan)
+    with SyncProgress(lambda line: typer.echo(line, err=True)) if show_progress else nullcontext() as progress:
+        plan = build_sync_plan(settings, dry_run=dry_run, target=target, progress=progress)
+        if progress:
+            progress.note(
+                "Plan: " + ", ".join(f"{plan.count(action)} {action}" for action in ("add", "update", "remove", "skip"))
+            )
+        if not dry_run:
+            apply_sync_plan(settings, plan, progress=progress)
     _print_sync_plan(plan)
+    if progress:
+        progress.summary()
 
 
 @app.command()

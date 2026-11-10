@@ -193,6 +193,13 @@ cobol-rag sync --dry-run
 
 Safety rule: `sync --dry-run` does not write to Chroma and does not write the manifest. `sync --apply` is the explicit write command.
 
+The sync CLI reports its current stage and, while busy, prints a plain-text update
+every 15 seconds. Apply progress counts actual add/update/remove operations
+(not unchanged documents). The final timings separate loading, opening Chroma,
+embedding via Ollama, Chroma writes/deletes and saving the manifest. The
+apply-stage total includes its embedding and database subtimings. Use
+`--no-progress` to suppress these diagnostics and keep only the normal summary.
+
 ## Sync Workflow
 
 The intended day-to-day workflow is:

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from cobol_rag import final_scripts_answers as artifacts
 from cobol_rag.investigation_protocol import TABLE_INFO, validate_tool
+from cobol_rag.call_targets import operand as call_operand, resolve_targets
 
 
 class ToolError(ValueError):
@@ -185,6 +186,18 @@ class EvidenceTools:
             self._cache[key] = json.loads(path.read_text(encoding='utf-8'))
         return deepcopy(self._cache[key])
 
+    def resolved_calls(self, program):
+        calls = self.load(program, 'architecture.call_parameters.json').get('calls', [])
+        expressions = [call_operand(call) for call in calls]
+        needs_source = any(value and not value.startswith(("'", '"')) for value in expressions)
+        source = []
+        if needs_source:
+            try:
+                source = self.rows(program, 'source')
+            except (ToolError, OSError, ValueError):
+                pass  # Preserve unresolved status; missing source is not a literal target.
+        return resolve_targets([dict(call, caller=call.get('caller') or program) for call in calls], source)
+
     def jcl_details(self, evidence_id, scope):
         """Follow a registered JCL step to its detailed artifact and source."""
         anchor = self.evidence.get(evidence_id, {})
@@ -336,17 +349,21 @@ class EvidenceTools:
             if table == 'metrics':
                 raw = [metrics]
             else:
-                calls = self.load(program, 'architecture.call_parameters.json')
+                calls = self.resolved_calls(program)
                 raw = [{'identity': summary.get('content'),
                         'purpose_comments': [r.get('normalized_text', r.get('text')) for r in comments.get('comments', [])
                                              if r.get('line', 9999) < 30 and r.get('indexable')],
-                        'metrics': metrics, 'outgoing_calls': [r.get('target') for r in calls.get('calls', [])],
+                        'metrics': metrics, 'outgoing_calls': [r.get('target') for r in calls],
+                        'call_target_details': [{k: r[k] for k in ('target', 'target_kind', 'target_variable',
+                            'target_resolution', 'paragraph', 'line_start') if k in r} for r in calls],
                         'limitations': 'Purpose comments describe intent; graph nodes and source paragraphs are different measurements.'}]
             raw[0]['metric_facts'] = [dict(field=key, value=metrics[key], unit=unit, source_artifact=source)
                 for key, (unit, source) in METRIC_DEFINITIONS.items() if metrics.get(key) is not None]
             raw[0]['source_artifacts'] = ['program.summary.json', 'program.comments.json', 'controlflow.cfg.json']
             if table == 'summary':
                 raw[0]['source_artifacts'].append('architecture.call_parameters.json')
+                if any(call.get('target_kind') == 'resolved_variable' for call in calls):
+                    raw[0]['source_artifacts'].append('program.source_lines.jsonl')
         elif table == 'artifacts':
             artifact = 'artifact_inventory'
             raw = [{'name': str(p.relative_to(root))} for p in sorted(root.rglob('*.json'))
@@ -359,6 +376,8 @@ class EvidenceTools:
                 raw = payload.get(key.split('.')[-1])
             if not isinstance(raw, list):
                 raise ToolError(f'Analysis schema gap: {artifact} has no row collection {key}; inspect it.')
+            if table in {'calls', 'parameter_writes'}:
+                raw = self.resolved_calls(program)
             if table == 'parameter_writes':
                 raw = [dict(site, caller=call.get('caller', program), target=call.get('target'),
                             parameter=detail.get('parameter'), variable=variable.get('variable'),
@@ -414,6 +433,8 @@ class EvidenceTools:
         result = []
         for item in raw:
             row = dict(item) if isinstance(item, dict) else {'name': str(item)}
+            if table == 'calls' and row.get('target_kind') == 'resolved_variable':
+                row['name'] = row['target']
             if table.startswith('jcl_') and table != 'jcl_datasets':
                 # A stable member identity is needed for list validation and paging.
                 # The table name alone would collapse every DD/step into one member.
@@ -461,10 +482,52 @@ class EvidenceTools:
             if graph.get('schema_version') != 1 or not isinstance(graph.get('edges'), list):
                 raise ToolError('Corpus relationship artifact has an unsupported schema.')
             rows = []
+            resolved_by_program = {}
             for edge in graph['edges']:
                 if not isinstance(edge, dict):
                     continue
+                # Apply explicit kind/source equality scopes before loading
+                # source evidence, so a JCL-only graph query does not inspect
+                # every program's variable CALL sites.
+                excluded = False
+                for predicate in args.get('where', []):
+                    key = predicate.get('field')
+                    if key not in {'kind', 'source'} or predicate.get('op') not in {'eq', 'in'}:
+                        continue
+                    values = predicate.get('value')
+                    values = values if isinstance(values, list) else [values]
+                    if str(edge.get(key)).upper() not in {str(value).upper() for value in values}:
+                        excluded = True
+                        break
+                if excluded:
+                    continue
                 row = dict(edge)
+                proof = row.get('evidence') or {}
+                expression = call_operand(proof) if row.get('kind') == 'program_call' else None
+                # Preserve published literal edges. Resolve variable edges from
+                # the same source-backed call records used by callers/callees.
+                if expression and not expression.startswith(("'", '"')):
+                    row['target_kind'] = 'unresolved_variable'
+                    owner = row.get('program')
+                    if owner not in resolved_by_program:
+                        try:
+                            resolved_by_program[owner] = self.resolved_calls(owner)
+                        except (ToolError, OSError, ValueError):
+                            resolved_by_program[owner] = []
+                    matches = [call for call in resolved_by_program[owner]
+                               if call.get('line_start') == proof.get('line_start')
+                               and call.get('paragraph') == proof.get('paragraph')
+                               and call.get('target_variable') == expression.upper()]
+                    if len(matches) == 1:
+                        resolved_call = matches[0]
+                        row['target_kind'] = resolved_call['target_kind']
+                        row['target_resolution'] = resolved_call['target_resolution']
+                        if resolved_call['target_kind'] == 'resolved_variable':
+                            row['recorded_target'] = row['target']
+                            row['target'] = resolved_call['target']
+                            row['evidence'] = {**proof, 'target_analyzed': row['target'] in self.programs}
+                            row['source_artifacts'] = ['corpus.relationships.json', 'program.source_lines.jsonl']
+                            row['id'] = digest((row.get('id'), row['target_resolution']))
                 row['name'] = f"{row.get('kind')}:{row.get('source')}->{row.get('target')}"
                 row['_artifact'] = 'corpus.relationships.json'
                 row['_row_id'] = digest(row)

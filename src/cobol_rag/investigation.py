@@ -48,6 +48,10 @@ possibilities, not a single guaranteed execution sequence.
 A graph CALL edge may represent PERFORM; inspect source_operation or the statement.
 
 Call relationships are caller -> target. callees queries outgoing calls of programs;
+When target_kind=resolved_variable, name the resolved target and explain that the
+CALL uses target_variable. Cite its target_resolution assignment/call evidence;
+do not list the variable itself as the callee. When target_kind=unresolved_variable,
+label that operand unresolved; never infer its value from a paragraph or prefix.
 callers queries incoming calls to target. Preserve both roles. Distinguish CALL, LINK,
 and XCTL. Empty incoming evidence says nothing about outgoing calls. For parameters
 read the matching call record; parameter_writes records preparation. Query both inventories
@@ -210,7 +214,8 @@ def tool_view(result, limit=10000):
         view['rows'] = [{k: r[k] for k in ('evidence_id', 'name', 'program', 'target',
                          'caller', 'command', 'paragraph', 'line', 'line_start', 'text',
                          'from', 'to', 'condition', 'statement', 'call_type', 'commarea', 'source_operation', 'execution_limitations',
-                         'parameters', 'parameter', 'call_line', 'categories', 'classification_note',
+                         'parameters', 'parameter', 'call_line', 'target_kind', 'target_variable',
+                         'target_expression', 'target_resolution', 'call_target_details', 'categories', 'classification_note',
                          'needs_review', 'proven_unused', 'review_source', 'review_proof_level', 'review_limitations',
                          'controls_flow', 'classification', 'source_file', 'source_role', 'is_comment', 'declaration', 'variable', 'access_kind',
                          'identity', 'purpose_comments', 'metrics', 'metric_facts', 'outgoing_calls', 'length', 'evidence', 'steps', 'source', 'variables', 'limitation',
@@ -1291,6 +1296,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         'A paragraph name is not a CICS command. For paragraph explanations consider all supplied paragraph_context operations, including COPY-origin operations. '
                         'Verify call types against call_type and statement: do not describe CALL or CICS XCTL as CICS LINK, even in a grouped sentence. For detailed explanations require an explanation of available conditions and interfaces rather than only names. '
                         'Known call/copybook roles must not be denied merely because their program implementation is unavailable. '
+                        'For target_kind=resolved_variable, the supported callee is target; target_variable is the operand holding that name. Verify target_resolution evidence and reject an answer that substitutes the variable for the resolved program. Unresolved variable operands must be labelled unresolved, not asserted as concrete program names. '
                         'For a question about which function or function number a caller uses with a routine, verify the caller-side selector assignment and call interface. A verified selector code answers which function the caller requested when no function-name mapping is available; report the code and qualify that its business meaning is unknown. Do not reject solely because the code has no documented function name or because it is not an intrinsic callee property. Do not infer the callee implementation. '
                         'For a question about fields shown in a map or record, verify source assignments through intermediate data items and the output transfer. A field prefix alone is only a search hint. A level-numbered DATA DIVISION group is not a PROCEDURE paragraph. Writes to child fields become part of the parent group; when the prepared group is moved TO an output field, those child values are transferred. Distinguish this from a MOVE from output TO group. Do not reinterpret a field-lineage question as requiring direct MOVE statements into the parent group. If the question asks which fields OF an interface or program, the answer must name supported source fields of that interface; destination group members are not substitutes. Reject destination fields attributed to that interface when their actual source is unrelated. Check every asserted direct MOVE against its actual source and destination; if intermediates exist, require the answer to say via those intermediates. When a candidate field is omitted, check whether its path through a group or redefinition was inspected before claiming an exhaustive list. If the evidence supports the field paths but the answer omits the requested source-field list, reject with repair=answer, not repair=evidence. '
                         'Source rows marked is_comment are not executable paths. A list of jump sites without their branch conditions does not answer a request for conditions. '

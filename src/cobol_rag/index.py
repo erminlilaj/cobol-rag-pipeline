@@ -9,7 +9,7 @@ from chromadb.api import ClientAPI
 from chromadb.api.models.Collection import Collection
 from llama_index.core import Settings, VectorStoreIndex
 from llama_index.core.llms import ChatMessage
-from llama_index.core.schema import Document, TextNode
+from llama_index.core.schema import Document, TextNode, MetadataMode
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.chroma import ChromaVectorStore
@@ -199,3 +199,39 @@ def upsert_document(
         resources.index.insert_nodes([node])
         return
     resources.index.insert(document)
+
+
+def upsert_documents(resources: IndexResources, documents: list[Document],
+                     chunk_mode: str = 'pre_chunked') -> None:
+    """Bounded replacement batches, including cleanup of interrupted additions.
+
+    Never assume an add is absent from Chroma: its vectors may have committed
+    before an earlier process died saving its manifest. Keep original single-
+    document semantics for split-mode documents and repeated source identities.
+    """
+    if len(documents) > 32:
+        raise ValueError('Vector replacement batch exceeds 32 documents.')
+    if not documents:
+        return
+    source_ids = [str(doc.metadata['source_id']) for doc in documents]
+    if (chunk_mode != 'pre_chunked' or len(set(source_ids)) != len(source_ids)
+            or len({doc.id_ for doc in documents}) != len(documents)):
+        for document in documents:
+            upsert_document(resources, document, chunk_mode=chunk_mode)
+        return
+    nodes = [TextNode(id_=doc.id_, text=doc.text, metadata=dict(doc.metadata),
+                     excluded_embed_metadata_keys=list(doc.excluded_embed_metadata_keys),
+                     excluded_llm_metadata_keys=list(doc.excluded_llm_metadata_keys)) for doc in documents]
+    # Prepare embeddings before deleting prior vectors: an unavailable embedding
+    # server must not remove otherwise usable records. LlamaIndex reuses these
+    # embeddings when inserting the nodes.
+    embeddings = resources.runtime.embed_model.get_text_embedding_batch(
+        [node.get_content(metadata_mode=MetadataMode.EMBED) for node in nodes])
+    if len(embeddings) != len(nodes):
+        raise ValueError('Embedding batch size does not match documents.')
+    for node, embedding in zip(nodes, embeddings):
+        node.embedding = embedding
+    measure = getattr(resources, 'measure', None)
+    with measure('delete old vectors from Chroma') if measure else nullcontext():
+        resources.chroma_collection.delete(where={'source_id': {'$in': source_ids}})
+    resources.index.insert_nodes(nodes)

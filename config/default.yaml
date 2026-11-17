@@ -45,6 +45,9 @@ observability:
   enabled: true
   include_hit_previews: false
 
+investigation:
+  memory_enabled: false
+
 loaders:
   generic_json:
     text_fields:

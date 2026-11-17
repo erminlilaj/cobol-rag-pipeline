@@ -91,8 +91,9 @@ class WaitingGamesAssetTest(unittest.TestCase):
         self.assertIn('chat-export.js?v=', self.index)
         self.assertIn('response.headers["Cache-Control"] = "no-store', self.api)
 
-    def test_each_browser_has_isolated_chat_memory(self) -> None:
-        self.assertIn("cobol-rag-session-id", self.script)
+    def test_each_visible_chat_has_isolated_memory(self) -> None:
+        self.assertIn("let chatSessionId = newConversationId();", self.script)
+        self.assertNotIn("window.localStorage.getItem", self.script)
         self.assertIn("X-Session-ID", self.script)
         self.assertIn("_chat_sessions", self.api)
         self.assertIn("_request_session_id(request", self.api)

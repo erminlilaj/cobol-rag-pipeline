@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 import json
+import threading
+import uuid
 
 from cobol_rag.config import AppConfig
 from cobol_rag.query import REJECTED_EXECUTION_MODES, QueryAnswer, answer_query
@@ -17,6 +20,7 @@ class ChatTurn:
     route: str = "technical"
     scope: QueryScope = field(default_factory=QueryScope)
     trace_id: str | None = None
+    status: str = 'complete'
 
 
 @dataclass
@@ -28,6 +32,11 @@ class ChatSession:
     turns: list[ChatTurn] = field(default_factory=list)
     state: SessionState = field(default_factory=SessionState)
     generation: int = 0
+    revision: int = 0
+    context_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    _request_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    _state_lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
+    _pending: int = field(default=0, init=False, repr=False)
 
     def cancel(self) -> int:
         """Abandon the answer in flight so its result never reaches chat memory.
@@ -37,37 +46,68 @@ class ChatSession:
         worker thread, and recording it would leave the next question resolving
         pronouns against an answer nobody read.
         """
-        self.generation += 1
-        return self.generation
+        with self._state_lock:
+            self.generation += 1
+            return self.generation
+
+    def is_busy(self) -> bool:
+        with self._state_lock:
+            return self._pending > 0
+
+    def context_snapshot(self) -> dict:
+        with self._state_lock:
+            return {'id': self.context_id, 'revision': self.revision,
+                    'memory_enabled': self.config.investigation.enabled and self.config.investigation.memory_enabled,
+                    'persistence': 'process-local; reset on API restart or session eviction'}
+
+    def _with_context(self, answer: QueryAnswer) -> QueryAnswer:
+        return replace(answer, debug={**answer.debug, 'session_context': self.context_snapshot()})
 
     def ask(self, message: str, target_program: str | None = None) -> QueryAnswer:
-        generation = self.generation
-        history = self._history_context()
+        # Capture the cancellation epoch before waiting: reset/cancel also
+        # invalidates old queued follow-ups, not just the executing request.
+        with self._state_lock:
+            generation = self.generation
+            self._pending += 1
+        try:
+            with self._request_lock:
+                with self._state_lock:
+                    if generation != self.generation:
+                        return self._with_context(QueryAnswer(question=message, answer='Stopped before execution.',
+                                                  sources=[], execution_mode='cancelled', route='unclear'))
+                    memory_on = not self.config.investigation.enabled or self.config.investigation.memory_enabled
+                    working_state = deepcopy(self.state) if memory_on else SessionState()
+                    history = self._history_context()
+                return self._ask_serialized(message, target_program, generation, working_state, history)
+        finally:
+            with self._state_lock:
+                self._pending -= 1
+
+    def _ask_serialized(self, message, target_program, generation, working_state, history):
         answer = answer_query(
             question=message,
             config=self.config,
             top_k=self.top_k,
             chunk_types=self.chunk_types,
             conversation_history=history,
-            session_state=self.state,
+            session_state=working_state,
             target_program=target_program,
         )
+        with self._state_lock:
+            return self._commit_answer(message, answer, generation)
+
+    def _commit_answer(self, message, answer, generation):
         if generation != self.generation:
             # Cancelled while this ran. The answer is still returned so a caller
             # that wants it can use it, but the session is left as though the
             # question had never been asked.
-            return QueryAnswer(
-                question=message,
-                answer=answer.answer,
-                sources=answer.sources,
-                route=answer.route,
-                scope=answer.scope,
-                trace_id=answer.trace_id,
-                guard_status=answer.guard_status,
-                plan=answer.plan,
-                execution_mode="cancelled",
-                debug=answer.debug,
-            )
+            return self._with_context(replace(answer, execution_mode='cancelled'))
+        accepted = (answer.route == 'technical' and answer.execution_mode not in REJECTED_EXECUTION_MODES
+                    and answer.debug.get('status') != 'rejected'
+                    and answer.debug.get('answer_status') not in {'failed', 'rejected', 'unresolved'}
+                    and (answer.debug.get('validation') or {}).get('passed') is not False)
+        status = answer.debug.get('answer_status', 'complete') if accepted else (
+            'conversational' if answer.route == 'conversational' else 'unresolved')
         self.turns.append(
             ChatTurn(
                 user=message,
@@ -76,6 +116,7 @@ class ChatSession:
                 route=answer.route,
                 scope=answer.scope,
                 trace_id=answer.trace_id,
+                status=status,
             )
         )
         self.turns = self.turns[-self.max_history :]
@@ -86,45 +127,49 @@ class ChatSession:
         # fails on the analyzers' paragraph-count disagreement, and "list them"
         # then inherited the failed intent and enumerated comment fragments.
         # If nothing was established, there is nothing to continue.
-        if answer.route == "technical" and answer.execution_mode not in REJECTED_EXECUTION_MODES:
+        memory_on = not self.config.investigation.enabled or self.config.investigation.memory_enabled
+        if accepted:
+            plan = answer.plan.as_dict() if answer.plan else None
+            if not memory_on and plan:
+                plan = {**plan, 'investigation_memory': None}
             self.state.update(
                 answer.scope,
                 [str(source.metadata.get("source_id", "")) for source in answer.sources],
-                plan=answer.plan.as_dict() if answer.plan else None,
+                plan=plan,
             )
-        elif self.config.investigation.enabled and answer.route != "conversational":
+        elif self.config.investigation.enabled and memory_on and answer.route != "conversational":
             # Remember the request, never the failed answer as a fact. Do not
             # let a follow-up silently attach to the previous successful topic.
-            self.state.investigation_memory['unresolved_turn'] = {"question": message}
-        return QueryAnswer(
-            question=message,
-            answer=answer.answer,
-            sources=answer.sources,
-            route=answer.route,
-            scope=answer.scope,
-            trace_id=answer.trace_id,
-            guard_status=answer.guard_status,
-            plan=answer.plan,
-            execution_mode=answer.execution_mode,
-            debug=answer.debug,
-        )
+            self.state.investigation_memory['unresolved_turn'] = {
+                'question': message, 'status': 'unresolved',
+                'resolved_request': deepcopy(answer.debug.get('plan', {}).get('resolved_request'))}
+        if not memory_on:
+            self.state.investigation_memory = {}
+        self.revision += 1
+        return self._with_context(answer)
 
     def reset(self) -> None:
-        self.turns.clear()
-        self.state.reset()
+        with self._state_lock:
+            self.generation += 1
+            self.turns.clear()
+            self.state.reset()
+            self.revision = 0
+            self.context_id = uuid.uuid4().hex
 
     def last_sources(self) -> list[RetrievalResult]:
-        if not self.turns:
-            return []
-        return self.turns[-1].sources
+        with self._state_lock:
+            return list(self.turns[-1].sources) if self.turns else []
 
     def _history_context(self) -> str | None:
+        if self.config.investigation.enabled and not self.config.investigation.memory_enabled:
+            return None
         if not self.turns:
             return None
 
         if self.config.investigation.enabled:
-            return json.dumps([{'question': t.user, 'answer': t.assistant[:2000],
-                                'status': 'answered' if t.route == 'technical' else t.route}
+            # The structured reference context is authoritative. History adds
+            # user requests and statuses, not competing assistant claims.
+            return json.dumps([{'question': t.user, 'status': t.status}
                                for t in self.turns[-self.max_history:]])
 
         technical_turns = [

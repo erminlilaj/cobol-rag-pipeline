@@ -47,8 +47,44 @@ function page() {
     `, context);
     return {get: id => elements.get(id), requests, messages,
             stop: () => vm.runInContext('stopChat()', context),
-            send: () => vm.runInContext('sendMessage()', context)};
+            send: () => vm.runInContext('sendMessage()', context),
+            reset: () => vm.runInContext('resetChat()', context),
+            session: () => vm.runInContext('chatSessionId', context),
+            observe: value => { context.incoming = value; vm.runInContext('observeConversationContext(incoming)', context); }};
 }
+
+test('new tabs and empty refreshed transcripts get different conversation IDs', () => {
+    const first = page(), second = page();
+    assert.notEqual(first.session(), second.session());
+    assert.notEqual(first.session(), 'test-session');
+});
+
+test('reset rotates chat identity as well as clearing the visible transcript', async () => {
+    const chat = page(), oldId = chat.session();
+    await chat.reset();
+    assert.notEqual(chat.session(), oldId);
+    assert.match(chat.messages.at(-1)[1], /memory cleared/);
+});
+
+test('server restart is disclosed only for a memory-enabled conversation', () => {
+    const chat = page();
+    chat.observe({id: 'old-server', memory_enabled: true});
+    chat.observe({id: 'new-server', memory_enabled: true});
+    assert.equal(chat.messages.length, 1);
+    assert.match(chat.messages[0][1], /processed without the previous chat context/);
+    chat.observe({id: 'another-server', memory_enabled: false});
+    assert.equal(chat.messages.length, 1);
+});
+
+test('a cancelled server response is discarded rather than shown as an answer', async () => {
+    const chat = page();
+    chat.get('chat-input').value = 'A question';
+    const sending = chat.send();
+    chat.requests[0].resolve({answer: 'Obsolete answer', execution_mode: 'cancelled'});
+    await sending;
+    assert.ok(chat.messages.some(message => /discarded/.test(message[1])));
+    assert.ok(!chat.messages.some(message => message[1] === 'Obsolete answer'));
+});
 
 test('batch dialog counts nonblank lines and preserves an unsubmitted draft', () => {
     const {get, requests} = page();

@@ -387,9 +387,105 @@ def test_large_profile_reads_larger_bounded_source_window(evidence, monkeypatch)
     standard = EvidenceTools(AppConfig())
     large = EvidenceTools(replace(AppConfig(), investigation=InvestigationConfig(
         profile='large', source_line_limit=240)))
-    with pytest.raises(ToolError, match='120 lines'):
-        standard.execute('source_range', dict(program='A', start=1, end=200))
+    page = standard.execute('source_range', dict(program='A', start=1, end=200))
+    assert page['returned'] == 120
+    assert not page['requested_complete']
+    assert page['continuation_spans'] == [[121, 200]]
     assert large.execute('source_range', dict(program='A', start=1, end=200))['returned'] == 200
+
+
+def test_reopening_verified_jcl_step_details_is_idempotent(jcl_package):
+    tools = EvidenceTools(AppConfig())
+    locator = tools.execute('query', dict(programs=['A'], table='jcl_steps'))
+    details = tools.execute('jcl_details', dict(evidence_id=locator['rows'][0]['evidence_id']))
+    repeated = tools.execute('jcl_details', dict(evidence_id=details['evidence_id']))
+    assert repeated == details
+    job = tools.execute('jcl_details', dict(evidence_id=details['evidence_id'], jcl_scope='job'))
+    assert job['complete_execution_inventory']
+
+
+def test_bad_followup_tool_does_not_hide_already_verified_answer(jcl_package):
+    budget = FakeBudget([
+        dict(action='tools', calls=[dict(tool='query', args=dict(programs=['A'], table='jcl_steps'))]),
+        dict(action='tools', calls=[dict(tool='jcl_details', args=dict(evidence_id='E2'))]),
+        dict(action='tools', calls=[dict(tool='jcl_details', args=dict(evidence_id='E999'))]),
+        dict(action='final', answer="A receives PARM='TEST'. [E3]", mode='technical',
+             status='complete', evidence_ids=['E3']),
+        dict(passed=True, issues=[]),
+    ])
+    result = investigate('What invocation parameter does A receive?', AppConfig(), budget=budget,
+                         resolved_request=dict(resolved_question='What invocation parameter does A receive?',
+                                               output='other', limit=None, jcl_detail='parm'))
+    assert result['status'] == 'complete', result['trace']
+    assert any(step.get('status') == 'error' for step in result['trace'])
+
+
+def test_large_program_inventory_is_a_labelled_partial_page(monkeypatch):
+    programs = tuple(f'UNSEEN{i:03}' for i in range(60))
+    monkeypatch.setattr('cobol_rag.investigation_tools.artifacts.analyzed_programs', lambda: programs)
+    monkeypatch.setattr(EvidenceTools, 'rows', lambda self, p, t: [])
+    answer = 'Showing 25 of 60 analyzed programs: ' + ', '.join(programs[:25]) + '. More remain; next offset 25.'
+    budget = FakeBudget([
+        dict(action='tools', calls=[dict(tool='inventory', args={})]),
+        dict(action='final', answer=answer, mode='technical', status='partial', evidence_ids=['E1']),
+        dict(passed=True, issues=[]),
+    ])
+    result = investigate('List the indexed program inventory.', AppConfig(), budget=budget,
+                         resolved_request=dict(resolved_question='List the indexed program inventory.',
+                                               output='list', limit=None))
+    assert result['status'] == 'partial', result['trace']
+    assert any(step.get('tool') == 'inventory' and step['args']['limit'] == 25 for step in result['trace'])
+
+
+def test_empty_filtered_jcl_collection_needs_no_nonexistent_dd_details(monkeypatch):
+    from cobol_rag.investigation import answer_checks
+    monkeypatch.setattr('cobol_rag.investigation_tools.artifacts.analyzed_programs', lambda: ('A',))
+    monkeypatch.setattr(EvidenceTools, 'root', lambda self, p: __import__('pathlib').Path('/tmp'))
+    monkeypatch.setattr(EvidenceTools, 'load', lambda self, p, a: {'content': {
+        'known_jobs': [], 'matching_steps': [], 'unknowns': []}})
+    tools = EvidenceTools(AppConfig())
+    result = tools.execute('query', dict(programs=['A'], table='jcl_unknowns'))
+    candidate = dict(answer='No uncertain dataset assignments are recorded for A in the supplied JCL.',
+                     mode='technical', status='complete', evidence_ids=[result['collection_evidence_id']])
+    assert not answer_checks('Which assignments have unknown direction?', candidate, tools, [],
+                             dict(output='other', jcl_detail='dds'))
+
+
+def test_sysout_destination_not_dd_name_or_bold_markup(jcl_package):
+    from cobol_rag.investigation import answer_checks
+    tools = EvidenceTools(AppConfig())
+    locator = tools.execute('query', dict(programs=['A'], table='jcl_steps'))
+    details = tools.execute('jcl_details', dict(evidence_id=locator['rows'][0]['evidence_id']))
+    candidate = dict(answer='The destination is **SYSOUT**.', mode='technical', status='complete',
+                     evidence_ids=[details['evidence_id']])
+    errors = answer_checks('Where is SYSOUT routed?', candidate, tools, [], dict(jcl_detail='sysout'))
+    assert any('destination missing' in error for error in errors)
+    candidate['answer'] = 'DD SYSOUT uses SYSOUT=*.'
+    assert not answer_checks('Where is SYSOUT routed?', candidate, tools, [], dict(jcl_detail='sysout'))
+
+
+def test_review_scope_payload_is_bounded_without_mutating_executor_contract():
+    from cobol_rag.investigation import bounded_review_payload
+    original = dict(relation=dict(caller_scope=[f'UNIT{i}' for i in range(2000)], targets=['Z']),
+                    text='source text remains intact')
+    bounded = bounded_review_payload(original)
+    assert len(bounded['relation']['caller_scope']) == 16
+    assert bounded['relation']['caller_scope_scope']['total'] == 2000
+    assert len(original['relation']['caller_scope']) == 2000
+    assert bounded['relation']['targets'] == ['Z']
+    assert bounded['text'] == original['text']
+
+
+@pytest.mark.parametrize('relation', [dict(direction='outgoing', targets=['NEWPROG']),
+                                      dict(direction='incoming', callers=['NEWPROG'])])
+def test_incomplete_resolver_roles_are_not_frozen_as_false_obligations(relation):
+    from cobol_rag.investigation import usable_request
+    original = dict(resolved_question='Identify the program at this call site.',
+                    output='other', limit=None, call_relation=relation)
+    repaired = usable_request(original)
+    assert 'call_relation' not in repaired
+    assert repaired['resolved_question'] == original['resolved_question']
+    assert original['call_relation'] == relation
 
 
 def test_large_profile_env_keeps_standard_defaults_untouched(monkeypatch):
@@ -479,7 +575,7 @@ def test_jcl_job_scope_includes_unindexed_programs_and_requires_job_evidence(jcl
     tools = EvidenceTools(AppConfig())
     step = tools.execute('query', dict(programs=['A'], table='jcl_steps'))['rows'][0]
     question = 'Does the same JCL job run other programs besides A?'
-    request = dict(output='other', jcl_scope='job')
+    request = dict(output='other', jcl_scope='job', job_inventory=True)
     candidate = dict(answer='No other programs run.', mode='technical', status='complete',
                      evidence_ids=[step['evidence_id']])
     assert any('Whole-job claims require' in error for error in
@@ -1272,7 +1368,7 @@ def test_detailed_read_batch_remains_bounded():
     call = dict(tool='source', args=dict(program='A', paragraph='WORK'))
     validate(dict(action='tools', calls=[call] * 4), decision_schema())
     with pytest.raises(ValidationError):
-        validate(dict(action='tools', calls=[call] * 7), decision_schema())
+        validate(dict(action='tools', calls=[call] * 17), decision_schema())
 
 
 def test_tool_calls_alias_preserves_operations_and_rejects_conflicts():
@@ -1528,6 +1624,185 @@ class FakeBudget:
         return result
 
 
+def test_optional_request_metadata_nulls_are_not_jcl_routing():
+    from jsonschema import validate, ValidationError
+    from cobol_rag.investigation_protocol import REQUEST, normalize_optional_nulls
+    request = dict(resolved_question='Explain numeric conversion in A', output='other', limit=None,
+                   jcl_scope=None, jcl_detail=None, call_relation=None, order_by=None)
+    normalized = normalize_optional_nulls(request, REQUEST)
+    assert normalized == dict(resolved_question=request['resolved_question'], output='other', limit=None)
+    assert 'jcl_scope' in request  # Never mutate model output in place.
+    validate(normalized, REQUEST)
+    with pytest.raises(ValidationError):
+        validate(normalize_optional_nulls({**request, 'jcl_scope': 'anything'}, REQUEST), REQUEST)
+    with pytest.raises(ValidationError):
+        validate(normalize_optional_nulls({**request, 'output': None}, REQUEST), REQUEST)
+
+
+def test_nested_null_filter_and_empty_selection_are_not_deleted():
+    from cobol_rag.investigation_protocol import TOOL_SCHEMAS, normalize_optional_nulls
+    args = dict(programs=['A'], table='variables', limit=0,
+                where=[dict(field='origin', op='eq', value=None), dict(field='name', op='in', value=[])])
+    assert normalize_optional_nulls(args, TOOL_SCHEMAS['query']) == args
+    assert normalize_optional_nulls(dict(target=None), TOOL_SCHEMAS['callers']) == dict(target=None)
+
+
+def test_job_step_locator_is_not_whole_job_inventory(jcl_package):
+    from cobol_rag.investigation import answer_checks
+    tools = EvidenceTools(AppConfig())
+    step = tools.execute('query', dict(programs=['A'], table='jcl_steps'))['rows'][0]
+    candidate = dict(answer=f"Job {step['job']}, step {step['step']}.", mode='technical',
+                     status='complete', evidence_ids=[step['evidence_id']])
+    errors = answer_checks('Which job and step execute A?', candidate, tools, [],
+                          dict(output='other', jcl_scope='job', job_inventory=False))
+    assert not errors
+
+
+def test_separate_inventories_do_not_require_fake_intersection(evidence):
+    from cobol_rag.investigation import answer_checks
+    a = evidence.execute('query', dict(programs=['A'], table='variables'))
+    b = evidence.execute('query', dict(programs=['B'], table='variables'))
+    candidate = dict(answer='A: V1, V2. B: V1.', mode='technical', status='complete',
+        collection_output='list', evidence_ids=[a['collection_evidence_id'], b['collection_evidence_id']])
+    request = dict(output='list', collection_semantics='sections')
+    assert not answer_checks('List variables separately for A and B.', candidate, evidence, [], request)
+    candidate['answer'] = 'A and B: V1.'
+    assert any('omits returned members' in e for e in answer_checks('List variables separately.', candidate, evidence, [], request))
+
+
+@pytest.mark.parametrize('operation,expected', [('intersection', ['COMMON']),
+    ('difference', ['ONLY_A']), ('union', ['AB', 'BC', 'COMMON', 'ONLY_A'])])
+def test_n_way_sets_preserve_every_subject_and_leaf_provenance(monkeypatch, operation, expected):
+    monkeypatch.setattr('cobol_rag.investigation_tools.artifacts.analyzed_programs', lambda: ('A', 'B', 'C'))
+    inventories = dict(A=['COMMON', 'AB', 'ONLY_A'], B=['COMMON', 'AB', 'BC'], C=['COMMON', 'BC'])
+    def rows(self, program, table):
+        return [dict(name=name, target=name, program=program, _artifact='calls',
+                     _row_id=f'{program}:{name}') for name in inventories[program]]
+    monkeypatch.setattr(EvidenceTools, 'rows', rows)
+    tools = EvidenceTools(AppConfig())
+    result = tools.execute('compare_many', dict(programs=['A', 'B', 'C'], table='calls',
+        operation=operation, field='target'))
+    assert [r['name'] for r in result['rows']] == expected
+    common = next((r for r in result['rows'] if r['name'] == 'COMMON'), None)
+    if common:
+        assert {r['program'] for r in common['members']} == {'A', 'B', 'C'}
+    selected = tools.execute('select', dict(result_id=result['result_id'], basis='collection'))
+    assert [r['name'] for r in selected['rows']] == expected
+
+
+def test_source_exposes_recorded_bounds_without_asserting_original_eof(evidence, monkeypatch):
+    monkeypatch.setattr(evidence, 'rows', lambda p, t: [dict(program=p, source_file='A.CBL',
+        line=i, text='CONTINUE.', _artifact='program.source_lines.jsonl') for i in range(1, 5)])
+    result = evidence.execute('source_range', dict(program='A', start=5, end=12))
+    assert result['returned'] == 0 and result['past_recorded_end']
+    assert result['source_bounds']['last_recorded_line'] == 4
+    assert 'not proof' in result['source_bounds']['scope']
+
+
+def test_reviewer_empty_non_subject_role_is_losslessly_omitted():
+    from cobol_rag.investigation import review_answer
+    response = dict(passed=True, issues=[], requested_call_relation=dict(
+        direction='outgoing', callers=['A'], targets=[]))
+    review = review_answer(FakeBudget([response]), 'Review', {'evidence_contracts': [{'relation': {'direction': 'outgoing'}}]}, [])
+    assert review['requested_call_relation'] == dict(direction='outgoing', callers=['A'])
+
+
+def test_partial_synthesis_keeps_supported_facts_and_requires_review(evidence):
+    from cobol_rag.investigation import synthesize_partial
+    result = evidence.execute('query', dict(programs=['A'], table='variables'))
+    response = dict(action='final', mode='technical', status='partial',
+        answer='A records V1 and V2. Their numeric-conversion behavior remains unverified.',
+        evidence_ids=[result['collection_evidence_id']])
+    budget = FakeBudget([response, dict(passed=True, issues=[])])
+    budget.config = AppConfig()
+    trace = []
+    found = synthesize_partial('Explain the variables and their conversion behavior.',
+        dict(output='other', scope='corpus'), [], evidence, [], ['Exploration stopped'], budget, trace)
+    assert found and found['status'] == 'partial' and budget.calls == 2
+    assert trace[-1]['status'] == 'partial_synthesis_accepted'
+    rejected = FakeBudget([response, dict(passed=False, issues=['This claim contradicts source'], repair='answer')])
+    rejected.config = AppConfig()
+    assert synthesize_partial('Explain A.', dict(output='other'), [], evidence, [], [], rejected, []) is None
+
+
+def test_partial_synthesis_does_not_allow_fabricated_citations(evidence):
+    from cobol_rag.investigation import synthesize_partial
+    budget = FakeBudget([dict(action='final', mode='technical', status='partial',
+        answer='Maybe A does everything.', evidence_ids=['E999'])])
+    budget.config = AppConfig()
+    assert synthesize_partial('Explain A.', dict(output='other'), [], evidence, [], [], budget, []) is None
+
+
+def test_mixed_directions_are_checked_separately(evidence):
+    from cobol_rag.investigation import call_review_errors, review_answer
+    outgoing = evidence.execute('callees', dict(programs=['A']))
+    incoming = evidence.execute('callers', dict(target='A'))
+    scopes = [dict(direction='outgoing', callers=['A']), dict(direction='incoming', targets=['A'])]
+    contracts = [{'relation': r['relation']} for r in (outgoing, incoming)]
+    assert not call_review_errors(dict(requested_call_relations=scopes), contracts)
+    assert call_review_errors(dict(requested_call_relations=scopes), contracts[:1])
+    budget = FakeBudget([dict(passed=True, issues=[], requested_call_relations=scopes)])
+    review = review_answer(budget, 'Review', dict(evidence_contracts=contracts,
+        resolved_request=dict(call_relations=scopes)), [])
+    assert review['requested_call_relations'] == scopes
+
+
+def test_actual_model_boundary_normalizes_null_request_metadata(monkeypatch):
+    import json
+    import sys
+    from cobol_rag.investigation import Budget
+    from cobol_rag.investigation_protocol import REQUEST
+    captured = []
+    result = dict(resolved_question='Explain A', scope='corpus', output='other',
+                  limit=None, jcl_scope=None, jcl_detail=None, call_relation=None)
+    def build(config, **kwargs):
+        captured.append(kwargs)
+        return SimpleNamespace(chat=lambda *a, **k: SimpleNamespace(
+            message=SimpleNamespace(content=json.dumps(result))))
+    monkeypatch.setitem(sys.modules, 'llama_index.core.llms', SimpleNamespace(ChatMessage=lambda **kw: kw))
+    monkeypatch.setitem(sys.modules, 'cobol_rag.index', SimpleNamespace(build_llm=build))
+    normalized = Budget(AppConfig()).call('Resolve', {'resolved_request': {'depth': 'detailed'}}, REQUEST)
+    assert 'jcl_scope' not in normalized and normalized['limit'] is None
+    assert captured[0]['max_output_tokens'] == 4096
+
+
+def test_stalled_investigation_reaches_reserved_partial_synthesis(evidence):
+    question = 'Explain A variables and conversion behavior.'
+    candidate = dict(action='final', mode='technical', status='partial',
+        answer='A records V1 and V2. Conversion behavior is not established by this evidence.',
+        evidence_ids=['E1'])
+    error = ToolError("Invalid decision at ['action']: 'final' was expected; received tools")
+    budget = FakeBudget([
+        dict(action='tools', calls=[dict(tool='query', args=dict(programs=['A'], table='variables'))]),
+        error, error, candidate, dict(passed=True, issues=[]),
+    ])
+    budget.config = AppConfig()
+    budget.maximum = 8
+    budget.synthesis_reserve = 2
+    result = investigate(question, budget.config, budget=budget,
+        resolved_request=dict(resolved_question=question, output='other', limit=None, scope='corpus'))
+    assert result['status'] == 'partial' and result['tool_calls'] == 1
+    assert any(step.get('status') == 'partial_synthesis_accepted' for step in result['trace'])
+
+
+def test_partial_recovery_transport_failure_is_not_an_api_error(evidence):
+    from cobol_rag.investigation import synthesize_partial
+    budget = FakeBudget([RuntimeError('Inference server disconnected')])
+    budget.config = AppConfig()
+    trace = []
+    assert synthesize_partial('Explain A.', dict(output='other'), [], evidence, [], [], budget, trace) is None
+    assert trace[-1]['status'] == 'partial_synthesis_rejected'
+
+
+def test_partial_recovery_does_not_run_after_deadline(evidence):
+    from cobol_rag.investigation import synthesize_partial
+    budget = FakeBudget([])
+    budget.config = AppConfig()
+    budget.deadline = time.monotonic() - 1
+    assert synthesize_partial('Explain A.', dict(output='other'), [], evidence, [], [], budget, []) is None
+    assert budget.calls == 0
+
+
 def test_large_file_inventory_is_explicitly_paginated(monkeypatch):
     monkeypatch.setattr('cobol_rag.investigation_tools.artifacts.analyzed_programs',
                         lambda: ('A', 'B', 'C'))
@@ -1724,6 +1999,53 @@ def test_memory_recall_revalidates_without_mutating_collection(evidence):
     evidence.memory['collections'][first['result_id']]['fingerprint'] = 'stale'
     with pytest.raises(ToolError, match='Corpus changed'):
         evidence.recall_active()
+
+
+def test_memory_cursor_records_actual_page_and_filtered_scope(evidence, monkeypatch):
+    monkeypatch.setattr(evidence, 'rows', lambda p, t: [dict(name=f'V{i:02}', program=p,
+        controls_flow=i % 2 == 0, _row_id=str(i), _artifact='variables') for i in range(40)])
+    full = evidence.execute('query', dict(programs=['A'], table='variables'))
+    first = evidence.execute('select', dict(result_id=full['result_id'], basis='collection',
+        where=[dict(field='controls_flow', op='eq', value=True)], order_by='name', offset=0, limit=5))
+    focus = evidence.context()['focus']
+    assert focus['subject']['programs'] == ['A']
+    assert focus['subject']['filters'] == [dict(field='controls_flow', op='eq', value=True)]
+    assert focus['result']['displayed_page'] == dict(offset=0, limit=5, returned=5, order_by='name', next_offset=5)
+    second = evidence.execute('select', dict(result_id=first['result_id'], basis='collection', offset=5, limit=5))
+    assert [r['name'] for r in second['rows']] == ['V10', 'V12', 'V14', 'V16', 'V18']
+    assert evidence.context()['focus']['result']['displayed_page']['next_offset'] == 10
+    assert evidence.context()['focus']['result']['total'] == 20
+
+
+def test_unresolved_focus_blocks_silent_previous_topic_fallback(evidence):
+    from cobol_rag.investigation import resolve_request
+    evidence.execute('query', dict(programs=['A'], table='variables'))
+    evidence.memory['last_exchange'] = dict(question='List A variables', status='partial',
+                                          coverage=[dict(requirement='Explain origins', status='unavailable')])
+    evidence.memory['unresolved_turn'] = dict(question='Explain B', status='unresolved')
+    captured = []
+    class Resolver:
+        def call(self, instructions, payload, *args, **kwargs):
+            captured.append(payload)
+            return dict(resolved_question='More about B', output='other', limit=None)
+    resolve_request('More details', '', evidence.memory, Resolver())
+    focus = captured[0]['conversation_focus']
+    assert focus['status'] == 'unresolved' and focus['current_request']['question'] == 'Explain B'
+    assert focus['previous_verified_context']['status'] == 'partial'
+    assert captured[0]['previous_verified_query'] is None
+    assert 'last_successful_exchange' not in captured[0]
+
+
+def test_comparison_focus_keeps_both_programs_and_input_filters(evidence):
+    from cobol_rag.conversation_memory import reference_context
+    left = evidence.execute('query', dict(programs=['A'], table='variables',
+        where=[dict(field='controls_flow', op='eq', value=True)]))
+    right = evidence.execute('query', dict(programs=['B'], table='variables'))
+    evidence.execute('compare', dict(left_id=left['result_id'], right_id=right['result_id'], operation='intersection'))
+    subject = reference_context(evidence.memory)['subject']
+    assert subject['programs'] == ['A', 'B']
+    assert subject['operation'] == 'intersection'
+    assert subject['inputs'][0]['filters'] == [dict(field='controls_flow', op='eq', value=True)]
 
 
 def test_review_protocol_repair_does_not_rewrite_answer(evidence):

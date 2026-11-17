@@ -38,6 +38,8 @@ def obj(properties, required=()):
 S = {'type': 'string'}
 STRINGS = {'type': 'array', 'items': S}
 TARGET = {'anyOf': [S, {'type': 'array', 'items': S, 'minItems': 1}]}
+CALL_RELATION = obj({'direction': {'enum': ['incoming', 'outgoing']},
+                    'callers': STRINGS, 'targets': STRINGS, 'target': S}, ['direction'])
 REQUEST = obj({'resolved_question': S,
     'depth': {'enum': ['brief', 'standard', 'detailed']},
     'explanation_goals': STRINGS,
@@ -47,9 +49,12 @@ REQUEST = obj({'resolved_question': S,
     'offset': {'type': 'integer', 'minimum': 0},
     'order_by': S,
     'jcl_scope': {'enum': ['step', 'job'], 'description': 'Use job only if the request asks about the whole job, e.g. other programs in that job, not merely which job contains a step.'},
-    'jcl_detail': {'enum': ['exec', 'parm', 'dds'], 'description': 'The requested step detail, when unambiguous; omit for datasets, job/step names, and unrelated requests.'},
-    'call_relation': obj({'direction': {'enum': ['incoming', 'outgoing']},
-                          'callers': STRINGS, 'targets': STRINGS, 'target': S}, ['direction'])},
+    'jcl_detail': {'enum': ['exec', 'parm', 'dds', 'sysout'], 'description': 'The requested step detail. sysout means output class/destination, not the DD name. Omit for dataset filters, job/step names, and unrelated requests.'},
+    'job_inventory': {'type': 'boolean', 'description': 'True only for exhaustive whole-job execution/absence claims, not a positive job-and-step lookup.'},
+    'collection_semantics': {'enum': ['inventory', 'set_comparison', 'sections'], 'description': 'sections means separate requested inventories/directions; set_comparison means shared/exclusive/union membership.'},
+    'call_relation': CALL_RELATION,
+    'call_relations': {'type': 'array', 'items': CALL_RELATION, 'minItems': 1,
+                       'description': 'Separate explicitly requested relationship dimensions, such as incoming AND outgoing. Omit call_relation when using this list.'}},
     ['resolved_question', 'output', 'limit'])
 FILTER = obj({'field': S, 'op': {'type': 'string', 'enum': ['eq', 'neq', 'in', 'contains']},
               'value': {'type': ['string', 'number', 'boolean', 'array', 'null']}}, ['field', 'op', 'value'])
@@ -86,6 +91,11 @@ TOOL_SCHEMAS = {
     'compare_programs': obj({'table': QUERY['table'], 'left_value': S, 'right_value': S, 'field': S,
                     'where': QUERY['where'], 'operation': {'enum': ['intersection', 'difference', 'union']}, **PAGE},
                     ['table', 'left_value', 'right_value', 'operation']),
+    'compare_many': obj({'table': QUERY['table'],
+                    'programs': {'type': 'array', 'items': S, 'minItems': 2, 'maxItems': 6, 'uniqueItems': True},
+                    'field': S, 'where': QUERY['where'],
+                    'operation': {'enum': ['intersection', 'difference', 'union']}, **PAGE},
+                    ['table', 'programs', 'operation']),
     'inspect': obj({'evidence_id': S, 'program': S, 'artifact': S, 'field': S, **PAGE}),
     'source': obj({'program': S, 'source_file': S, 'paragraph': S,
                   'spans': {'type': 'array', 'items': {'type': 'array', 'items': {'type': 'integer'}, 'minItems': 2, 'maxItems': 2}}}, ['program']),
@@ -97,7 +107,7 @@ def decision_schema():
     # A flat envelope avoids recursive unions in inference-server grammars.
     # Per-tool arguments are still strictly validated before execution.
     argument_fields = {key: value for spec in TOOL_SCHEMAS.values() for key, value in spec['properties'].items()}
-    calls = {'type': 'array', 'maxItems': 6, 'items': obj({
+    calls = {'type': 'array', 'maxItems': 16, 'items': obj({
         'tool': {'enum': list(TOOL_SCHEMAS)}, 'args': obj(argument_fields)}, ['tool', 'args'])}
     schema = obj({'action': {'enum': ['tools', 'final']}, 'calls': calls, 'answer': S,
                 'mode': {'enum': ['technical', 'general', 'conversational', 'clarification']},
@@ -111,6 +121,29 @@ def decision_schema():
         {'if': {'required': ['action'], 'properties': {'action': {'const': 'final'}}}, 'then': {'required': ['answer', 'mode', 'status', 'evidence_ids']}},
     ]
     return schema
+
+
+def normalize_optional_nulls(value, schema):
+    """Omit optional null metadata only where null is not a valid value.
+
+    Required fields, explicit null predicates, empty filters and unknown keys
+    remain untouched and must pass normal validation. Never invent defaults.
+    """
+    from copy import deepcopy
+    from jsonschema import Draft202012Validator
+    value = deepcopy(value)
+    if isinstance(value, dict):
+        required = schema.get('required', [])
+        for key, spec in schema.get('properties', {}).items():
+            if key not in value:
+                continue
+            if value[key] is None and key not in required and not Draft202012Validator(spec).is_valid(None):
+                del value[key]
+            else:
+                value[key] = normalize_optional_nulls(value[key], spec)
+    elif isinstance(value, list) and isinstance(schema.get('items'), dict):
+        value = [normalize_optional_nulls(item, schema['items']) for item in value]
+    return value
 
 
 def tool_help():
@@ -133,6 +166,7 @@ def tool_help():
                   'select refines a saved result, basis collection or displayed. Preserve its filters.',
                   'compare_groups compares two groups inside ONE saved result without intermediate IDs. For shared members across programs use group_by=program, left_value/right_value=the program identifiers, field=name, operation=intersection. Difference is left minus right; union combines both. It works for any table and grouping field.',
                   'For shared or exclusive members of two named programs, use compare_programs directly with table, left_value, right_value, operation and optional field (default name). For shared copybooks use table=copybooks and operation=intersection. This tool needs no result IDs.',
+                  'For shared members across three to six programs use compare_many(table,programs,operation,field optional). Intersection requires membership in EVERY program. Difference means the first program minus ALL remaining programs. It returns one derived result with provenance; pairwise intersections are not a three-way intersection.',
                   'order_by is a field string: name for ascending, -name for descending. Sorting precedes pagination.',
                   'source reads spans [[start,end]] or a paragraph body.',
                   'group_context(program,group,source_prefix optional) reads a destination data group declaration, its child fields, and relevant source lines in paragraphs that prepare or transfer the group. Set group to the output record or map-row name and source_prefix to the input interface name. For "fields of SERVICE in SCREEN-ROW", use group=SCREEN-ROW, source_prefix=SERVICE. The returned source text still needs interpretation.',

@@ -19,13 +19,94 @@ addresses and requirement coverage, then reviewed against the original
 question. A reviewer failure cannot accept an unreviewed candidate. This review
 uses the same configured model and is not an independent correctness proof.
 
-The default budget is six model calls, ten tool calls and ninety seconds.
+The standard configured exploration budget is sixteen model calls, twenty
+tool calls and 240 seconds (the large profile can override these). Two extra
+model calls are reserved for evidence-review recovery, and two for a grounded
+partial synthesis followed by independent review if ordinary exploration stalls.
+These reserves do not extend the configured wall-clock deadline.
 Italian adds up to two model calls for translation, using the existing
 identifier-preserving translation checks. Output translation can fall back to
 English; the debug data records that outcome. The configured HTTP timeout is
 bounded by the remaining budget; it is not a hard process cancellation timer.
 
 ## Current boundaries
+
+### Transcript regression repairs (2026-11-17)
+
+Source reads larger than the configured limit now return explicitly incomplete
+pages with continuation spans, rather than repeated window-size errors. Reopening
+a registered JCL step-detail ID is safe and idempotent; collection IDs and
+unregistered paths remain invalid. Tool repair retains bounded verified context
+and permits a cited answer if an unnecessary follow-up failed after sufficient
+evidence was already retrieved. Missing evidence still requires retrieval.
+
+Reviewer envelopes preview large corpus scopes with exact counts and fingerprints;
+local direction/membership checks retain full executor contracts. Incomplete
+resolver role metadata is not frozen into a false relationship obligation.
+Semantic metadata can be corrected without replacing the original question,
+requested output size or constraints. Empty scoped JCL queries need no details
+for nonexistent steps. SYSOUT destination is distinct from its DD name.
+
+Large program and source-member inventories explicitly report partial pages.
+Review guidance checks CALL USING versus CICS COMMAREA, PERFORM range returns,
+branch-dependent lineage, and raw versus resolved JCL parameters. These semantic
+checks still rely on model review and require live evaluation; they are not a
+proof of correctness for arbitrary unseen questions. Memory remains OFF.
+
+### Evidence-led synthesis and protocol repair (2026-11-11)
+
+- Optional invalid null metadata is omitted before schema validation; required
+  fields and meaningful null/empty predicates are preserved. Non-JCL questions
+  do not fail because an unused `jcl_scope` was returned as null.
+- A positive job-and-step lookup is not a whole-job inventory. Exhaustive
+  whole-job claims use `job_inventory=true` and still need complete job evidence.
+- `collection_semantics` distinguishes separate lists from derived set
+  comparisons. `compare_many` computes actual n-way membership for two to six
+  programs, preserving leaf provenance. Mixed relationship requests can retain
+  separate typed incoming and outgoing scopes via `call_relations`.
+- Source windows expose recorded member bounds (not proof of original-file
+  completeness). Repeated reads adding no evidence trigger synthesis instead
+  of endless paging beyond those bounds. COPY behavior still requires reading
+  the relevant included member.
+- After a stalled investigation, a final-only synthesis can return useful
+  supported facts with status `partial`, explicit gaps and labelled inferences.
+  It is independently reviewed and must still pass citation, factual and call
+  direction checks. A disclaimer cannot authorize invented facts. If even a
+  useful partial answer cannot be supported or reviewed, the request still fails.
+- Detailed answers have a 4096-token output allowance rather than 2048.
+  The model, input analysis and memory-enabled setting are unchanged.
+
+Offline protocol tests cannot establish live model reliability or prove that
+every generated source analysis is complete. Recheck failing standalone
+questions after API deployment before considering an analyzer rerun.
+
+### Optional memory lifecycle (2026-11-11)
+
+Memory remains OFF by default (`investigation.memory_enabled: false`); this
+repair does not enable it or change the configured model. The health response
+and per-answer runtime metadata expose the effective `memory_enabled` flag.
+
+When enabled later, reference resolution uses one `conversation_focus` object:
+the last accepted request/status/coverage, executed query scope and filters,
+and its actual displayed page (offset, limit, ordering and next offset).
+Unresolved requests explicitly supersede older successful topics. Historical
+assistant prose is not reinjected as proof. Replayed collections still reject
+changed fingerprints, and evidence IDs still expire at each turn.
+
+Each visible browser transcript has a fresh opaque conversation ID. Tabs,
+page refreshes and cleared chats cannot inherit a hidden conversation via
+localStorage. Clients without an explicit conversation ID are stateless;
+invalid IDs return 400 rather than joining a shared default session.
+
+Requests within one conversation are serialized. Work uses a state snapshot;
+cancel/reset prevents old in-flight or queued requests from committing. A
+reset rotates the context ID. Sessions expire after two idle hours or idle
+LRU eviction; active requests are not deliberately evicted. Memory is
+process-local, not durable: API restarts lose it. The UI detects a changed
+server context ID and explains that a question was processed without prior
+context when memory is enabled. This avoids pretending the visible transcript
+is durable server memory. Live follow-up evaluation is still required before
+enabling this feature.
 
 - Tools read existing analyzed artifacts; they do not regenerate analysis.
 - Source search supports literal source lookup and scoped hybrid retrieval.

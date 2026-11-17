@@ -40,12 +40,22 @@ function downloadChat(includeDebug) {
     link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
-const chatSessionStorageKey = 'cobol-rag-session-id';
-let chatSessionId = window.localStorage.getItem(chatSessionStorageKey);
-if (!chatSessionId) {
-    chatSessionId = window.crypto?.randomUUID?.()
-        || `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    window.localStorage.setItem(chatSessionStorageKey, chatSessionId);
+function newConversationId() {
+    return window.crypto?.randomUUID?.()
+        || `chat-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+// Each visible transcript owns its conversation. No localStorage or duplicated
+// sessionStorage ID: new tabs and refreshed empty transcripts cannot inherit
+// hidden context from another chat. Server memory remains opt-in.
+let chatSessionId = newConversationId();
+let serverConversationContext = null;
+
+function observeConversationContext(context) {
+    if (!context?.id) return;
+    if (context.memory_enabled && serverConversationContext && serverConversationContext.id !== context.id) {
+        appendMessage('assistant', 'The server conversation context was reset or expired. This question was processed without the previous chat context; restate the program and entity for follow-up questions.');
+    }
+    serverConversationContext = context;
 }
 
 function scrollChatToBottom() {
@@ -903,6 +913,11 @@ async function askOne(text) {
             body: JSON.stringify({ message: text }),
             signal: runningRequest.signal,
         });
+        observeConversationContext(data.session_context);
+        if (data.execution_mode === 'cancelled') {
+            appendMessage('assistant', 'Stopped. This answer was discarded and is not part of the chat memory.');
+            return false;
+        }
         appendMessage('assistant', data.answer, data.sources, data);
         return true;
     } catch (error) {
@@ -1008,6 +1023,8 @@ async function resetChat() {
     }
     try {
         await apiFetch('/api/chat/reset', { method: 'POST' });
+        chatSessionId = newConversationId();
+        serverConversationContext = null;
         chatHistory.innerHTML = '';
         transcript = [];
         transcriptStartedAt = new Date().toISOString();

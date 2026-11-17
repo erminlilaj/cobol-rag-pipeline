@@ -51,36 +51,49 @@ CONFIG_PATH = PROJECT_ROOT / "config" / "default.yaml"
 UI_DIR = PROJECT_ROOT / "ui"
 
 # Conversation memory must never leak between browsers or users.  The browser
-# supplies an opaque session id; command-line and older clients retain a
-# backwards-compatible "default" session.
+# supplies an opaque conversation id; clients without an ID are stateless.
 _MAX_CHAT_SESSIONS = 256
+_CHAT_SESSION_TTL_SECONDS = 2 * 60 * 60
 _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _chat_sessions: "OrderedDict[str, tuple[float, ChatSession]]" = OrderedDict()
 _chat_sessions_lock = threading.RLock()
 
 
-def _normalize_session_id(session_id: str | None) -> str:
-    candidate = (session_id or "default").strip()
-    return candidate if _SESSION_ID_PATTERN.fullmatch(candidate) else "default"
+def _normalize_session_id(session_id: str | None) -> str | None:
+    if session_id is None:
+        return None  # Clients without an ID are stateless, never a shared chat.
+    candidate = session_id.strip()
+    if not _SESSION_ID_PATTERN.fullmatch(candidate):
+        raise HTTPException(status_code=400, detail='Invalid conversation ID.')
+    return candidate
 
 
-def _request_session_id(request: Request, body_session_id: str | None = None) -> str:
-    return _normalize_session_id(body_session_id or request.headers.get("X-Session-ID"))
+def _request_session_id(request: Request, body_session_id: str | None = None) -> str | None:
+    return _normalize_session_id(body_session_id if body_session_id is not None else request.headers.get("X-Session-ID"))
 
 
 def get_chat_session(session_id: str | None = None) -> ChatSession:
     key = _normalize_session_id(session_id)
+    if key is None:
+        return ChatSession(config=load_config(CONFIG_PATH))
     with _chat_sessions_lock:
+        now = time.monotonic()
         cached = _chat_sessions.pop(key, None)
-        if cached is not None:
+        if cached is not None and (now - cached[0] < _CHAT_SESSION_TTL_SECONDS or cached[1].is_busy()):
             session = cached[1]
-            _chat_sessions[key] = (time.monotonic(), session)
+            _chat_sessions[key] = (now, session)
             return session
+        for expired, (accessed, session) in list(_chat_sessions.items()):
+            if now - accessed >= _CHAT_SESSION_TTL_SECONDS and not session.is_busy():
+                del _chat_sessions[expired]
+        if len(_chat_sessions) >= _MAX_CHAT_SESSIONS:
+            idle = next((sid for sid, (_, session) in _chat_sessions.items() if not session.is_busy()), None)
+            if idle is None:
+                raise HTTPException(status_code=503, detail='All conversation slots are active; retry later.')
+            del _chat_sessions[idle]
         settings = load_config(CONFIG_PATH)
         session = ChatSession(config=settings)
-        _chat_sessions[key] = (time.monotonic(), session)
-        while len(_chat_sessions) > _MAX_CHAT_SESSIONS:
-            _chat_sessions.popitem(last=False)
+        _chat_sessions[key] = (now, session)
         return session
 
 class ChatRequest(BaseModel):
@@ -115,6 +128,7 @@ def health() -> Any:
         "embedding": settings.embedding.model,
         "investigation_enabled": settings.investigation.enabled,
         "investigation_profile": settings.investigation.profile,
+        "memory_enabled": settings.investigation.enabled and settings.investigation.memory_enabled,
     }
 
 @app.post("/api/chat")
@@ -147,6 +161,7 @@ def chat(req: ChatRequest, request: Request) -> Any:
             "route": answer.route,
             "scope": answer.scope.as_dict(),
             "session_state": session.state.as_dict(),
+            "session_context": answer.debug.get('session_context', session.context_snapshot()),
             "trace_id": answer.trace_id,
             "guard_status": answer.guard_status,
             "plan": answer.plan.as_dict() if answer.plan else {},
@@ -159,6 +174,7 @@ def chat(req: ChatRequest, request: Request) -> Any:
                 "embedding": session.config.embedding.model,
                 "collection": session.config.index.collection,
                 "investigation_enabled": session.config.investigation.enabled,
+                "memory_enabled": session.config.investigation.enabled and session.config.investigation.memory_enabled,
             },
         }
     except QueryError as error:
@@ -218,6 +234,8 @@ def get_config_endpoint() -> Any:
             "require_citations": settings.answers.require_citations,
         },
         "observability": {"enabled": settings.observability.enabled},
+        "investigation": {"enabled": settings.investigation.enabled,
+                          "memory_enabled": settings.investigation.memory_enabled},
     }
 
 @app.get("/api/index-info")

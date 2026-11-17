@@ -11,6 +11,7 @@ from pathlib import Path
 from cobol_rag import final_scripts_answers as artifacts
 from cobol_rag.investigation_protocol import TABLE_INFO, validate_tool
 from cobol_rag.call_targets import operand as call_operand, resolve_targets
+from cobol_rag.conversation_memory import reference_context, query_subject
 
 
 class ToolError(ValueError):
@@ -201,7 +202,7 @@ class EvidenceTools:
     def jcl_details(self, evidence_id, scope):
         """Follow a registered JCL step to its detailed artifact and source."""
         anchor = self.evidence.get(evidence_id, {})
-        if anchor.get('_artifact') != 'jcl.file_io.json' or not all(
+        if anchor.get('_artifact') not in {'jcl.file_io.json', 'jcl.step_details'} or not all(
                 isinstance(anchor.get(key), str) and anchor[key]
                 for key in ('program', 'job', 'step', 'source_artifact')):
             raise ToolError('Use a jcl_steps row evidence ID, not a collection ID or a file path.')
@@ -567,10 +568,15 @@ class EvidenceTools:
             values = a & b if op == 'intersection' else a - b if op == 'difference' else a | b if op == 'union' else None
             if values is None:
                 raise ToolError('Comparison requires intersection, difference or union.')
+            # Preserve leaf provenance through nested n-way comparisons.
+            leaves = [member for row in left + right for member in row.get('members', [row])]
             rows = [{'name': v, 'members': [{k: r[k] for k in
                      ('name', 'program', 'caller', 'target', 'call_type', 'paragraph', 'line_start', '_artifact', '_row_id') if k in r}
-                     for r in left + right if str(field(r, key)).upper() == v],
+                     for r in leaves if str(field(r, key)).upper() == v],
                      '_artifact': 'derived_set_operation', '_row_id': digest((recipe, v))} for v in sorted(values)]
+            if key != 'name':
+                for row in rows:
+                    row[key] = row['name']
         else:
             raise ToolError('Invalid replay operation.')
         category_values = {key: {str(field(r, key)).casefold() for r in rows if field(r, key) is not None}
@@ -955,12 +961,25 @@ class EvidenceTools:
             target = args.pop('target')
             return self.execute('query', {**args, 'programs': args.get('programs') or list(self.programs),
                 'table': 'calls', 'where': [{'field': 'target', 'op': 'in' if isinstance(target, list) else 'eq', 'value': target}]})
-        if tool in {'connections', 'inventory', 'query', 'select', 'compare', 'compare_groups', 'compare_programs'}:
+        if tool in {'connections', 'inventory', 'query', 'select', 'compare', 'compare_groups', 'compare_programs', 'compare_many'}:
             if any(k in args for k in ('parent', 'left', 'right', 'displayed_ids')):
                 raise ToolError('Internal replay fields cannot be supplied by the model.')
             direct = tool == 'compare_programs'
             grouped = tool == 'compare_groups'
-            if direct:
+            many = tool == 'compare_many'
+            if many:
+                queries = [{'tool': 'query', 'args': {'programs': [owner], 'table': args['table'],
+                                                    'where': args.get('where', [])}}
+                           for owner in args['programs']]
+                combined = queries[0]
+                for query in queries[1:-1]:
+                    combined = {'tool': 'compare', 'args': {'left': combined, 'right': query,
+                                'field': args.get('field', 'name'), 'operation': args['operation']}}
+                args = {'left': combined, 'right': queries[-1], 'field': args.get('field', 'name'),
+                        'operation': args['operation'], 'offset': args.get('offset', 0),
+                        'limit': args.get('limit', 100)}
+                tool = 'compare'
+            elif direct:
                 def program_query(owner):
                     return {'tool': 'query', 'args': {'programs': [owner], 'table': args['table'],
                                                     'where': args.get('where', [])}}
@@ -987,7 +1006,7 @@ class EvidenceTools:
                     raise ToolError('Select basis must be collection or displayed.')
                 args['parent'] = saved['recipe']
                 args['displayed_ids'] = saved['displayed_ids']
-            if tool == 'compare' and not (grouped or direct):
+            if tool == 'compare' and not (grouped or direct or many):
                 args['left'] = self.saved(args.pop('left_id', ''))['recipe']
                 args['right'] = self.saved(args.pop('right_id', ''))['recipe']
             offset, limit = args.pop('offset', 0), args.pop('limit', 100)
@@ -999,6 +1018,9 @@ class EvidenceTools:
             rid = digest((recipe, fingerprint, offset, limit))
             self.memory['collections'][rid] = {
                 'recipe': recipe, 'fingerprint': fingerprint, 'total': len(rows),
+                'displayed_page': {'offset': offset, 'limit': limit, 'returned': len(shown),
+                                   'order_by': query_subject(recipe)['order_by'],
+                                   'next_offset': offset + len(shown) if limit and offset + len(shown) < len(rows) else None},
                 'displayed_ids': [r['_row_id'] for r in shown],
                 'preview': [{'name': r.get('name'), 'program': r.get('program'), 'row_id': r['_row_id']} for r in shown[:12]]}
             self.memory['collections'] = dict(list(self.memory['collections'].items())[-8:])
@@ -1131,7 +1153,12 @@ class EvidenceTools:
             rows = [r for r in rows if r.get('source_file', '').upper() == filename.upper()]
             if not rows:
                 raise ToolError(f'Source member {filename!r} unavailable or ambiguous. Exact available members: {available}.')
+            recorded_lines = {r['line'] for r in rows}
+            source_bounds = {'source_file': filename, 'first_recorded_line': min(recorded_lines),
+                             'last_recorded_line': max(recorded_lines),
+                             'scope': 'Recorded member bounds, not proof of an untruncated original file.'}
             requested = []
+            continuation_spans = []
             if args.get('paragraph'):
                 rows = [r for r in rows if str(r.get('paragraph') or '').upper() == args['paragraph'].upper()]
                 # Listing controls are not paragraph behavior. Exact physical-line
@@ -1143,17 +1170,31 @@ class EvidenceTools:
                     raise ToolError('Source spans must be [[start,end], ...].')
                 if any(type(n) is not int or n < 1 for s in spans for n in s) or any(s[1] < s[0] for s in spans):
                     raise ToolError('Invalid source span.')
-                if sum(b-a+1 for a,b in spans) > source_limit:
-                    raise ToolError(f'Source window exceeds {source_limit} lines; request smaller spans.')
-                requested = list(dict.fromkeys(n for a,b in spans for n in range(a,b+1)))
+                # Return a bounded, explicitly paged window instead of a
+                # repeatable size error. Never imply the whole requested span
+                # was read. Keep exact remaining addresses for continuation.
+                remaining = source_limit
+                for first, last in spans:
+                    end = min(last, first + remaining - 1)
+                    if remaining:
+                        requested.extend(range(first, end + 1))
+                        remaining -= end - first + 1
+                    if end < last:
+                        continuation_spans.append([max(first, end + 1), last])
+                requested = list(dict.fromkeys(requested))
                 rows = [r for r in rows if r['line'] in requested]
             if len(rows) > source_limit:
-                raise ToolError(f'Paragraph exceeds {source_limit} lines; read smaller source spans.')
+                continuation_spans = [[rows[source_limit]['line'], rows[-1]['line']]]
+                rows = rows[:source_limit]
             missing = [n for n in requested if n not in {r['line'] for r in rows}]
             return {'rows': [{'evidence_id': self.register(r), **r} for r in rows], 'returned': len(rows),
                     'paragraph_operations': self.paragraph_operations(args['program'], args['paragraph']) if args.get('paragraph') else [],
                     'paragraph_flow': self.paragraph_flow_context(args['program'], args['paragraph']) if args.get('paragraph') else {},
                     'missing_lines': missing, 'requested': args,
+                    'source_bounds': source_bounds,
+                    'requested_complete': not continuation_spans and not missing,
+                    'continuation_spans': continuation_spans,
+                    'past_recorded_end': bool(requested and min(requested) > source_bounds['last_recorded_line']),
                     'limitation': 'Physical source records only; no absent line is inferred.'}
         if tool == 'search':
             programs = args.get('programs') or list(self.programs)
@@ -1233,7 +1274,8 @@ class EvidenceTools:
         exchange = deepcopy(self.memory.get('last_exchange'))
         if exchange:
             exchange['answer'] = re.sub(r'\[(?:E\d+|Source \d+)(?:\s*[,\-]\s*(?:E\d+|Source \d+))*\]', '', exchange.get('answer', ''))
-        return {'evidence_scope': 'Evidence IDs expire each turn. Replay a saved result with select or query fresh evidence before citing it.',
+        return {'focus': reference_context(self.memory),
+                'evidence_scope': 'Evidence IDs expire each turn. Replay a saved result with select or query fresh evidence before citing it.',
                 'unresolved_turn': deepcopy(unresolved),
                 'focus_status': 'Previous successful context; latest request is unresolved.' if unresolved else 'Previous successful context.',
                 'active_subject': {'programs': recipe.get('args', {}).get('programs', []),
@@ -1243,5 +1285,6 @@ class EvidenceTools:
                                    'total': active.get('total')},
                 'last_result_id': self.memory.get('last_result_id'),
                 'last_exchange': exchange,
-                'results': {k: {'query': v['recipe'], 'total': v['total'], 'displayed': v['preview'][:5]}
+                'results': {k: {'query': v['recipe'], 'total': v['total'], 'displayed_page': deepcopy(v.get('displayed_page')),
+                               'displayed': v['preview'][:5]}
                             for k, v in list(self.memory['collections'].items())[-2:]}}

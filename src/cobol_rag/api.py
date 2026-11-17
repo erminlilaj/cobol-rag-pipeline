@@ -170,6 +170,7 @@ def chat(req: ChatRequest, request: Request) -> Any:
             "runtime": {
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "duration_ms": round((time.monotonic() - started) * 1000),
+                "token_usage": answer.debug.get('investigation', {}).get('token_usage'),
                 "llm": session.config.llm.model,
                 "embedding": session.config.embedding.model,
                 "collection": session.config.index.collection,

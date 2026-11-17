@@ -487,6 +487,7 @@ class Budget:
     def __init__(self, config, italian=False):
         self.config = config
         self.calls = 0
+        self.token_reports = []
         # Reserved for one failed-review recovery, not ordinary exploration.
         self.recovery_reserve = 2
         self.synthesis_reserve = 2
@@ -515,6 +516,10 @@ class Budget:
         model = build_llm(config, json_mode=True, max_output_tokens=4096 if detailed else 2048, temperature=0.0)
         response = model.chat([ChatMessage(role='system', content=system), ChatMessage(role='user', content=user)],
                               format='json')
+        # Record before parsing: rejected/malformed model decisions still cost
+        # generation tokens. Missing reports remain unknown, never zero.
+        from cobol_rag.token_usage import response_tokens
+        self.token_reports.append(response_tokens(response))
         result = parse_model_json(str(response.message.content or ''))
         if output_schema:
             from jsonschema import validate, ValidationError
@@ -1821,7 +1826,8 @@ def answer_with_investigation(question, config, state=None, target_program=None,
             language_status['input'] = 'failed: ' + str(exc)
             return legacy.QueryAnswer(question=original, answer='Non riesco a tradurre la domanda in modo sicuro; puoi riformularla o scriverla in inglese?',
                                       sources=[], route='unclear', execution_mode='clarification',
-                                      debug={'status':'translation_failed','language_adapter':language_status})
+                                      debug={'status':'translation_failed','language_adapter':language_status,
+                                             'investigation': {'token_usage': budget_token_usage(budget)}})
     resolution_error = None
     try:
         resolved = resolve_request(question, conversation_history, getattr(state, 'investigation_memory', {}), budget)
@@ -1889,7 +1895,8 @@ def answer_with_investigation(question, config, state=None, target_program=None,
              'evidence_disposition': {'state': 'grounded' if successful and technical else 'not_applicable',
                                       'evidence_ids': ids, 'reasons': result['errors']},
              'investigation': {'requirements': result['requirements'], 'coverage': result.get('coverage', []),
-                               'model_calls': budget.calls, 'tool_calls': result['tool_calls'], 'steps': result['trace']},
+                               'model_calls': budget.calls, 'tool_calls': result['tool_calls'], 'steps': result['trace'],
+                               'token_usage': budget_token_usage(budget)},
              'language_adapter': language_status}
     mode = 'investigation' if technical and successful else 'conversational' if plan.route == 'conversational' else 'clarification'
     trace_id = legacy.write_answer_trace(config, legacy._trace_payload(
@@ -1899,3 +1906,8 @@ def answer_with_investigation(question, config, state=None, target_program=None,
     return legacy.QueryAnswer(question=original, answer=answer, sources=sources, route=plan.route, scope=scope,
                               plan=plan, trace_id=trace_id, guard_status='sufficient' if successful and technical else 'not_applicable',
                               execution_mode=mode, debug=debug)
+
+
+def budget_token_usage(budget):
+    from cobol_rag.token_usage import summarize_tokens
+    return summarize_tokens(getattr(budget, 'token_reports', []), budget.calls)

@@ -1,6 +1,6 @@
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {render} = require('../ui/chat-export.js');
+const {render, runtimeSummary} = require('../ui/chat-export.js');
 
 const snapshot = {
     sessionId: 'session-123', startedAt: '2026-09-24T10:00:00Z',
@@ -33,4 +33,24 @@ test('partial snapshots and missing metadata are explicit', () => {
     assert.ok(html.includes('still running'));
     assert.ok(html.includes('2 queued questions'));
     assert.ok(!html.includes('Model: undefined'));
+});
+
+test('answer metrics show server time and provider input/output totals', () => {
+    const runtime = {duration_ms: 65123, token_usage: {input_tokens: 12000,
+        output_tokens: 250, total_tokens: 12250, complete: true, reported_calls: 3, model_calls: 3}};
+    assert.equal(runtimeSummary(runtime), 'Time: 1m 5.1s · Tokens: 12,250 (in 12,000 / out 250)');
+    const messages = [{role: 'assistant', content: 'Answer', metadata: {runtime}}];
+    assert.ok(render({...snapshot, messages, includeDebug: false}).includes('Tokens: 12,250'));
+});
+
+test('missing and partial token reports never look like complete zero usage', () => {
+    assert.equal(runtimeSummary({duration_ms: 1250}), 'Time: 1.3s · Tokens: unavailable');
+    assert.match(runtimeSummary({duration_ms: NaN}), /Time: unavailable/);
+    assert.match(runtimeSummary({token_usage: {input_tokens: 10, output_tokens: 2,
+        total_tokens: 12, reported_calls: 1, model_calls: 3, complete: false}}),
+        /reported subtotal.*12.*1 \/ 3 calls reported/);
+    assert.match(runtimeSummary({token_usage: {input_tokens: 0, output_tokens: 0,
+        total_tokens: 0, reported_calls: 1, model_calls: 1, complete: true}}), /Tokens: 0/);
+    assert.match(runtimeSummary({token_usage: {input_tokens: '<script>', output_tokens: 0,
+        total_tokens: 0, complete: true}}), /Tokens: unavailable/);
 });

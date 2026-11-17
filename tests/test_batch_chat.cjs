@@ -13,12 +13,16 @@ function page() {
     function element() {
         const listeners = new Map();
         return {
+            children: [],
             value: '', textContent: '', hidden: false, open: false, style: {},
             addEventListener(type, handler) { listeners.set(type, handler); },
             emit(type) { listeners.get(type)({preventDefault() {}}); },
             showModal() { this.open = true; },
             close() { this.open = false; },
-            appendChild() {}, scrollTo() {}, focus() {},
+            appendChild(child) { this.children.push(child); },
+            append(...children) { this.children.push(...children); },
+            prepend(child) { this.children.unshift(child); },
+            scrollTo() {}, focus() {},
         };
     }
     const elements = new Map(Array.from(html.matchAll(/\bid="([^"]+)"/g),
@@ -26,7 +30,7 @@ function page() {
     const requests = [];
     const messages = [];
     const context = vm.createContext({
-        AbortController, console,
+        AbortController, console, ChatExport: require('../ui/chat-export.js'),
         document: {getElementById: id => elements.get(id), addEventListener() {}, createElement: element},
         window: {localStorage: {getItem: () => 'test-session'}, addEventListener() {}},
         messages,
@@ -42,6 +46,7 @@ function page() {
     });
     vm.runInContext(script + `
         apiFetch = request;
+        const originalAppendMessage = appendMessage;
         createWaitingExperience = () => ({element: {remove() {}}, destroy() {}});
         appendMessage = (role, text) => messages.push([role, text]);
     `, context);
@@ -50,8 +55,20 @@ function page() {
             send: () => vm.runInContext('sendMessage()', context),
             reset: () => vm.runInContext('resetChat()', context),
             session: () => vm.runInContext('chatSessionId', context),
-            observe: value => { context.incoming = value; vm.runInContext('observeConversationContext(incoming)', context); }};
+            observe: value => { context.incoming = value; vm.runInContext('observeConversationContext(incoming)', context); },
+            showAnswer: metadata => { context.metadata = metadata; vm.runInContext("originalAppendMessage('assistant', 'Supported answer', [], metadata)", context); }};
 }
+
+test('answer bubble displays metrics outside collapsed debug details', () => {
+    const chat = page();
+    chat.showAnswer({runtime: {duration_ms: 2500, token_usage: {input_tokens: 1000,
+        output_tokens: 200, total_tokens: 1200, complete: true, reported_calls: 2, model_calls: 2}}});
+    const message = chat.get('chat-history').children.at(-1);
+    const content = message.children.find(child => child.className === 'content');
+    const metrics = content.children.find(child => child.className === 'answer-runtime');
+    assert.equal(metrics.textContent, 'Time: 2.5s · Tokens: 1,200 (in 1,000 / out 200)');
+    assert.match(metrics.title, /planning.*review.*retries/);
+});
 
 test('new tabs and empty refreshed transcripts get different conversation IDs', () => {
     const first = page(), second = page();

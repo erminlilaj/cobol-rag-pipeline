@@ -407,6 +407,14 @@ function appendMessage(role, content, sources = [], metadata = null) {
     contentDiv.className = 'content';
     contentDiv.innerHTML = renderMarkdownLite(content);
 
+    if (role === 'assistant' && metadata?.runtime) {
+        const metrics = document.createElement('div');
+        metrics.className = 'answer-runtime';
+        metrics.textContent = ChatExport.runtimeSummary(metadata.runtime);
+        metrics.title = 'Server processing time (not queue wait). Provider-reported input/output tokens across planning, answers, review and retries; excludes embeddings. Missing counts are not estimated.';
+        contentDiv.appendChild(metrics);
+    }
+
     if (role === 'assistant' && metadata?.execution_mode) {
         const metaDiv = document.createElement('div');
         metaDiv.className = 'answer-meta';

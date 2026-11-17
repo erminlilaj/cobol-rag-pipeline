@@ -31,6 +31,16 @@ bounded by the remaining budget; it is not a hard process cancellation timer.
 
 ## Current boundaries
 
+### Per-answer time and token display
+
+Every new API-backed answer displays server processing time and provider-reported
+input/output token totals across the question's planning, answer, review, retry
+and translation calls. Embedding tokens and browser queue wait are excluded.
+Reports are recorded before parsing, so invalid model JSON still contributes
+usage. Unreported/failed calls make usage an explicitly labelled subtotal;
+missing counts are unavailable, never character estimates or invented zeros.
+The same figures are included in both clean and debug transcript exports.
+
 ### Transcript regression repairs (2026-11-17)
 
 Source reads larger than the configured limit now return explicitly incomplete

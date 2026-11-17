@@ -329,6 +329,14 @@ h1 {
     padding: 24px;
 }
 
+.answer-runtime {
+    margin-top: 12px;
+    font-size: 0.8rem;
+    color: var(--text-secondary, #aeb8c7);
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+
 .message {
     display: flex;
     gap: 12px;

@@ -491,8 +491,8 @@ class Budget:
         # Reserved for one failed-review recovery, not ordinary exploration.
         self.recovery_reserve = 2
         self.synthesis_reserve = 2
-        self.maximum = config.investigation.max_model_calls + (2 if italian else 0) + self.recovery_reserve + self.synthesis_reserve
-        self.output_reserve = 1 if italian else 0
+        self.maximum = config.investigation.max_model_calls + (3 if italian else 0) + self.recovery_reserve + self.synthesis_reserve
+        self.output_reserve = 2 if italian else 0
         self.deadline = time.monotonic() + config.investigation.timeout_seconds
 
     def call(self, system, payload, output_schema=None, reserve=0):
@@ -1849,19 +1849,17 @@ def answer_with_investigation(question, config, state=None, target_program=None,
             'source_id': eid, 'source_file': source, 'chunk_type': row.get('_artifact', 'investigation'),
             'program': program}))
         answer = answer.replace(f'[{eid}]', f'[Source {index}]')
-    if language == 'it' and result['status'] != 'failed':
-        try:
-            lines, templates = legacy._separate_translation_lines(answer)
-            if lines:
-                translated = budget.call(legacy._ITALIAN_RENDER_PROMPT.format(lines_json=json.dumps(lines)), {})
-                localized = legacy._restore_translation_lines(translated.get('lines', []), templates)
-                if not localized or legacy._italian_translation_validation_reasons(answer, localized, preserve_layout=True):
-                    raise ToolError('Output translation changed facts or format.')
-                answer = localized
-                language_status['output'] = 'translated'
-        except Exception as exc:
-            language_status['output'] = 'english_fallback: ' + str(exc)
-    successful = result['status'] != 'failed'
+    delivery_passed = True
+    if language == 'it':
+        from cobol_rag.language_delivery import deliver_italian
+        reviewed_original = answer
+        answer, delivery = deliver_italian(answer, budget, legacy, failed=result['status'] == 'failed',
+                                         request=resolved)
+        language_status.update(delivery)
+        delivery_passed = delivery['passed']
+        if not delivery_passed:
+            language_status['reviewed_original_answer'] = reviewed_original
+    successful = result['status'] != 'failed' and delivery_passed
     technical = result.get('mode') == 'technical'
     programs = tuple(dict.fromkeys(r.metadata['program'] for r in sources if r.metadata['program']))
     rid = result.get('result_id')
@@ -1876,12 +1874,12 @@ def answer_with_investigation(question, config, state=None, target_program=None,
     memory = deepcopy(tools.memory) if successful and technical and config.investigation.memory_enabled else None
     scope = QueryScope(program=programs[0] if len(programs) == 1 else target_program,
                        programs=programs, intent='investigation', entity_source='investigation')
-    plan = QueryPlan(route='technical' if technical else 'conversational' if result['mode'] in {'general','conversational'} else 'unclear',
+    plan = QueryPlan(route='unclear' if not delivery_passed else 'technical' if technical else 'conversational' if result['mode'] in {'general','conversational'} else 'unclear',
                      program=scope.program, programs=scope.programs, intent='investigation',
                      response_language=language, response_language_source=language_source,
                      response_contract=response_contract(question), planner_source='model_led_investigation',
                      investigation_memory=memory)
-    debug = {'status': 'accepted' if successful else 'rejected', 'answer_status': result['status'],
+    debug = {'status': 'accepted' if successful else 'rejected', 'answer_status': result['status'] if delivery_passed else 'failed',
              'execution_strategy': 'model_led_investigation',
              'plan': {'route': plan.route, 'planner_source': 'model_led_investigation',
                       'resolved_request': next((s['resolved_request'] for s in result['trace'] if 'resolved_request' in s), None),
@@ -1891,7 +1889,9 @@ def answer_with_investigation(question, config, state=None, target_program=None,
                                            excerpt=json.dumps(row, ensure_ascii=False)[:6000],
                                            excerpt_truncated=len(json.dumps(row, ensure_ascii=False)) > 6000, cited=eid in ids)
                                         for eid, row in tools.evidence.items()]},
-             'validation': {'stage': 'investigation_answer_review', 'passed': successful, 'reasons': result['errors']},
+             'validation': {'stage': 'investigation_answer_review' if delivery_passed else 'language_delivery',
+                            'passed': successful, 'reasons': result['errors'] if delivery_passed else ['italian_delivery_failed']},
+             'evidence_validation': {'passed': result['status'] != 'failed', 'reasons': result['errors']},
              'evidence_disposition': {'state': 'grounded' if successful and technical else 'not_applicable',
                                       'evidence_ids': ids, 'reasons': result['errors']},
              'investigation': {'requirements': result['requirements'], 'coverage': result.get('coverage', []),

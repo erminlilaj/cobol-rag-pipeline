@@ -31,6 +31,30 @@ bounded by the remaining budget; it is not a hard process cancellation timer.
 
 ## Current boundaries
 
+### Strict Italian delivery (2026-11-18)
+
+Italian input and explicit Italian output requests retain their output language
+through the English-first investigation. Ordinary Italian formulations such as
+"Qual è lo scopo" are recognized; quoted code and compound technical identifiers
+do not vote for a prose language. Explicit language requests still take priority.
+
+The output adapter skips already-Italian replies, preserves fenced/raw source,
+filenames, identifiers, numbers, quoted values and citations, and validates each
+translation's line and placeholder structure. It attempts one targeted repair
+using specific validation reasons, within the existing wall-clock deadline.
+Italian questions reserve an extra output call for that repair, not more tools.
+
+Failed investigations receive a deterministic Italian notice without a model
+call. If safe localization cannot be produced, the primary answer is an Italian
+limitation notice, never a silent English fallback. Evidence-review status and
+language-delivery status are recorded separately, and a failed delivery cannot
+be committed as a successful technical memory turn. The reviewed original is
+retained only in debug metadata for diagnosis. Memory remains OFF.
+
+Offline tests cover preservation and protocol behavior; language recognition and
+translation still need live model retesting, and do not constitute semantic proof
+that every translation preserves meaning.
+
 ### Per-answer time and token display
 
 Every new API-backed answer displays server processing time and provider-reported

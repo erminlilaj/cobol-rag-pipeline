@@ -512,12 +512,23 @@ _ENGLISH_LANGUAGE_MARKERS = frozenset({
     "explain", "good", "hello", "hey", "hi", "how", "is", "list", "morning",
     "night", "please", "reply", "show", "speak", "sure", "tell", "thank",
     "thanks", "the", "what", "where", "which", "why", "write", "you", "your",
+    "following", "contains", "called", "calls", "passed", "returns", "returning",
+    "from", "when", "then", "otherwise", "using", "with", "through",
 })
 _ITALIAN_LANGUAGE_MARKERS = frozenset({
     "bene", "buongiorno", "buonanotte", "buonasera", "certo", "che", "chi",
     "ciao", "come", "cosa", "dove", "grazie", "il", "la", "le", "perche",
     "perché", "potresti", "puoi", "quale", "quali", "rispondi", "scrivi",
     "sono", "spiega", "stai", "sto", "tu", "usa",
+    "qual", "è", "salve", "parli", "sì", "scopo", "principale", "quante",
+    "quanti", "elenca", "mostra", "descrivi", "confronta", "viene", "vengono",
+    "chiamati", "chiamato", "programma", "programmi", "variabili", "righe",
+    "significa", "funziona", "spiegami", "differenza", "analizzati",
+    "non", "nessun", "nessuna", "nessuno", "questo", "questa", "questi",
+    "nel", "nella", "delle", "della", "degli",
+    "paragrafo", "paragrafi", "parametro", "parametri",
+    "valore", "valori", "chiamata", "restituisce", "risposta",
+    "disponibile", "disponibili",
 })
 
 
@@ -531,7 +542,11 @@ def detect_message_language(message: str) -> str | None:
 
 def language_marker_scores(message: str) -> tuple[int, int]:
     """Return English and Italian marker counts for monolingual reply validation."""
-    tokens = re.findall(r"[^\W\d_]+", message.casefold(), flags=re.UNICODE)
+    # Quoted code, source members and compound identifiers are data, not a
+    # language preference (e.g. SHOW-ERROR must not count as English "show").
+    prose = re.sub(r"```[\s\S]*?```|`[^`]*`|'[^'\n]*'|\"[^\"\n]*\"", " ", message)
+    prose = re.sub(r"\b[\w]+(?:[-.][\w]+)+\b|\b\w*\d\w*\b", " ", prose)
+    tokens = re.findall(r"[^\W\d_]+", prose.casefold(), flags=re.UNICODE)
     if not tokens:
         return 0, 0
     english_score = sum(token in _ENGLISH_LANGUAGE_MARKERS for token in tokens)

@@ -503,7 +503,9 @@ English line:
 """
 
 _TRANSLATION_PROTECTED_SPAN = re.compile(
-    r"`[^`]*`|\[Source\s+\d+\]|'(?:[^'\n]|'')*'|\"(?:[^\"\n]|\"\")*\"|"
+    r"`[^`]*`|\[(?:Source\s+\d+|E\d+(?:[-, ]+E?\d+)*)\]|"
+    r"[A-Za-z0-9_./\\-]+\.(?i:jsonl|json|cbl|cob|cpy|jcl|proc|prc|bms|sql|txt|csv|toml|yaml|md|log)\b|"
+    r"'(?:[^'\n]|'')*'|\"(?:[^\"\n]|\"\")*\"|"
     r"(?<![A-Za-z0-9-])(?:[A-Z][A-Z0-9]{2,}|[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+)(?![A-Za-z0-9-])|"
     r"(?<![A-Za-z0-9])-?\d+(?:\.\d+)?(?![A-Za-z0-9])"
 )
@@ -538,9 +540,22 @@ def _separate_translation_lines(
     """Replace evidence inside each line while leaving the model enough grammar."""
     translatable: list[str] = []
     templates: list[tuple[str, str, tuple[str, ...], int | None]] = []
+    fence = None
     for original in answer.splitlines(keepends=True):
         newline = "\n" if original.endswith("\n") else ""
         line = original[:-1] if newline else original
+        marker = re.match(r'^\s*(`{3,}|~{3,})', line)
+        if marker:
+            token = marker.group(1)
+            if fence is None:
+                fence = token
+            elif token[0] == fence[0] and len(token) >= len(fence):
+                fence = None
+            templates.append((line, newline, (), None))
+            continue
+        if fence or re.match(r'^\s*//', line) or re.match(r'^[ \t]{6,}[A-Z0-9*]', line):
+            templates.append((line, newline, (), None))
+            continue
         prefix_match = re.match(r"^[ \t]*(?:[-*][ \t]+)?", line)
         prefix = prefix_match.group(0) if prefix_match else ""
         body = line[len(prefix):]
@@ -566,6 +581,10 @@ def _restore_translation_lines(
     translated: list[str],
     templates: list[tuple[str, str, tuple[str, ...], int | None]],
 ) -> str | None:
+    expected = sum(index is not None for _, _, _, index in templates)
+    if not isinstance(translated, list) or len(translated) != expected or any(
+            not isinstance(line, str) or '\n' in line or '\r' in line for line in translated):
+        return None
     rendered: list[str] = []
     for prefix, newline, protected, index in templates:
         if index is None:
@@ -642,8 +661,10 @@ def _italian_translation_validation_reasons(
     reasons = list(_translation_validation_reasons(
         source, translated, preserve_layout=preserve_layout,
     ))
-    source_prose = _TRANSLATION_PROTECTED_SPAN.sub("", source)
-    translated_prose = _TRANSLATION_PROTECTED_SPAN.sub("", translated)
+    source_lines, _ = _separate_translation_lines(source)
+    translated_lines, _ = _separate_translation_lines(translated)
+    source_prose = re.sub(r'\[\[P\d+\]\]', '', '\n'.join(source_lines))
+    translated_prose = re.sub(r'\[\[P\d+\]\]', '', '\n'.join(translated_lines))
     normalized_source = " ".join(re.findall(
         r"[^\W\d_]+", source_prose.casefold(), flags=re.UNICODE,
     ))

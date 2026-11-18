@@ -64,3 +64,6 @@ def test_budget_counts_rejected_json_and_transport_gaps_without_cross_question_l
     assert usage['total_tokens'] == 150 and not usage['complete']
     assert usage['reported_calls'] == 2 and usage['model_calls'] == 3
     assert budget_token_usage(Budget(AppConfig()))['total_tokens'] is None
+    assert [event['status'] for event in budget.model_events] == ['invalid_json', 'ok', 'transport_or_model_error']
+    assert all(event['duration_ms'] >= 0 for event in budget.model_events)
+    assert budget.model_events[0]['token_usage'] == {'input_tokens': 50, 'output_tokens': 10}

@@ -31,6 +31,40 @@ bounded by the remaining budget; it is not a hard process cancellation timer.
 
 ## Current boundaries
 
+### Scoped trace recovery and source review (2026-11-18)
+
+- Catalogue-confirmed internal paragraph names cannot become external-call
+  obligations. Incomplete singular and plural call-role metadata is omitted,
+  while the original question and independently reviewed directions remain binding.
+- Combined call-query rows can support separate callee dimensions using their
+  actual caller/target facts, without weakening wrong-caller, wrong-target or
+  missing-dimension checks. Query scope is not confused with a reversed call.
+- Cached and empty reads no longer force a global final-only response. Three
+  successive tool rounds adding no evidence still stop; model/time/tool limits
+  remain unchanged. Duplicate evidence and a useful new lookup may coexist.
+- Ambiguous multi-collection lists get a semantic classification during review;
+  narrative supporting observations do not require an arbitrary intersection.
+  Explicit set comparisons still require a derived answer set and real
+  inventories retain member-completeness checks.
+- `source_outline` locates physical division headers and procedure paragraphs
+  by recorded verbs/terms. It is navigation, not an execution proof. Unknown
+  paragraphs expose valid names rather than implying the logic is absent.
+- Unambiguous explicitly named local programs scope entity lookups. Incoming
+  caller searches are never silently narrowed to their target program.
+- Requested semantic checks produce explicit source-claim verdicts during review.
+  Bounded condition windows retain focal variables and controlled statements;
+  storage queries explicitly disclose exact-identifier-only coverage. Empty
+  direct-access results cannot be presented as complete storage-effect proof.
+- Citation groups/ranges are expanded only through selected registered IDs.
+  Per-model-call phase, time, reported usage, error status and available stop
+  reason are retained, including malformed JSON; failed tool arguments and
+  bounded rejected candidates are available for diagnosis.
+
+These checks improve evidence discipline but cannot prove that a model will
+correctly interpret every unseen program. Live replay of the failed questions
+and new variants is required. No additional model or indexing dependency was
+introduced; memory remains OFF.
+
 ### Strict Italian delivery (2026-11-18)
 
 Italian input and explicit Italian output requests retain their output language

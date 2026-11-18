@@ -38,7 +38,8 @@ def deliver_italian(answer, budget, legacy, *, failed=False, request=None):
                     previous_json=json.dumps(rejected, ensure_ascii=False))
             else:
                 instructions = legacy._ITALIAN_RENDER_PROMPT.format(lines_json=json.dumps(lines, ensure_ascii=False))
-            response = budget.call(instructions, {'resolved_request': request or {}}, reserve=0 if attempt else 1)
+            response = budget.call(instructions, {'resolved_request': request or {}}, reserve=0 if attempt else 1,
+                                   phase='output_translation_repair' if attempt else 'output_translation')
             rejected = response.get('lines') if isinstance(response, dict) else None
             localized = legacy._restore_translation_lines(rejected, templates)
             reasons = list(legacy._italian_translation_validation_reasons(

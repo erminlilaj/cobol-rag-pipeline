@@ -60,6 +60,13 @@ delegates behavior to an included member; stop paging a member at its recorded E
 Read a paragraph with source(program,paragraph); linked paragraph_operations describe
 expanded COPY behavior. COPY/INCLUDE are inclusion directives, EJECT/SKIP are listing
 directives, not runtime actions. Preserve exact statement text, operands and conditions.
+When the location is unknown, use source_outline(program, verbs or terms) to find
+actual procedure paragraphs, then read their source. For calculations, locate
+arithmetic verbs instead of matching an English business word against Italian
+identifiers. For parameter validation inspect IF/EVALUATE procedure locations,
+not only declarations. An unknown paragraph or an empty source window is a
+navigation failure, not proof the requested logic is absent. Keep describe and
+search scoped to the explicitly named program unless corpus scope was requested.
 Honor source_role: boundary comments have no established paragraph ownership.
 Static fallthrough edges do not establish execution after an expanded terminating operation.
 Incoming paragraph edges explain entry conditions; the body explains what happens after entry.
@@ -262,7 +269,7 @@ def canonical_order(value):
             'name ascending': 'name', 'name desc': '-name'}.get(value, value)
 
 
-def usable_request(request):
+def usable_request(request, entities=()):
     """Omit incomplete role metadata rather than freeze a guessed direction.
 
     The original question is unchanged and the independent review still checks
@@ -271,11 +278,23 @@ def usable_request(request):
     request = deepcopy(request)
     if not request:
         return request
-    relation = request.get('call_relation')
-    if relation:
+    program_names = {e['name'].upper() for e in entities if e.get('entity_type') == 'program'}
+    paragraph_names = {e['name'].upper() for e in entities if e.get('entity_type') in {'paragraph', 'paragraphs'}} - program_names
+    def usable(relation):
         subject = {'incoming': 'targets', 'outgoing': 'callers'}.get(relation.get('direction'))
-        if not subject or not relation.get(subject):
-            request.pop('call_relation')
+        # External call contracts cannot bind internal paragraphs. The original
+        # question remains authoritative and its flow evidence is still reviewed.
+        names = {str(name).upper() for key in ('targets', 'callers') for name in relation.get(key, [])}
+        names.add(str(relation.get('target', '')).upper())
+        return bool(subject and relation.get(subject)) and not (names & paragraph_names)
+    if request.get('call_relation') and not usable(request['call_relation']):
+        request.pop('call_relation')
+    if request.get('call_relations'):
+        relations = [r for r in request['call_relations'] if usable(r)]
+        if relations:
+            request['call_relations'] = relations
+        else:
+            request.pop('call_relations')
     return request
 
 
@@ -488,6 +507,7 @@ class Budget:
         self.config = config
         self.calls = 0
         self.token_reports = []
+        self.model_events = []
         # Reserved for one failed-review recovery, not ordinary exploration.
         self.recovery_reserve = 2
         self.synthesis_reserve = 2
@@ -495,7 +515,7 @@ class Budget:
         self.output_reserve = 2 if italian else 0
         self.deadline = time.monotonic() + config.investigation.timeout_seconds
 
-    def call(self, system, payload, output_schema=None, reserve=0):
+    def call(self, system, payload, output_schema=None, reserve=0, phase='decision'):
         from llama_index.core.llms import ChatMessage
         from cobol_rag.index import build_llm
         remaining = self.deadline - time.monotonic()
@@ -510,17 +530,36 @@ class Budget:
         if len(system) + len(user) > context_window * 3 - 3000:
             raise ToolError('Context budget exceeded; narrow evidence pages or request scope.')
         self.calls += 1
+        started = time.monotonic()
+        event = {'call': self.calls, 'phase': phase, 'status': 'started'}
+        self.model_events.append(event)
         config = replace(self.config, llm=replace(self.config.llm, context_window=context_window, request_timeout=max(1, min(remaining, self.config.llm.request_timeout))))
         # Final answers need room for both detailed prose and closing JSON fields.
         detailed = (payload.get('resolved_request') or {}).get('depth') == 'detailed'
-        model = build_llm(config, json_mode=True, max_output_tokens=4096 if detailed else 2048, temperature=0.0)
-        response = model.chat([ChatMessage(role='system', content=system), ChatMessage(role='user', content=user)],
-                              format='json')
+        try:
+            model = build_llm(config, json_mode=True, max_output_tokens=4096 if detailed else 2048, temperature=0.0)
+            response = model.chat([ChatMessage(role='system', content=system), ChatMessage(role='user', content=user)],
+                                  format='json')
+        except Exception as error:
+            event.update(status='transport_or_model_error', error_type=type(error).__name__)
+            raise
+        finally:
+            event['duration_ms'] = round((time.monotonic() - started) * 1000, 2)
         # Record before parsing: rejected/malformed model decisions still cost
         # generation tokens. Missing reports remain unknown, never zero.
         from cobol_rag.token_usage import response_tokens
-        self.token_reports.append(response_tokens(response))
-        result = parse_model_json(str(response.message.content or ''))
+        usage = response_tokens(response)
+        self.token_reports.append(usage)
+        event['token_usage'] = usage
+        event['status'] = 'response_received'
+        raw = getattr(response, 'raw', None)
+        if isinstance(raw, dict):
+            event['stop_reason'] = raw.get('done_reason') or raw.get('finish_reason')
+        try:
+            result = parse_model_json(str(response.message.content or ''))
+        except Exception as error:
+            event.update(status='invalid_json', error_type=type(error).__name__)
+            raise
         if output_schema:
             from jsonschema import validate, ValidationError
             result = normalize_decision(result, None)
@@ -528,6 +567,7 @@ class Budget:
             try:
                 validate(result, output_schema)
             except ValidationError as error:
+                event.update(status='invalid_schema', schema_path=list(error.absolute_path))
                 failure = ToolError(f'Invalid decision at {list(error.absolute_path)}: {error.message}; received {str(error.instance)[:300]}')
                 if result.get('action') == 'tools' and len(result.get('calls', [])) == 1:
                     failure.failed_call = result['calls'][0]
@@ -536,6 +576,7 @@ class Budget:
                     if path[0] == 'calls' and isinstance(path[1], int):
                         failure.failed_call = result['calls'][path[1]]
                 raise failure from error
+        event['status'] = 'ok'
         return result
 
 
@@ -583,6 +624,20 @@ def review_answer(budget, instructions, payload, trace):
         'requested_call_relation': {'type': ['object', 'null']},
     }
     required = ['passed', 'issues']
+    semantic_checks = (payload.get('resolved_request') or {}).get('analysis_checks', [])
+    if semantic_checks:
+        properties['source_claim_checks'] = {'type': 'array', 'minItems': 1, 'maxItems': 20,
+            'items': {'type': 'object', 'required': ['check', 'claim', 'supported', 'reason'],
+                      'properties': {'claim': {'type': 'string', 'minLength': 1},
+                                     'check': {'enum': semantic_checks},
+                                     'supported': {'type': 'boolean'}, 'reason': {'type': 'string', 'minLength': 1}},
+                      'additionalProperties': False}}
+        required.append('source_claim_checks')
+    request_metadata = payload.get('resolved_request') or {}
+    if (request_metadata.get('output') == 'list' and not request_metadata.get('collection_semantics')
+            and len(payload.get('verified_collections', [])) > 1):
+        properties['requested_collection_semantics'] = {'enum': ['inventory', 'set_comparison', 'sections', 'narrative']}
+        required.append('requested_collection_semantics')
     if any(c.get('relation') for c in payload['evidence_contracts']):
         properties['requested_call_relation'] = {
             'type': 'object', 'required': ['direction'],
@@ -605,6 +660,8 @@ def review_answer(budget, instructions, payload, trace):
                       {'if': {'properties': {'direction': {'const': 'not_requested'}}},
                        'then': {'required': ['reason']}}],
         }
+        properties['requested_call_relations'] = {'type': 'array',
+            'items': properties['requested_call_relation'], 'minItems': 1}
         required.append('requested_call_relation')
         if (payload.get('resolved_request') or {}).get('call_relations'):
             properties['requested_call_relations'] = {'type': 'array',
@@ -613,6 +670,13 @@ def review_answer(budget, instructions, payload, trace):
             required.append('requested_call_relations')
     contract = {'type': 'object', 'properties': properties, 'required': required,
                 'additionalProperties': False}
+    if (any(c.get('relation') for c in payload['evidence_contracts'])
+            and not request_metadata.get('call_relation') and not request_metadata.get('call_relations')):
+        # A call-site/interface explanation can naturally have one or several
+        # independently interpreted dimensions. Both forms remain fully typed.
+        required.remove('requested_call_relation')
+        contract['anyOf'] = [{'required': ['requested_call_relation']},
+                             {'required': ['requested_call_relations']}]
     validator = Draft202012Validator(contract)
     # Keep exact executor contracts for local checks, but do not send thousands
     # of identical corpus-scope names in every reviewer envelope.
@@ -635,6 +699,18 @@ def review_answer(budget, instructions, payload, trace):
                      'the DD identifier. For lineage preserve branch-dependent assignments. '
                      'A paragraph following an EXIT label does not prove normal continuation '
                      'of a PERFORM THRU; require evidence about the actual caller and range.')
+    if semantic_checks:
+        instructions += ('\nPerform the requested analysis_checks explicitly. Return source_claim_checks for '
+                         'the material claims, not just a generic approval. Compare condition polarity and '
+                         'controlled statements against source_context; preserve the exact focal variable and '
+                         'destination. For storage effects, exact group-name accesses do not cover child fields, '
+                         'aliases or writes by a by-reference callee. Missing JCL links do not negate file I/O '
+                         'evidence of batch-style processing. A partial disclaimer cannot excuse a contradicted '
+                         'categorical claim. Set supported=false for any such claim and reject the answer.')
+    if 'requested_collection_semantics' in required:
+        instructions += ('\nResolve requested_collection_semantics from the ORIGINAL question: narrative uses '
+                         'several observations to explain behavior; set_comparison requires a computed shared, '
+                         'exclusive or union set; inventory enumerates members; sections contains separate lists.')
     if (payload.get('resolved_request') or {}).get('call_relations'):
         instructions += ('\nFor this multi-relationship request return requested_call_relations, '
                          'one typed entry per original relationship dimension. Preserve both incoming '
@@ -661,7 +737,7 @@ def review_answer(budget, instructions, payload, trace):
                     'Still reject unsupported claims of guaranteed execution or exclusive entry, '
                     'and truncated compound conditions. If only wording overstates the evidence, '
                     'use repair=answer rather than demanding the same evidence again.')
-            review = budget.call(scoped_instructions, request, reserve=budget.output_reserve)
+            review = budget.call(scoped_instructions, request, reserve=budget.output_reserve, phase='review')
             if isinstance(review, dict):
                 # Lossless envelope normalization; never change the review verdict.
                 repair = review.get('repair')
@@ -706,6 +782,13 @@ def review_answer(budget, instructions, payload, trace):
                         if role != subject and relation.get(role) == []:
                             relation.pop(role)
             errors = [e.message for e in validator.iter_errors(review)]
+            if not errors and semantic_checks and not set(semantic_checks) <= {
+                    check['check'] for check in review.get('source_claim_checks', [])}:
+                errors.append('source_claim_checks must cover every requested analysis_check.')
+            if not errors and any(not check['supported'] for check in review.get('source_claim_checks', [])):
+                review = {**review, 'passed': False, 'repair': 'answer',
+                          'issues': [*review['issues'], *[check['reason'] for check in review['source_claim_checks']
+                                                        if not check['supported']]]}
         except (ValueError, TypeError) as exc:
             review, errors = None, [str(exc)]
         trace.append({'review_response': review, 'review_protocol_errors': errors,
@@ -780,8 +863,8 @@ def call_review_errors(review, contracts):
         if relation.get('inputs'):
             return [leaf for child in relation['inputs'] for leaf in leaves(child)]
         return [relation]
-    relations = {str(i): relation for i, relation in enumerate(
-        leaf for c in contracts if c.get('relation') for leaf in leaves(c['relation']))}
+    relations = [(leaf, contract) for contract in contracts if contract.get('relation')
+                 for leaf in leaves(contract['relation'])]
     if not relations:
         return []
     requested = review.get('requested_call_relation')
@@ -796,7 +879,8 @@ def call_review_errors(review, contracts):
         return ['Requested call relation has no subject.']
     subjects = {s.upper() for s in subjects}
     matched = set()
-    for relation in relations.values():
+    row_targets = {}
+    for relation, contract in relations:
         callers = {str(p).upper() for p in relation.get('caller_scope', [])}
         targets = {str(v).upper() for p in relation.get('target_filters', [])
                    if p.get('op') in {'eq', 'in'}
@@ -806,10 +890,16 @@ def call_review_errors(review, contracts):
             requested_targets.add(str(requested['target']).upper())
         if requested['direction'] == 'outgoing' and (not targets or targets == requested_targets):
             matched.update(subjects & callers)
+        if requested['direction'] == 'outgoing' and requested_targets and contract.get('call_type'):
+            caller = str(contract.get('caller') or contract.get('program') or '').upper()
+            target = str(contract.get('target') or '').upper()
+            if caller in callers and caller in subjects and target in requested_targets and (not targets or target in targets):
+                row_targets.setdefault(caller, set()).add(target)
         if requested['direction'] == 'incoming':
             required_callers = {str(p).upper() for p in requested.get('callers', [])}
             if not required_callers or required_callers <= callers:
                 matched.update(subjects & targets)
+    matched.update(caller for caller, targets in row_targets.items() if requested_targets <= targets)
     if subjects <= matched:
         return []
     return [f'call_direction_mismatch: requested {requested["direction"]} relative to {sorted(subjects - matched)}; retrieve the matching relationship, not its reverse.']
@@ -963,7 +1053,12 @@ def answer_checks(question, candidate, tools, requirements, request=None):
     if not isinstance(ids, list) or any(i not in tools.evidence for i in ids):
         reasons.append('unknown_evidence_reference')
         ids = []
-    citations = re.findall(r'\[(E\d+)\]', answer)
+    from cobol_rag.citations import evidence_ids
+    try:
+        citations = evidence_ids(answer)
+    except ValueError:
+        citations = []
+        reasons.append('invalid_citation_range')
     if any(i not in ids for i in citations):
         reasons.append('unlisted_citation')
     if candidate.get('mode') == 'technical' and not ids:
@@ -986,6 +1081,11 @@ def answer_checks(question, candidate, tools, requirements, request=None):
         reasons.append('corpus_entity_answer_requires_evidence')
     cited_rows = [tools.evidence[i] for i in ids]
     cited_rows += [member for row in list(cited_rows) for member in row.get('member_rows', [])]
+    if request and 'storage_effects' in request.get('analysis_checks', []) and candidate.get('status') == 'complete':
+        exact_accesses = [row for row in cited_rows if row.get('_artifact') == 'verified_collection_operation'
+                         and row.get('recipe', {}).get('args', {}).get('table') == 'variable_access']
+        if exact_accesses and all(row.get('total_matches') == 0 for row in exact_accesses):
+            reasons.append('Storage-effect coverage is partial: empty exact-identifier access queries do not establish absence of child-field, alias or callee writes. Mark partial and state these gaps.')
     if candidate.get('mode') == 'technical' and candidate.get('status') == 'complete':
         for context in getattr(tools, 'group_contexts', []):
             fields = context['candidate_source_fields']
@@ -1105,7 +1205,7 @@ def answer_checks(question, candidate, tools, requirements, request=None):
                 group['rows'].update(r.get('_row_id', digest(r)) for r in bundle.get('member_rows', []))
                 group['positions'].update(range(bundle.get('offset', 0), bundle.get('offset', 0) + bundle.get('returned', 0)))
             start = request.get('offset', 0)
-            if not groups or any(not set(range(start, min(g['total'], start + (request.get('limit') or g['total'])))) <= g['positions'] for g in groups.values()):
+            if request.get('collection_semantics') != 'narrative' and (not groups or any(not set(range(start, min(g['total'], start + (request.get('limit') or g['total'])))) <= g['positions'] for g in groups.values())):
                 reasons.append('Requested collection is incomplete; retrieve the missing members before finalizing.')
             if any(p < start or (request.get('limit') and p >= start + request['limit'])
                    for g in groups.values() for p in g['positions']):
@@ -1124,7 +1224,7 @@ def answer_checks(question, candidate, tools, requirements, request=None):
                         r'\b(?:more|remaining|next|additional)\b', answer, re.I):
                     reasons.append('Large inventory is a partial page: state the exact total, list this page, and say more remain or give the next offset.')
         separate_sections = request and request.get('collection_semantics') in {'sections', 'inventory'}
-        if len({digest(b.get('recipe')) for b in bundles}) > 1 and not rid and not separate_sections:
+        if len({digest(b.get('recipe')) for b in bundles}) > 1 and not rid and request and request.get('collection_semantics') == 'set_comparison':
             inputs = list(dict.fromkeys(b['result_id'] for b in bundles))
             reasons.append('Multiple input collections do not define the answer set. Select or compare the requested members and return its result_id; cite other collections only as context. '
                            'For a set comparison call tool="compare" with args={"left_id": "' + inputs[0] + '", "right_id": "' + inputs[1] + '", "field": "name", "operation": "intersection", "limit": 100}. '
@@ -1185,6 +1285,12 @@ absence is requested. A positive job-and-step lookup is not a whole-job inventor
 Set collection_semantics=sections for separate lists or dimensions (such as incoming
 and outgoing relationships), inventory for enumeration, set_comparison for shared,
 exclusive or union membership. Do not turn separate lists into an intersection.
+Use collection_semantics=narrative when a list is only the presentation of an
+explanation/trace assembled from supporting observations, not an exhaustive member inventory.
+Set analysis_checks to the relevant checks among condition_scope, flow_destinations,
+storage_effects and execution_environment when those aspects are requested.
+Paragraph callers reached by PERFORM are INTERNAL flow relationships: do not create
+an external call_relation for a paragraph or a question about its performed range.
 questions about particular program contents still require corpus evidence. Social requests
 and general questions must not inherit a previous technical topic.
 Preserve caller -> target meaning in the standalone question.
@@ -1223,10 +1329,10 @@ Your resolution will be checked against the original request.'''
     return usable_request(budget.call(instructions, {'recent_conversation': history or '',
                        'conversation_focus': focus,
                        'previous_verified_query': focus.get('result', {}).get('recipe') or None,
-                       'CURRENT QUESTION': question}, contract, reserve=3))
+                       'CURRENT QUESTION': question}, contract, reserve=3, phase='resolution'))
 
 
-def synthesize_partial(question, request, requirements, tools, observations, errors, budget, trace):
+def synthesize_partial(question, request, requirements, tools, observations, errors, budget, trace, entities=()):
     """Spend reserved calls on grounded synthesis + independent review, never tools.
 
     Failure to explore completely is not failure to know anything. This path
@@ -1255,7 +1361,7 @@ def synthesize_partial(question, request, requirements, tools, observations, err
         payload = pack_observations(payload, instructions,
             max(budget.config.investigation.context_window, budget.config.llm.context_window))
         candidate = normalize_decision(budget.call(instructions, payload, contract,
-                                                  reserve=budget.output_reserve + 1), tools)
+                                                  reserve=budget.output_reserve + 1, phase='partial_synthesis'), tools)
         if candidate.get('action') != 'final' or candidate.get('status') != 'partial' or not candidate.get('evidence_ids'):
             raise ToolError('Partial synthesis must provide a cited partial final answer.')
         candidate['mode'] = 'technical'
@@ -1266,8 +1372,10 @@ def synthesize_partial(question, request, requirements, tools, observations, err
             raise ToolError('Partial synthesis rejected: ' + '; '.join(checks))
         ids = candidate['evidence_ids']
         rows = [{'evidence_id': i, **tools.evidence[i]} for i in ids]
-        contracts = [{'evidence_id': i, 'relation': tools.evidence[i].get('relation')}
+        contracts = [{'evidence_id': i, **{key: tools.evidence[i][key] for key in
+                      ('program', 'caller', 'target', 'call_type', 'relation') if key in tools.evidence[i]}}
                      for i in ids if tools.evidence[i].get('relation')]
+        from cobol_rag.source_review import review_context
         review = review_answer(budget,
             'Independently review this PARTIAL answer against the ORIGINAL question and untrusted evidence. '
             'Accept useful supported facts and clearly labelled source-based interpretations, with explicit gaps. '
@@ -1281,7 +1389,8 @@ def synthesize_partial(question, request, requirements, tools, observations, err
             {'original_question': question, 'question': question, 'candidate': candidate,
              'resolved_request': request, 'requirements': requirements,
              'evidence': tool_view({'rows': rows}, budget.config.investigation.preview_chars),
-             'evidence_contracts': contracts, 'verified_collections': collection_contracts(tools, ids)}, trace)
+             'evidence_contracts': contracts, 'verified_collections': collection_contracts(tools, ids),
+             'source_context': review_context(tools, entities)}, trace)
         failures = call_review_errors(review, contracts)
         if request and request.get('call_relation'):
             failures += call_review_errors({'requested_call_relation': request['call_relation']}, contracts)
@@ -1320,6 +1429,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
     finalize_existing = False
     pagination_notice = None
     repeated_no_progress = 0
+    stagnant_rounds = 0
     previous_protocol_error = None
     repeated_answer = {'signature': None, 'count': 0}
     def stopped_repeated_answer(reply, issues):
@@ -1334,7 +1444,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
         trace.append({'status': 'stopped_repeated_answer', 'issues': list(issues)})
         return True
     known_entities = tools.mentioned_entities(question)
-    request = usable_request(resolved_request)
+    request = usable_request(resolved_request, known_entities)
     if request:
         trace.append({'resolved_request': request})
     # Previous collections describe conversational referents, not proof for
@@ -1345,6 +1455,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
     attempts = 0
     while budget.calls < core_limit - 1 and attempts < config.investigation.max_model_calls + 2 and time.monotonic() < budget.deadline:
         attempts += 1
+        evidence_at_attempt = len(tools.evidence)
         payload = {'question': request['resolved_question'] if request else question, 'original_question': question,
                    'default_program': target_program or getattr(state, 'current_program', None),
                    'known_entity_roles': known_entities[:30],
@@ -1476,11 +1587,12 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         review_rows.append({'evidence_id': i, **{k: v for k, v in row.items() if k != 'member_rows'}})
                         review_rows.extend({'evidence_id': i, **member} for member in row.get('member_rows', []))
                     support = tool_view({'rows': review_rows}, config.investigation.preview_chars)
+                    from cobol_rag.source_review import review_context
                     # Preserve typed facts and execution scope outside prose
                     # compaction. Review the selected paragraph's other known
                     # operations too, not only the one the answer cherry-picked.
                     contracts = [{'evidence_id': i, **{k: r[k] for k in
-                        ('program', 'entity_type', 'metric_facts', 'relation', 'call_type',
+                        ('program', 'caller', 'entity_type', 'metric_facts', 'relation', 'call_type',
                          'commarea', 'parameters', 'target', 'target_variable', 'target_resolution') if k in r}}
                         for i, r in tools.evidence.items() if i in decision.get('evidence_ids', [])]
                     hosts = {(r.get('program'), r.get('paragraph')) for r in review_rows if r.get('paragraph')}
@@ -1562,6 +1674,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                          'requirements': requirements, 'conversation': conversation, 'resolved_request': request,
                          'evidence_contracts': contracts, 'known_entity_roles': known_entities[:30],
                          'verified_collections': collection_contracts(tools, decision.get('evidence_ids', [])),
+                         'source_context': review_context(tools, known_entities),
                          'paragraph_context': paragraph_context[:20], 'paragraph_flow': paragraph_flow,
                          'execution_contracts': [dict(program=p, paragraph=name,
                              operations=tools.paragraph_operations(p, name),
@@ -1569,6 +1682,12 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                                           'SKIP/EJECT are listing directives, never executed.',
                                           'Do not describe normal continuation after termination from a static edge.'])
                              for p, name in sorted(requested_paragraphs)[:4]]}, trace)
+                    if review.get('requested_collection_semantics'):
+                        request = {**request, 'collection_semantics': review['requested_collection_semantics']}
+                        semantic_errors = answer_checks(question, candidate, tools, requirements, request)
+                        if semantic_errors:
+                            review = {**review, 'passed': False, 'repair': 'evidence',
+                                      'issues': [*review.get('issues', []), *semantic_errors]}
                     relation_errors = call_review_errors(review, contracts)
                     if request and request.get('call_relations'):
                         relation_errors += call_review_errors({'requested_call_relations': request['call_relations']}, contracts)
@@ -1609,7 +1728,9 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                             relation_errors.append('Requested callee changed during investigation; preserve the resolved target.')
                     if review.get('passed') is not True or relation_errors:
                         errors = list(review.get('issues') or ([] if relation_errors else ['semantic_review_failed'])) + relation_errors
-                        trace.append({'review': 'rejected', 'issues': errors})
+                        trace.append({'review': 'rejected', 'issues': errors,
+                                      'candidate_excerpt': str(candidate.get('answer', ''))[:4000],
+                                      'candidate_excerpt_truncated': len(str(candidate.get('answer', ''))) > 4000})
                         if stopped_repeated_answer(candidate, errors):
                             errors = ['Repeated identical answer failed review without new evidence.', *errors]
                             candidate = None
@@ -1656,6 +1777,16 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
             errors = []
             for call in calls:
                 broad_files = False
+                # Only an unambiguous, explicitly named owner can supply local
+                # scope. Never narrow a corpus-wide incoming-call search this way.
+                explicit_programs = sorted({e['name'] for e in known_entities if e.get('entity_type') == 'program'})
+                args = call.get('args', {})
+                local_tool = call.get('tool') in {'describe', 'search', 'files', 'variable_access', 'flow_edges', 'copybooks'}
+                local_query = call.get('tool') == 'query' and args.get('table') not in {'calls', 'connections'}
+                if len(explicit_programs) == 1 and 'programs' not in args and (local_tool or local_query):
+                    args['programs'] = explicit_programs
+                    trace.append({'scope_repair': {'tool': call['tool'], 'programs': explicit_programs,
+                                                   'basis': 'single explicitly named analyzed program'}})
                 if request and call.get('tool') == 'describe' and request.get('depth') == 'detailed':
                     call['args']['depth'] = 'detailed'
                 if request and request.get('output') == 'list' and call.get('tool') in {
@@ -1685,7 +1816,6 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     cached = next((o for o in observations if o.get('call') == call and 'result' in o), None)
                     if cached and not must_retrieve:
                         observations.append(deepcopy(cached))
-                        finalize_existing = True
                         errors = ['The identical request already succeeded. Use the cached result, including total_matches for a count.']
                         trace.append({'tool': call['tool'], 'status': 'cached', 'result_id': cached['result'].get('result_id')})
                         continue
@@ -1702,7 +1832,6 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     view = tool_view(result, config.investigation.preview_chars)
                     observations.append({'call': call, 'result': view})
                     if result.get('source_bounds') and not new_evidence:
-                        finalize_existing = True
                         errors = ['This source read adds no evidence. Use the recorded member bounds; '
                                   'synthesize supported behavior, inspect a different relevant COPY member, '
                                   'or state the remaining gap. Do not page beyond recorded EOF.']
@@ -1737,7 +1866,12 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                                         pass
                     observations.append(diagnostic)
                     trace.append({'tool': call.get('tool'), 'status': 'error', 'error': str(exc),
+                                  'args': deepcopy(call.get('args', {})),
                                   'duration_ms': round((time.monotonic() - tool_started) * 1000, 2)})
+            stagnant_rounds = stagnant_rounds + 1 if len(tools.evidence) == evidence_at_attempt else 0
+            if stagnant_rounds >= 3:
+                trace.append({'status': 'stopped_no_progress', 'rounds': stagnant_rounds})
+                break
         except Exception as exc:
             candidate = None
             errors = [str(exc)]
@@ -1758,7 +1892,8 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     break
             if getattr(exc, 'failed_call', None):
                 pending_tool_repair = {'call': exc.failed_call, 'error': str(exc)}
-            trace.append({'status': 'error', 'error': str(exc)[:500]})
+            trace.append({'status': 'error', 'error': str(exc)[:500],
+                          **({'failed_call': deepcopy(exc.failed_call)} if getattr(exc, 'failed_call', None) else {})})
             if isinstance(exc, ReviewProtocolError):
                 break
             if budget.calls >= core_limit - 1 or time.monotonic() >= budget.deadline:
@@ -1770,7 +1905,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                 break
     if candidate is None and tools.evidence and getattr(budget, 'synthesis_reserve', 0):
         candidate = synthesize_partial(question, request, requirements, tools, observations,
-                                       errors, budget, trace)
+                                       errors, budget, trace, known_entities)
     if candidate is None:
         stopped = any(step.get('status') == 'stopped_repeated_answer' for step in trace)
         return {'answer': ('I could not verify this answer because the same unsupported response failed validation twice.'
@@ -1816,7 +1951,7 @@ def answer_with_investigation(question, config, state=None, target_program=None,
     language_status = {'input': 'not_needed', 'output': 'not_needed'}
     if detect_message_language(question) == 'it':
         try:
-            translated = budget.call('Translate the request to English. Preserve identifiers, numbers and literals exactly. Return JSON {"text":string}.', {'text': question})
+            translated = budget.call('Translate the request to English. Preserve identifiers, numbers and literals exactly. Return JSON {"text":string}.', {'text': question}, phase='input_translation')
             text = translated.get('text', '')
             if not text or not legacy._safe_translation(question, text, preserve_layout=False):
                 raise ToolError('Input translation changed protected data.')
@@ -1848,7 +1983,8 @@ def answer_with_investigation(question, config, state=None, target_program=None,
         sources.append(RetrievalResult(score=None, text=json.dumps(row, ensure_ascii=False), metadata={
             'source_id': eid, 'source_file': source, 'chunk_type': row.get('_artifact', 'investigation'),
             'program': program}))
-        answer = answer.replace(f'[{eid}]', f'[Source {index}]')
+    from cobol_rag.citations import render_citations
+    answer = render_citations(answer, ids)
     delivery_passed = True
     if language == 'it':
         from cobol_rag.language_delivery import deliver_italian
@@ -1896,7 +2032,7 @@ def answer_with_investigation(question, config, state=None, target_program=None,
                                       'evidence_ids': ids, 'reasons': result['errors']},
              'investigation': {'requirements': result['requirements'], 'coverage': result.get('coverage', []),
                                'model_calls': budget.calls, 'tool_calls': result['tool_calls'], 'steps': result['trace'],
-                               'token_usage': budget_token_usage(budget)},
+                               'token_usage': budget_token_usage(budget), 'model_events': getattr(budget, 'model_events', [])},
              'language_adapter': language_status}
     mode = 'investigation' if technical and successful else 'conversational' if plan.route == 'conversational' else 'clarification'
     trace_id = legacy.write_answer_trace(config, legacy._trace_payload(

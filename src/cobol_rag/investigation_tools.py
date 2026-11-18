@@ -72,8 +72,12 @@ def match(row, predicate):
         raise ToolError('Filter needs field, op=eq|neq|in|contains, and value.')
     missing = object()
     actual = field(row, key, missing)
-    if actual is missing:
+    if actual is missing and key not in {'target_variable', 'target_kind', 'target_resolution'}:
         raise ToolError(f'Field {key} is unavailable; inspect the schema first.')
+    if actual is missing:
+        # Optional call-target properties are absent on literal calls. Absence
+        # is not a matching value; other rows may validly carry that property.
+        return False
     normalize = lambda x: str(x).casefold()
     if op == 'contains':
         return normalize(wanted) in normalize(actual)
@@ -599,7 +603,7 @@ class EvidenceTools:
                     error = ToolError('Program scope is already selected by programs. origin is a declaration origin, not the owning program; remove this ownership filter or use a recorded origin.')
                     error.suggested_where = [p for p in args.get('where', []) if p != predicate]
                     raise error
-            if schema_rows and not present:
+            if schema_rows and not present and key not in {'target_variable', 'target_kind', 'target_resolution'}:
                 hint = (' Use quality(programs) for reachability/unused findings, not paragraph inventory filters.'
                         if args.get('table') == 'paragraphs' else '')
                 raise ToolError(f'Field {key} is unavailable; inspect the table schema before filtering.' + hint)
@@ -825,6 +829,51 @@ class EvidenceTools:
         if tool == 'source_range':
             start, end = args.pop('start'), args.pop('end')
             return self.execute('source', {**args, 'spans': [[start, end]]})
+        if tool == 'source_outline':
+            filename = args.get('source_file') or args['program'].upper() + '.CBL'
+            source = [r for r in self.rows(args['program'], 'source')
+                      if r.get('source_file', '').upper() == filename.upper()]
+            if not source:
+                raise ToolError('Source member unavailable; query files for the exact recorded member name.')
+            terms = [term.upper() for term in args.get('terms', [])]
+            requested_verbs = set(args.get('verbs', []))
+            groups = {}
+            for row in source:
+                if row.get('is_comment') or row.get('is_blank') or not row.get('paragraph') or row.get('division') in {
+                        'DATA DIVISION', 'IDENTIFICATION DIVISION', 'ENVIRONMENT DIVISION'}:
+                    continue
+                text = str(row.get('normalized') or row.get('text', '')).strip()
+                code = re.sub(r"'(?:[^']|'')*'|\"[^\"]*\"", ' ', text.upper())
+                verbs = set(re.findall(r'(?<![A-Z0-9-])(?:COMPUTE|ADD|SUBTRACT|MULTIPLY|DIVIDE|OPEN|READ|WRITE|CLOSE|CALL|PERFORM|IF|EVALUATE|MOVE|EXEC)(?![A-Z0-9-])', code))
+                group = groups.setdefault(row['paragraph'], {'name': row['paragraph'], 'program': args['program'],
+                    'source_file': filename, 'first_line': row['line'], 'last_line': row['line'],
+                    'verbs': set(), 'term_match': not terms, 'matches': []})
+                group['first_line'] = min(group['first_line'], row['line'])
+                group['last_line'] = max(group['last_line'], row['line'])
+                group['verbs'].update(verbs)
+                term_match = not terms or any(term in text.upper() for term in terms)
+                group['term_match'] |= term_match
+                if term_match and (not requested_verbs or verbs & requested_verbs) and len(group['matches']) < 8:
+                    group['matches'].append({'line': row['line'], 'text': text})
+            rows = []
+            for group in groups.values():
+                if group.pop('term_match') and (not requested_verbs or group['verbs'] & requested_verbs):
+                    group['verbs'] = sorted(group['verbs'])
+                    group['_artifact'] = 'source.outline'
+                    rows.append(group)
+            rows.sort(key=lambda row: row['first_line'])
+            offset, limit = args.get('offset', 0), args.get('limit', 30)
+            return {'rows': [{'evidence_id': self.register(row), **row} for row in rows[offset:offset + limit]],
+                    'division_headers': [{'evidence_id': self.register(row), 'line': row['line'],
+                                          'source_file': row['source_file'], 'text': row['text']}
+                                         for row in source if re.match(r'^(?:IDENTIFICATION|ENVIRONMENT|DATA|PROCEDURE)\s+DIVISION\b',
+                                             str(row.get('normalized') or row.get('text', '')).strip(), re.I)
+                                         and not row.get('is_comment')][:12],
+                    'source_bounds': {'first_recorded_line': min(row['line'] for row in source),
+                                      'last_recorded_line': max(row['line'] for row in source)},
+                    'total_matches': len(rows), 'returned': len(rows[offset:offset + limit]),
+                    'next_offset': offset + limit if limit and offset + limit < len(rows) else None,
+                    'limitation': 'Recorded paragraph/verb navigation and physical division headers, not a control-flow or business-rule proof. Read matching source and surrounding conditions before answering.'}
         if tool == 'group_context':
             program, group = args['program'].upper(), args['group'].upper()
             source_prefix = str(args.get('source_prefix') or '').upper().rstrip('-')
@@ -1050,7 +1099,7 @@ class EvidenceTools:
                 summary['jobs_without_analyzed_program_link'] = graph.get('jobs_without_analyzed_program_link', [])
             table = recipe['args'].get('table')
             summary['evidence_scope'] = {
-                'variable_access': 'Recorded access sites only. Zero accesses does not prove a variable is undeclared; query variables for existence.',
+                'variable_access': 'Recorded accesses to the exact queried identifiers only. Zero direct group-name writes does not cover child fields, redefinitions, aliases, or a by-reference callee. Source line order alone is not proof of post-call execution order. Zero accesses does not prove undeclared; query variables for existence.',
                 'copybooks': 'COPY inclusion. Unused/review claims require explicit needs_review/proven_unused fields and review_source; missing review fields mean unknown. Inclusion alone proves no unused status.',
                 'edges': 'Static graph edges. Use source_operation/evidence for COBOL verbs; graph CALL can mean PERFORM. No runtime feasibility proof.',
                 'calls': 'Recorded caller-to-target relationships within this query scope. If total_matches=0, there are no matching call parameters to report in this scope.',
@@ -1160,6 +1209,7 @@ class EvidenceTools:
             requested = []
             continuation_spans = []
             if args.get('paragraph'):
+                available_paragraphs = sorted({r['paragraph'] for r in rows if r.get('paragraph')})
                 rows = [r for r in rows if str(r.get('paragraph') or '').upper() == args['paragraph'].upper()]
                 # Listing controls are not paragraph behavior. Exact physical-line
                 # queries still return them verbatim for source inspection.
@@ -1195,6 +1245,9 @@ class EvidenceTools:
                     'requested_complete': not continuation_spans and not missing,
                     'continuation_spans': continuation_spans,
                     'past_recorded_end': bool(requested and min(requested) > source_bounds['last_recorded_line']),
+                    **({'paragraph_lookup': 'unavailable', 'available_paragraphs': available_paragraphs[:30],
+                        'navigation': 'Use source_outline(program, verbs or terms) to find actual procedure locations; a division heading is not a paragraph.'}
+                       if args.get('paragraph') and not rows else {}),
                     'limitation': 'Physical source records only; no absent line is inferred.'}
         if tool == 'search':
             programs = args.get('programs') or list(self.programs)

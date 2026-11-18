@@ -781,13 +781,13 @@ def test_multiple_input_collections_require_selected_answer_set(evidence):
     b = evidence.execute('query', dict(programs=['B'], table='variables'))
     candidate = dict(answer='V1', mode='technical', status='complete', collection_output='list',
         evidence_ids=[a['collection_evidence_id'], b['collection_evidence_id']])
-    errors = answer_checks('Which variables are shared?', candidate, evidence, [], dict(output='list'))
+    errors = answer_checks('Which variables are shared?', candidate, evidence, [], dict(output='list', collection_semantics='set_comparison'))
     assert any('Select or compare' in e for e in errors)
     assert not any('omits returned members' in e for e in errors)
     shared = evidence.execute('compare', dict(left_id=a['result_id'], right_id=b['result_id'], operation='intersection'))
     candidate['result_id'] = shared['result_id']
     candidate['evidence_ids'].append(shared['collection_evidence_id'])
-    assert not answer_checks('Which variables are shared?', candidate, evidence, [], dict(output='list'))
+    assert not answer_checks('Which variables are shared?', candidate, evidence, [], dict(output='list', collection_semantics='set_comparison'))
 
 
 def test_selected_subset_does_not_require_context_members(evidence):

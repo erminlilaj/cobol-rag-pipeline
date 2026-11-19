@@ -230,3 +230,75 @@ def test_followup_budget_and_empty_outlines_are_not_synthetic_source(evidence, m
     calls = outline_followups(evidence, set(), maximum=1)
     assert len(calls) == 1
     assert not outline_followups(evidence, {digest(calls[0])}, maximum=1)
+
+
+def test_skip_only_fully_read_ranges_in_same_member(evidence, monkeypatch):
+    from cobol_rag.investigation_recovery import source_window_already_read
+    monkeypatch.setattr(EvidenceTools, 'rows', lambda self, p, t: rows(p, t))
+    evidence.execute('source_range', dict(program='A', start=10, end=15))
+    def covered(**args):
+        return source_window_already_read(dict(tool='source_range', args=args), evidence.evidence)
+    assert covered(program='A', start=11, end=14)
+    assert not covered(program='A', start=11, end=16)
+    assert not covered(program='B', start=11, end=14)
+    assert not covered(program='A', source_file='SHARED.CPY', start=11, end=14)
+
+
+def test_scoped_literal_fallback_can_find_copybook_and_stops_repeat_exploration(evidence, monkeypatch):
+    def corpus(self, program, table):
+        if program == 'A':
+            return rows(program, table)
+        if table == 'source':
+            return [dict(program='B', source_file='B.CBL', line=1, text='MAIN.', paragraph='MAIN'),
+                    dict(program='B', source_file='RULES.CPY', line=12, text="88 MATCH-ITEM VALUE '9876'.")]
+        return []
+    monkeypatch.setattr(EvidenceTools, 'rows', corpus)
+    monkeypatch.setattr(EvidenceTools, 'mentioned_entities', lambda *a: [
+        dict(name=p, entity_type='program', program=p) for p in 'AB'])
+    def tools(*calls):
+        return dict(action='tools', calls=list(calls))
+    a = dict(tool='source_outline', args=dict(program='A', terms=['9876']))
+    b = dict(tool='source_outline', args=dict(program='B', terms=['9876', '5432']))
+    body = dict(tool='source_range', args=dict(program='A', start=10, end=16))
+    covered = dict(tool='source_range', args=dict(program='A', start=11, end=15))
+    class Replay(FakeBudget):
+        maximum = 14
+        synthesis_reserve = 2
+        config = AppConfig()
+        def call(self, system, payload, *args, **kwargs):
+            if kwargs.get('phase') == 'partial_synthesis':
+                retained = payload['retained_source_evidence']['rows']
+                assert any(row['source_file'] == 'RULES.CPY' for row in retained)
+                assert any('MOVE 12345' in row['text'] for row in retained)
+                self.calls += 1
+                return dict(action='final', mode='technical', status='partial',
+                    answer='A assigns fixed amounts; B has a copybook reference but its calculation is unverified.',
+                    evidence_ids=[row['evidence_id'] for row in retained])
+            return super().call(system, payload, *args, **kwargs)
+    budget = Replay([tools(a, b), tools(body), tools(body), tools(covered), tools(body), dict(passed=True, issues=[])])
+    result = investigate('Explain the item rule in A and B', AppConfig(), budget=budget,
+        resolved_request=dict(resolved_question='Explain the item rule in A and B', output='other', depth='detailed', limit=None))
+    assert result['status'] == 'partial', result['trace']
+    searches = [step for step in result['trace'] if step.get('recovery') == 'unresolved_program']
+    assert [step['returned'] for step in searches] == [1, 0]
+    assert all(step['args']['programs'] == ['B'] for step in searches)
+    assert any(step.get('status') == 'covered_source_range' for step in result['trace'])
+    assert any(step.get('status') == 'stopped_bounded_source_exploration' for step in result['trace'])
+
+
+def test_citation_groups_keep_nonadjacent_numbers_and_claim_boundaries():
+    from cobol_rag.citations import group_source_labels
+    text = 'Rule [Source 4] [Source 1] [Source 2] [Source 4]. Gap [Source 8].\n[Source 9] [Source 10]'
+    assert group_source_labels(text) == 'Rule [Sources 1–2, 4]. Gap [Source 8].\n[Sources 9–10]'
+
+
+def test_retained_preview_keeps_entry_bypass_and_late_rule_under_small_budget(evidence):
+    for line in range(1, 102):
+        text = {2: "IF MODE = 'D'", 3: 'GO TO OVERRIDE.', 90: "IF CODE = '9876'",
+                91: "AND MODE = 'D'", 92: 'MOVE ZERO TO AMOUNT.'}.get(line, 'CONTINUE')
+        evidence.register(dict(program='A', source_file='A.CBL', paragraph='RULE', line=line, text=text))
+    evidence.register(dict(program='A', source_file='A.CBL', name='RULE', first_line=1, last_line=101,
+                           matches=[dict(line=90)], _artifact='source.outline'))
+    preview = recovery_source_evidence(evidence, max_chars=2800)
+    assert preview['truncated']
+    assert {2, 3, 90, 91, 92} <= {row['line'] for row in preview['rows']}

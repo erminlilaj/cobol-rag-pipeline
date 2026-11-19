@@ -3,6 +3,21 @@ import re
 
 
 GROUP = re.compile(r'\[(E\d+(?:\s*(?:-|,)\s*E?\d+)*)\]')
+SOURCE_RUN = re.compile(r'\[Source \d+\](?:[^\S\n]+\[Source \d+\])+')
+
+
+def group_source_labels(text):
+    """Compact adjacent references without dropping any referenced source."""
+    def render(match):
+        numbers = sorted({int(n) for n in re.findall(r'\d+', match[0])})
+        ranges = []
+        for n in numbers:
+            if ranges and n == ranges[-1][1] + 1:
+                ranges[-1][1] = n
+            else:
+                ranges.append([n, n])
+        return '[Sources ' + ', '.join(str(a) if a == b else f'{a}–{b}' for a, b in ranges) + ']'
+    return SOURCE_RUN.sub(render, text)
 
 
 def ids_in_group(group):

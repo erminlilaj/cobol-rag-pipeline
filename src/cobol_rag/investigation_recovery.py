@@ -10,6 +10,50 @@ def source_row(row):
             and type(row.get('line')) is int and isinstance(row.get('text'), str))
 
 
+def source_address(row):
+    return (str(row.get('program') or '').upper(), str(row.get('source_file') or '').upper(), row['line'])
+
+
+def source_window_already_read(call, evidence):
+    """Skip only fully covered ranges; an overlapping range can add a condition."""
+    if call['tool'] != 'source_range':
+        return False
+    args = call['args']
+    if set(args) - {'program', 'source_file', 'start', 'end'} or not isinstance(args.get('program'), str):
+        return False
+    if 'source_file' in args and not isinstance(args['source_file'], str):
+        return False
+    first, last = args.get('start'), args.get('end')
+    if type(first) is not int or type(last) is not int or not 1 <= first <= last or last - first >= 500:
+        return False
+    program = str(args.get('program', '')).upper()
+    member = str(args.get('source_file') or program + '.CBL').upper()
+    covered = {source_address(row) for row in evidence.values() if source_row(row)}
+    return all((program, member, line) in covered for line in range(first, last + 1))
+
+
+def unresolved_source_searches(observations, evidence, programs, maximum=4):
+    """Try a different lookup on scoped owners whose literal outlines found nothing."""
+    inspected = {source_address(row)[0] for row in evidence.values() if source_row(row)}
+    named = {program.upper() for program in programs}
+    calls = []
+    for observation in observations:
+        call = observation.get('call', {})
+        args = call.get('args', {})
+        program = str(args.get('program', '')).upper()
+        terms = args.get('terms') or []
+        if (call.get('tool') != 'source_outline' or observation.get('result', {}).get('total_matches') != 0
+                or program not in named or program in inspected or not terms):
+            continue
+        for term in terms[:2]:
+            lookup = {'tool': 'search', 'args': {'programs': [program], 'text': term, 'mode': 'literal', 'limit': 6}}
+            if term.strip() and lookup not in calls:
+                calls.append(lookup)
+                if len(calls) >= maximum:
+                    return calls
+    return calls
+
+
 def evidence_progress(tools):
     """Measure facts rather than transport pages or freshly allocated handles."""
     keys = set()
@@ -37,10 +81,28 @@ def recovery_source_evidence(tools, max_chars=20000):
     second program. IDs always refer to registered evidence, never summaries.
     """
     groups = defaultdict(list)
+    indexed = defaultdict(dict)
     for eid, row in tools.evidence.items():
         if source_row(row):
-            groups[row.get('program')].append({'evidence_id': eid, **{key: row[key] for key in
-                ('program', 'source_file', 'line', 'paragraph', 'text', 'is_comment') if key in row}})
+            key = (row.get('program'), row.get('source_file'))
+            indexed[key].setdefault(row['line'], {'evidence_id': eid, **{field: row[field] for field in
+                ('program', 'source_file', 'line', 'paragraph', 'text', 'is_comment') if field in row}})
+    # Prefer the paragraph entry/bypass and contiguous context around actual
+    # outline hits. Keep original line IDs; preview gaps remain explicit.
+    entries, priority = defaultdict(list), defaultdict(list)
+    for row in tools.evidence.values():
+        if row.get('_artifact') != 'source.outline':
+            continue
+        key = (row.get('program'), row.get('source_file'))
+        member = indexed.get(key, {})
+        entry = row.get('first_line')
+        anchors = [hit['line'] for hit in row.get('matches', []) if type(hit.get('line')) is int and hit['line'] in member]
+        if type(entry) is int and entry in member and anchors:
+            entries[key].append(range(entry, entry + 8))
+            priority[key].extend(range(max(entry, line - 4), line + 13) for line in anchors[:2])
+    for key, member in indexed.items():
+        order = list(dict.fromkeys([line for span in entries[key] + priority[key] for line in span if line in member] + list(member)))
+        groups[key[0]].extend(member[line] for line in order)
     result, size = [], 0
     for index in range(160):
         for rows in groups.values():

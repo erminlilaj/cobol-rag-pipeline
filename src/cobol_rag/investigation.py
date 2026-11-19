@@ -18,7 +18,8 @@ from cobol_rag.progress import emit as emit_progress
 
 from cobol_rag.investigation_protocol import decision_schema, tool_help, TOOL_SCHEMAS, TABLE_INFO, REQUEST, normalize_optional_nulls
 from cobol_rag.conversation_memory import reference_context
-from cobol_rag.investigation_recovery import evidence_progress, recovery_source_evidence, outline_followups
+from cobol_rag.investigation_recovery import (evidence_progress, recovery_source_evidence, outline_followups,
+    source_address, source_row, source_window_already_read, unresolved_source_searches)
 from cobol_rag.activity_context import model_context, tool_context, source_preview
 
 SYSTEM = '''You are a COBOL analysis assistant using read-only evidence tools.
@@ -71,6 +72,10 @@ English business words in Italian identifiers. For parameter validation inspect 
 not only declarations. An unknown paragraph or an empty source window is a
 navigation failure, not proof the requested logic is absent. Keep describe and
 search scoped to the explicitly named program unless corpus scope was requested.
+For a source rule, state the controlling branch (including bypasses), required
+conditions, explicit ELSE/default behavior and representative assigned values.
+Do not call literal assignments table lookups without a recorded table access.
+Cite the smallest sufficient source span per claim, not every line in a paragraph.
 Honor source_role: boundary comments have no established paragraph ownership.
 Static fallthrough edges do not establish execution after an expanded terminating operation.
 Incoming paragraph edges explain entry conditions; the body explains what happens after entry.
@@ -1398,7 +1403,9 @@ def synthesize_partial(question, request, requirements, tools, observations, err
         'even when another program is unresolved. An outline or zero term matches cannot '
         'establish missing computation logic. Conditional MOVE/initialization/table lookup '
         'can implement business rules without an arithmetic formula. State what was not '
-        'inspected separately from what inspected source proves absent.')
+        'inspected separately from what inspected source proves absent. Include the complete '
+        'enclosing conditions and bypasses, representative literal assignments, and exact ELSE scope '
+        'when supported. Do not call a literal MOVE a table lookup. Cite each claim once.')
     payload = {'original_question': question, 'resolved_request': request,
                'requirements': requirements or [question], 'feedback': errors,
                'observations': deepcopy(observations[-3:]),
@@ -1430,7 +1437,10 @@ def synthesize_partial(question, request, requirements, tools, observations, err
             'Reject any contradicted fact, invented condition, path, metric, service type, absence claim or entity. '
             'A disclaimer cannot excuse unsupported factual claims. Require a substantive answer to at least '
             'part of the actual request, not just a generic failure notice. Partial list pages must state their '
-            'limits; never imply completeness. Check each operation-specific condition and both endpoints of '
+            'limits. When explaining a source rule, reject a claim that omits a material enclosing condition '
+            'or bypass and thereby makes the rule sound broader than the recorded source. Distinguish literal '
+            'assignment from a demonstrated table lookup. '
+            'Never imply completeness. Check each operation-specific condition and both endpoints of '
             'edges, not a similar destination. Empty JCL results cannot prove absence of SQL/COBOL I/O. '
             'Independently interpret caller/target roles in the question; preserve direction and restrictions. '
             'Return passed, issues and requested_call_relation when a call relation is requested.',
@@ -1478,6 +1488,8 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
     pagination_notice = None
     repeated_no_progress = 0
     stagnant_rounds = 0
+    scoped_search_used = False
+    scoped_search_round = None
     previous_protocol_error = None
     repeated_answer = {'signature': None, 'count': 0}
     def stopped_repeated_answer(reply, issues):
@@ -1492,6 +1504,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
         trace.append({'status': 'stopped_repeated_answer', 'issues': list(issues)})
         return True
     known_entities = tools.mentioned_entities(question)
+    named_programs = {e['name'] for e in known_entities if e.get('entity_type') == 'program'}
     request = usable_request(resolved_request, known_entities)
     if request:
         trace.append({'resolved_request': request})
@@ -1504,6 +1517,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
     while budget.calls < core_limit - 1 and attempts < config.investigation.max_model_calls + 2 and time.monotonic() < budget.deadline:
         attempts += 1
         evidence_at_attempt = evidence_progress(tools)
+        source_at_attempt = {source_address(row) for row in tools.evidence.values() if source_row(row)}
         payload = {'question': request['resolved_question'] if request else question, 'original_question': question,
                    'default_program': target_program or getattr(state, 'current_program', None),
                    'known_entity_roles': known_entities[:30],
@@ -1874,13 +1888,20 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                 if key in seen:
                     cached = next((o for o in observations if o.get('call') == call and 'result' in o), None)
                     if cached and not must_retrieve:
-                        observations.append(deepcopy(cached))
+                        # Refresh the result's recency without replaying duplicate rows.
+                        observations.remove(cached)
+                        observations.append(cached)
                         errors = ['The identical request already succeeded. Use the cached result, including total_matches for a count.']
                         trace.append({'tool': call['tool'], 'status': 'cached', 'result_id': cached['result'].get('result_id')})
                         emit_progress('tool_cached', 'Reusing an existing tool result; no new lookup is being executed.',
                                       tool=call['tool'], scope=call.get('args'), **tool_context(call['tool'], call['args'], cached['result']))
                         continue
                     raise ToolError('Identical tool request produced no new evidence; refine it or answer.')
+                if source_window_already_read(call, tools.evidence):
+                    errors = ['These lines were already retrieved. Cite existing source evidence or inspect a genuinely new location.']
+                    trace.append({'tool': call['tool'], 'args': call['args'], 'status': 'covered_source_range'})
+                    emit_progress('tool_cached', 'All requested source lines were already inspected.', tool=call['tool'], scope=call['args'])
+                    continue
                 seen.add(key)
                 tool_calls += 1
                 tool_started = time.monotonic()
@@ -1895,7 +1916,10 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     new_evidence = set(tools.evidence) - evidence_before
                     pending_tool_repair = None
                     must_retrieve = False
-                    view = tool_view(result, config.investigation.preview_chars)
+                    preview_limit = config.investigation.preview_chars
+                    if call['tool'] in {'source', 'source_range'}:
+                        preview_limit = min(preview_limit, 7500)
+                    view = tool_view(result, preview_limit)
                     observations.append({'call': call, 'result': view})
                     emit_progress('tool_end', 'Evidence lookup completed.', tool=call['tool'],
                                   **tool_context(call['tool'], call['args'], result),
@@ -1943,7 +1967,38 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     trace.append({'tool': call.get('tool'), 'status': 'error', 'error': str(exc),
                                   'args': deepcopy(call.get('args', {})),
                                   'duration_ms': round((time.monotonic() - tool_started) * 1000, 2)})
-            stagnant_rounds = stagnant_rounds + 1 if evidence_progress(tools) == evidence_at_attempt else 0
+            source_only = all(call['tool'] in {'source_outline', 'source', 'source_range', 'search'} for call in calls)
+            has_source = bool(source_at_attempt)
+            new_physical = any(source_row(row) and source_address(row) not in source_at_attempt for row in tools.evidence.values())
+            progressed = (new_physical if source_only and has_source else evidence_progress(tools) != evidence_at_attempt)
+            stagnant_rounds = 0 if progressed else stagnant_rounds + 1
+            if (has_source and len(named_programs) > 1 and not scoped_search_used and source_only
+                    and not (request and request.get('output') in {'count', 'list'})):
+                lookups = unresolved_source_searches(observations, tools.evidence, named_programs)
+                if lookups:
+                    scoped_search_used = True
+                    scoped_search_round = attempts
+                    for lookup in lookups:
+                        if digest(lookup) in seen or tool_calls >= config.investigation.max_tool_calls or time.monotonic() >= budget.deadline:
+                            continue
+                        seen.add(digest(lookup))
+                        tool_calls += 1
+                        emit_progress('tool_start', 'Checking unresolved program with a bounded literal source search.', tool='search', scope=lookup['args'])
+                        try:
+                            found = tools.execute('search', lookup['args'])
+                            observations.append({'call': lookup, 'result': tool_view(found, 5000)})
+                            trace.append({'tool': 'search', 'args': lookup['args'], 'returned': found.get('returned'), 'recovery': 'unresolved_program'})
+                            emit_progress('tool_end', 'Scoped literal search finished.', tool='search', returned=found.get('returned'), **tool_context('search', lookup['args'], found))
+                        except (ToolError, ValueError, KeyError, OSError) as exc:
+                            trace.append({'tool': 'search', 'status': 'error', 'recovery': 'unresolved_program', 'error': str(exc)[:500]})
+                    errors = ['A bounded literal search was attempted for each unresolved source scope selected. '
+                              'Use supported findings; a zero match leaves behavior unverified.']
+                    stagnant_rounds = 0
+            if (scoped_search_round is not None and attempts >= scoped_search_round + 2 and source_only
+                    and getattr(budget, 'synthesis_reserve', 0)):
+                trace.append({'status': 'stopped_bounded_source_exploration'})
+                emit_progress('exploration_stopped', 'Bounded cross-program source exploration finished; preparing supported findings.')
+                break
             if stagnant_rounds:
                 emit_progress('no_progress', 'This round added no new evidence facts.', repeated_rounds=stagnant_rounds,
                               purpose='Repeated or cached lookups are not new source evidence; the bounded no-progress guard is active.')
@@ -2101,6 +2156,8 @@ def answer_with_investigation(question, config, state=None, target_program=None,
         delivery_passed = delivery['passed']
         if not delivery_passed:
             language_status['reviewed_original_answer'] = reviewed_original
+    from cobol_rag.citations import group_source_labels
+    answer = group_source_labels(answer)
     successful = result['status'] != 'failed' and delivery_passed
     technical = result.get('mode') == 'technical'
     programs = tuple(dict.fromkeys(r.metadata['program'] for r in sources if r.metadata['program']))

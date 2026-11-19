@@ -558,6 +558,16 @@ h1 {
     border-top: 1px solid var(--border);
 }
 
+.debug-scroll { max-height: 340px; overflow: auto; padding: 0 8px 8px; }
+.debug-body > .debug-facts { padding: 10px 0; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+.debug-body pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.debug-body .debug-raw { max-height: 340px; }
+.debug-body .debug-warning { max-height: 180px; overflow: auto; }
+.debug-table { width: 100%; border-collapse: collapse; font-size: 0.72rem; table-layout: fixed; }
+.debug-table th, .debug-table td { text-align: left; vertical-align: top; padding: 6px; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.debug-table th:first-child { width: 20%; }
+.debug-table th:nth-child(2) { width: 14%; }
+
 .debug-section {
     padding: 11px 0;
     border-bottom: 1px solid var(--border);

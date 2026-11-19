@@ -75,10 +75,15 @@ class WaitingGamesAssetTest(unittest.TestCase):
         self.assertIn('controller?.abort()', self.script)
 
     def test_ui_assets_are_versioned_and_served_without_stale_browser_caching(self) -> None:
-        self.assertIn("style.css?v=detailed-activity-", self.index)
+        self.assertRegex(self.index, r'style\.css\?v=[A-Za-z0-9-]+')
         self.assertRegex(self.index, r'app\.js\?v=[A-Za-z0-9-]+')
         self.assertIn('chat-export.js?v=', self.index)
         self.assertIn('response.headers["Cache-Control"] = "no-store', self.api)
+
+    def test_live_debug_uses_the_same_compact_renderer_as_exports(self) -> None:
+        self.assertIn('return ChatExport.debugView(debug, traceId);', self.script)
+        self.assertIn('.debug-scroll { max-height: 340px; overflow: auto;', self.styles)
+        self.assertLess(self.index.index('src="chat-export.js'), self.index.index('src="app.js'))
 
     def test_each_visible_chat_has_isolated_memory(self) -> None:
         self.assertIn("let chatSessionId = newConversationId();", self.script)

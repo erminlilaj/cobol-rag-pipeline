@@ -13,6 +13,7 @@ import re
 import time
 
 from cobol_rag.investigation_tools import EvidenceTools, ToolError, EntityTypeMismatch, TABLES, compact, digest
+from cobol_rag.progress import emit as emit_progress
 
 
 from cobol_rag.investigation_protocol import decision_schema, tool_help, TOOL_SCHEMAS, TABLE_INFO, REQUEST, normalize_optional_nulls
@@ -533,6 +534,7 @@ class Budget:
         started = time.monotonic()
         event = {'call': self.calls, 'phase': phase, 'status': 'started'}
         self.model_events.append(event)
+        emit_progress('model_start', 'Model request started.', phase=phase, call=self.calls)
         config = replace(self.config, llm=replace(self.config.llm, context_window=context_window, request_timeout=max(1, min(remaining, self.config.llm.request_timeout))))
         # Final answers need room for both detailed prose and closing JSON fields.
         detailed = (payload.get('resolved_request') or {}).get('depth') == 'detailed'
@@ -542,6 +544,7 @@ class Budget:
                                   format='json')
         except Exception as error:
             event.update(status='transport_or_model_error', error_type=type(error).__name__)
+            emit_progress('model_error', 'Model request failed.', phase=phase, call=self.calls)
             raise
         finally:
             event['duration_ms'] = round((time.monotonic() - started) * 1000, 2)
@@ -551,6 +554,8 @@ class Budget:
         usage = response_tokens(response)
         self.token_reports.append(usage)
         event['token_usage'] = usage
+        emit_progress('model_end', 'Model response received.', phase=phase, call=self.calls,
+                      duration_ms=event['duration_ms'], token_usage=usage)
         event['status'] = 'response_received'
         raw = getattr(response, 'raw', None)
         if isinstance(raw, dict):
@@ -1727,6 +1732,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         if enforce_targets and expected_targets and reviewed.get('direction') != 'not_requested' and {t.upper() for t in expected_targets} != {t.upper() for t in reviewed_targets}:
                             relation_errors.append('Requested callee changed during investigation; preserve the resolved target.')
                     if review.get('passed') is not True or relation_errors:
+                        emit_progress('validation', 'Answer review rejected the candidate; preparing a repair.')
                         errors = list(review.get('issues') or ([] if relation_errors else ['semantic_review_failed'])) + relation_errors
                         trace.append({'review': 'rejected', 'issues': errors,
                                       'candidate_excerpt': str(candidate.get('answer', ''))[:4000],
@@ -1765,6 +1771,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                             trace.append({'recovery': 'review_feedback', 'core_limit': core_limit})
                         continue
                     trace.append({'review': 'passed'})
+                    emit_progress('validation', 'Answer review passed.')
                     if not candidate.get('coverage'):
                         candidate['coverage'] = [{'requirement': r, 'status': 'answered' if
                             candidate.get('status') == 'complete' else 'unavailable'} for r in requirements]
@@ -1818,11 +1825,16 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         observations.append(deepcopy(cached))
                         errors = ['The identical request already succeeded. Use the cached result, including total_matches for a count.']
                         trace.append({'tool': call['tool'], 'status': 'cached', 'result_id': cached['result'].get('result_id')})
+                        emit_progress('tool_cached', 'Reusing an existing tool result.', tool=call['tool'])
                         continue
                     raise ToolError('Identical tool request produced no new evidence; refine it or answer.')
                 seen.add(key)
                 tool_calls += 1
                 tool_started = time.monotonic()
+                visible_args = {key: value for key, value in call.get('args', {}).items() if key in {
+                    'program', 'programs', 'table', 'paragraph', 'source_file', 'start', 'end', 'spans',
+                    'identifier', 'variables', 'group', 'source_prefix', 'target', 'direction', 'verbs', 'terms', 'where', 'text'}}
+                emit_progress('tool_start', 'Reading evidence.', tool=call['tool'], scope=visible_args)
                 try:
                     evidence_before = set(tools.evidence)
                     result = tools.execute(call['tool'], call['args'])
@@ -1831,6 +1843,11 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     must_retrieve = False
                     view = tool_view(result, config.investigation.preview_chars)
                     observations.append({'call': call, 'result': view})
+                    emit_progress('tool_end', 'Evidence lookup completed.', tool=call['tool'],
+                                  returned=result.get('returned'), total_matches=result.get('total_matches'),
+                                  artifacts=sorted({str(row.get('_artifact') or row.get('source_file'))
+                                      for row in result.get('rows', []) if row.get('_artifact') or row.get('source_file')})[:8],
+                                  duration_ms=round((time.monotonic() - tool_started) * 1000, 2))
                     if result.get('source_bounds') and not new_evidence:
                         errors = ['This source read adds no evidence. Use the recorded member bounds; '
                                   'synthesize supported behavior, inspect a different relevant COPY member, '
@@ -1846,6 +1863,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                                   'result_id': result.get('result_id'), 'returned': result.get('returned'),
                                   'duration_ms': round((time.monotonic() - tool_started) * 1000, 2)})
                 except (ToolError, ValueError, KeyError, OSError) as exc:
+                    emit_progress('tool_error', 'Evidence lookup failed; checking arguments or scope.', tool=call.get('tool'))
                     diagnostic = {'call': call, 'error': str(exc)}
                     if hasattr(exc, 'suggested_where') and call['tool'] == 'query':
                         diagnostic['proposed_repair'] = {'tool': 'query', 'args': {
@@ -1904,6 +1922,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                 # Explicitly fail instead of presenting metadata as evidence.
                 break
     if candidate is None and tools.evidence and getattr(budget, 'synthesis_reserve', 0):
+        emit_progress('recovery', 'Preparing a supported partial answer from available evidence.')
         candidate = synthesize_partial(question, request, requirements, tools, observations,
                                        errors, budget, trace, known_entities)
     if candidate is None:

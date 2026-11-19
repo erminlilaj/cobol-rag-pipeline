@@ -10,18 +10,24 @@ const html = fs.readFileSync(path.join(ui, 'index.html'), 'utf8');
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
 function page() {
+    const timers = new Map();
+    let nextTimer = 0;
     function element() {
         const listeners = new Map();
         return {
             children: [],
+            get childElementCount() { return this.children.length; },
+            get firstElementChild() { return this.children[0]; },
             value: '', textContent: '', hidden: false, open: false, style: {},
             addEventListener(type, handler) { listeners.set(type, handler); },
             emit(type) { listeners.get(type)({preventDefault() {}}); },
             showModal() { this.open = true; },
             close() { this.open = false; },
-            appendChild(child) { this.children.push(child); },
+            appendChild(child) { child.parent = this; this.children.push(child); },
             append(...children) { this.children.push(...children); },
             prepend(child) { this.children.unshift(child); },
+            setAttribute() {},
+            remove() { if (this.parent) this.parent.children = this.parent.children.filter(child => child !== this); },
             scrollTo() {}, focus() {},
         };
     }
@@ -29,12 +35,22 @@ function page() {
         match => [match[1], element()]));
     const requests = [];
     const messages = [];
+    const progressRequests = [];
     const context = vm.createContext({
         AbortController, console, ChatExport: require('../ui/chat-export.js'),
         document: {getElementById: id => elements.get(id), addEventListener() {}, createElement: element},
         window: {localStorage: {getItem: () => 'test-session'}, addEventListener() {}},
         messages,
+        progressResponse: {},
+        setInterval(callback) { const id = ++nextTimer; timers.set(id, callback); return id; },
+        clearInterval(id) { timers.delete(id); },
+        setTimeout(callback) { const id = ++nextTimer; timers.set(id, callback); return id; },
+        clearTimeout(id) { timers.delete(id); },
         request(url, options) {
+            if (url.startsWith('/api/chat/progress/')) {
+                progressRequests.push(url);
+                return Promise.resolve(context.progressResponse);
+            }
             if (url !== '/api/chat') return Promise.resolve({});
             return new Promise((resolve, reject) => {
                 requests.push({message: JSON.parse(options.body).message, resolve});
@@ -47,10 +63,13 @@ function page() {
     vm.runInContext(script + `
         apiFetch = request;
         const originalAppendMessage = appendMessage;
+        const originalWaitingExperience = createWaitingExperience;
         createWaitingExperience = () => ({element: {remove() {}}, destroy() {}});
         appendMessage = (role, text) => messages.push([role, text]);
     `, context);
-    return {get: id => elements.get(id), requests, messages,
+    return {get: id => elements.get(id), requests, messages, timers, progressRequests,
+            setProgress: value => { context.progressResponse = value; },
+            activity: () => vm.runInContext("originalWaitingExperience('test-request')", context),
             stop: () => vm.runInContext('stopChat()', context),
             send: () => vm.runInContext('sendMessage()', context),
             reset: () => vm.runInContext('resetChat()', context),
@@ -58,6 +77,23 @@ function page() {
             observe: value => { context.incoming = value; vm.runInContext('observeConversationContext(incoming)', context); },
             showAnswer: metadata => { context.metadata = metadata; vm.runInContext("originalAppendMessage('assistant', 'Supported answer', [], metadata)", context); }};
 }
+
+test('live activity renders real events safely and stops every timer on cleanup', async () => {
+    const chat = page();
+    chat.setProgress({events: [{sequence: 1, kind: 'tool_start', message: 'Reading evidence.', elapsed_ms: 1200,
+        details: {tool: 'source', scope: {program: 'DEMO', paragraph: '<script>not html</script>'}}}]});
+    const activity = chat.activity();
+    await tick();
+    assert.match(chat.progressRequests[0], /test-request\?after=0/);
+    const content = activity.element.children[1];
+    const list = content.children.find(child => child.className === 'activity-list');
+    assert.match(list.children[0].textContent, /source.*DEMO.*<script>/);
+    assert.equal(list.children[0].innerHTML, undefined);
+    assert.equal(activity.snapshot().length, 1);
+    assert.ok(chat.timers.size > 0);
+    activity.destroy();
+    assert.equal(chat.timers.size, 0);
+});
 
 test('answer bubble displays metrics outside collapsed debug details', () => {
     const chat = page();

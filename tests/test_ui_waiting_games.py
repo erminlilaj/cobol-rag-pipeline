@@ -14,23 +14,20 @@ class WaitingGamesAssetTest(unittest.TestCase):
         cls.api = (root / "src" / "cobol_rag" / "api.py").read_text(encoding="utf-8")
         cls.chat = (root / "src" / "cobol_rag" / "chat.py").read_text(encoding="utf-8")
 
-    def test_four_games_are_available_in_the_waiting_component(self) -> None:
-        self.assertIn("function createWaitingExperience()", self.script)
-        self.assertIn("Bug Hunt", self.script)
-        self.assertIn("COBOL Match", self.script)
-        self.assertIn("Catch the moving bug.", self.script)
-        self.assertIn("Match the COBOL keywords.", self.script)
-        self.assertIn("Dino Run", self.script)
-        self.assertIn("Snake", self.script)
-        self.assertIn("function tickDino()", self.script)
-        self.assertIn("function tickSnake()", self.script)
+    def test_live_activity_replaces_the_waiting_games(self) -> None:
+        self.assertIn("function createWaitingExperience(requestId)", self.script)
+        self.assertIn("Live RAG activity", self.script)
+        self.assertIn("/api/chat/progress/", self.script)
+        self.assertIn("not private model reasoning", self.script.replace('—', ' not ').replace('not not', 'not'))
+        for game in ('Bug Hunt', 'Dino Run', 'COBOL Match', 'tickSnake'):
+            self.assertNotIn(game, self.script)
 
     def test_waiting_component_is_always_destroyed_however_the_request_ends(self) -> None:
         # The component belongs to one request, so it now lives in askOne. The
         # three duplicated cleanups collapsed into a single finally, which is a
         # stronger guarantee than repetition: no exit path can skip it.
         ask_one = self.script.split("async function askOne(", 1)[1].split("\nasync function", 1)[0]
-        self.assertIn("const waiting = createWaitingExperience();", ask_one)
+        self.assertIn("const waiting = createWaitingExperience(requestId);", ask_one)
         self.assertIn("} finally {", ask_one)
         cleanup = ask_one.split("} finally {", 1)[1]
         self.assertIn("waiting.destroy();", cleanup)
@@ -70,23 +67,15 @@ class WaitingGamesAssetTest(unittest.TestCase):
         self.assertIn("pendingQuestions = []", drain)
         self.assertIn("cancelled", drain)
 
-    def test_games_have_responsive_and_reduced_motion_styles(self) -> None:
-        for selector in (
-            ".waiting-experience",
-            ".waiting-game-tabs",
-            ".bug-grid",
-            ".memory-grid",
-            ".memory-card.matched",
-            ".dino-canvas",
-            ".snake-canvas",
-        ):
-            self.assertIn(selector, self.styles)
-        self.assertIn("@media (prefers-reduced-motion: reduce)", self.styles)
-        self.assertIn("clearInterval(dinoInterval)", self.script)
-        self.assertIn("clearInterval(snakeInterval)", self.script)
+    def test_activity_has_bounded_display_and_cleans_up_polling(self) -> None:
+        self.assertIn('.activity-list', self.styles)
+        self.assertIn('events.length > 200', self.script)
+        self.assertIn('clearInterval(clock)', self.script)
+        self.assertIn('clearTimeout(timer)', self.script)
+        self.assertIn('controller?.abort()', self.script)
 
     def test_ui_assets_are_versioned_and_served_without_stale_browser_caching(self) -> None:
-        self.assertIn("style.css?v=waiting-games-", self.index)
+        self.assertIn("style.css?v=live-activity-", self.index)
         self.assertRegex(self.index, r'app\.js\?v=[A-Za-z0-9-]+')
         self.assertIn('chat-export.js?v=', self.index)
         self.assertIn('response.headers["Cache-Control"] = "no-store', self.api)

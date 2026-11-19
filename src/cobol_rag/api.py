@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from cobol_rag.chat import ChatSession
+from cobol_rag import progress
 from cobol_rag.config import load_config
 from cobol_rag.index import collection_count, open_index
 from cobol_rag.loaders import LoaderError, load_path
@@ -100,6 +101,7 @@ class ChatRequest(BaseModel):
     message: str
     program: Optional[str] = None
     session_id: Optional[str] = None
+    request_id: Optional[str] = None
 
 class SyncRequest(BaseModel):
     paths: Optional[List[str]] = None
@@ -133,10 +135,18 @@ def health() -> Any:
 
 @app.post("/api/chat")
 def chat(req: ChatRequest, request: Request) -> Any:
-    session = get_chat_session(_request_session_id(request, req.session_id))
+    owner = _request_session_id(request, req.session_id)
+    request_id = _normalize_session_id(req.request_id)
+    if request_id and not owner:
+        raise HTTPException(status_code=400, detail='Activity tracking requires a conversation ID.')
+    session = get_chat_session(owner)
     started = time.monotonic()
     try:
-        answer = session.ask(req.message, target_program=req.program)
+        with progress.track(owner, request_id):
+            progress.emit('execution', 'Starting request processing.')
+            answer = session.ask(req.message, target_program=req.program)
+            progress.emit('result', 'Answer discarded after cancellation.' if answer.execution_mode == 'cancelled'
+                          else 'Answer ready.', execution_mode=answer.execution_mode)
         sources = [
             {
                 "source_id": s.metadata.get("source_id", ""),
@@ -180,6 +190,18 @@ def chat(req: ChatRequest, request: Request) -> Any:
         }
     except QueryError as error:
         raise HTTPException(status_code=400, detail=str(error))
+    except progress.ProgressConflict as error:
+        raise HTTPException(status_code=409, detail=str(error))
+
+
+@app.get('/api/chat/progress/{request_id}')
+def chat_progress(request_id: str, request: Request, after: int = 0) -> Any:
+    owner = _request_session_id(request)
+    request_id = _normalize_session_id(request_id)
+    result = progress.snapshot(owner, request_id, max(0, after)) if owner else None
+    if result is None:
+        raise HTTPException(status_code=404, detail='Activity is not available for this conversation.')
+    return result
 
 @app.post("/api/chat/cancel")
 def chat_cancel(request: Request) -> Any:

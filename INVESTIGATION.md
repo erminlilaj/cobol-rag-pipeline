@@ -31,6 +31,28 @@ bounded by the remaining budget; it is not a hard process cancellation timer.
 
 ## Current boundaries
 
+### Live activity instead of waiting games (2026-11-19)
+
+The waiting panel polls a session-owned request activity feed. It shows observable
+model-call phases, executed tools and bounded query/source scopes, returned rows,
+artifact names, timings, available provider token counts, review results and
+partial-answer recovery. It does not expose hidden chain-of-thought, prompts,
+draft answers or raw model text. A model request can legitimately run for a while
+without further events; no intermediate reasoning is invented for the display.
+
+Each question has a unique request ID. Polling does not acquire the chat request
+lock, so events can be read during execution. Session ownership is checked; logs
+are capped at 200 events and 256 requests, with completed runs expiring after 30
+minutes. This is in-process activity state for the current single-process API,
+not conversational memory or an authentication system. Keep the API local.
+
+Polling is bounded, sequential and aborted on completion/stop. Observed events
+remain available in an answer's collapsed activity section and debug export.
+Stopping still discards the in-flight answer; it does not interrupt an already
+running model generation. Detailed events instrument the investigation route;
+other execution routes may show only request-boundary events. There are no new
+dependencies, model changes or reindex requirements. Memory stays OFF.
+
 ### Scoped trace recovery and source review (2026-11-18)
 
 - Catalogue-confirmed internal paragraph names cannot become external-call

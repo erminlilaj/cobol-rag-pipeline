@@ -432,6 +432,23 @@ function appendMessage(role, content, sources = [], metadata = null) {
         contentDiv.prepend(metaDiv);
     }
 
+    if (role === 'assistant' && metadata?.live_progress?.length) {
+        const activity = document.createElement('details');
+        activity.className = 'answer-activity';
+        const summary = document.createElement('summary');
+        summary.textContent = 'Recorded activity · ' + metadata.live_progress.length + ' events';
+        const log = document.createElement('ol');
+        for (const event of metadata.live_progress) {
+            const row = document.createElement('li');
+            row.textContent = ((event.elapsed_ms || 0) / 1000).toFixed(1) + 's · ' + event.message
+                + (event.details?.tool ? ' · ' + event.details.tool : '')
+                + (event.details?.scope ? ' · ' + JSON.stringify(event.details.scope) : '');
+            log.appendChild(row);
+        }
+        activity.append(summary, log);
+        contentDiv.appendChild(activity);
+    }
+
     if (sources?.length) {
         const sourcesDiv = document.createElement('div');
         sourcesDiv.className = 'sources-box';
@@ -463,414 +480,86 @@ function shuffleItems(items) {
     return shuffled;
 }
 
-function createWaitingExperience() {
+function createWaitingExperience(requestId) {
     const element = document.createElement('div');
     element.className = 'message assistant loading waiting-experience';
-
     const avatar = document.createElement('div');
     avatar.className = 'avatar';
     avatar.textContent = 'AI';
-
     const content = document.createElement('div');
     content.className = 'content waiting-content';
-
     const header = document.createElement('div');
     header.className = 'waiting-header';
-    const headerCopy = document.createElement('div');
     const title = document.createElement('strong');
-    title.textContent = 'Working on your answer';
-    const subtitle = document.createElement('span');
-    subtitle.textContent = 'Play a quick game while evidence is being prepared.';
-    headerCopy.append(title, subtitle);
+    title.textContent = 'Live RAG activity';
     const elapsed = document.createElement('span');
     elapsed.className = 'waiting-elapsed';
-    elapsed.textContent = '0s';
-    elapsed.setAttribute('aria-label', 'Elapsed time');
-    header.append(headerCopy, elapsed);
-
-    const tabs = document.createElement('div');
-    tabs.className = 'waiting-game-tabs';
-    tabs.setAttribute('role', 'tablist');
-    tabs.setAttribute('aria-label', 'Waiting games');
-
-    const panel = document.createElement('div');
-    panel.className = 'waiting-game-panel';
-    panel.setAttribute('aria-live', 'polite');
-
-    content.append(header, tabs, panel);
+    header.append(title, elapsed);
+    const note = document.createElement('p');
+    note.className = 'activity-note';
+    note.textContent = 'Recorded actions, source lookups and validation—not private model reasoning. A running model call may have no new events.';
+    const state = document.createElement('div');
+    state.className = 'activity-state';
+    state.setAttribute('role', 'status');
+    state.textContent = 'Waiting for the server to receive this question…';
+    const list = document.createElement('ol');
+    list.className = 'activity-list';
+    content.append(header, note, state, list);
     element.append(avatar, content);
-
-    const gameState = {
-        activeGame: 'bug',
-        bugScore: 0,
-        bugTarget: Math.floor(Math.random() * 12),
-        memoryDeck: shuffleItems(['MOVE', 'MOVE', 'PERFORM', 'PERFORM', 'LINK', 'LINK', 'XCTL', 'XCTL']),
-        memoryRevealed: new Set(),
-        memoryMatched: new Set(),
-        memoryLocked: false,
-        memoryMoves: 0,
-        dino: {running: false, over: false, y: 0, velocity: 0, obstacles: [420], score: 0},
-        snake: {running: false, over: false, body: [{x: 5, y: 5}, {x: 4, y: 5}],
-            direction: {x: 1, y: 0}, nextDirection: {x: 1, y: 0}, food: {x: 12, y: 5}, score: 0},
-        dinoCanvas: null,
-        snakeCanvas: null,
-        destroyed: false,
-        timeouts: new Set(),
+    let destroyed = false, cursor = 0, timer = null, controller = null, inFlight = null;
+    let failures = 0;
+    const events = [];
+    const started = Date.now();
+    function show(event) {
+        events.push(event);
+        if (events.length > 200) events.shift();
+        const row = document.createElement('li');
+        const details = event.details || {};
+        row.textContent = '[' + ((event.elapsed_ms || 0) / 1000).toFixed(1) + 's] ' + event.message
+            + (details.phase ? ' · ' + details.phase.replaceAll('_', ' ') : '')
+            + (details.tool ? ' · ' + details.tool : '')
+            + (details.scope ? ' · ' + JSON.stringify(details.scope) : '')
+            + (details.returned != null ? ' · ' + details.returned + ' rows' : '')
+            + (details.artifacts?.length ? ' · ' + details.artifacts.join(', ') : '')
+            + (details.duration_ms != null ? ' · ' + (details.duration_ms / 1000).toFixed(1) + 's' : '')
+            + (details.token_usage ? ' · in ' + details.token_usage.input_tokens + ' / out ' + details.token_usage.output_tokens + ' tokens' : '');
+        list.appendChild(row);
+        while (list.childElementCount > 200) list.firstElementChild.remove();
+        state.textContent = event.message;
+        list.scrollTop = list.scrollHeight;
+    }
+    function refresh() {
+        if (destroyed || inFlight) return inFlight;
+        controller = new AbortController();
+        const timeout = setTimeout(() => controller?.abort(), 5000);
+        inFlight = (async () => {
+            try {
+                const data = await apiFetch('/api/chat/progress/' + encodeURIComponent(requestId) + '?after=' + cursor,
+                    {signal: controller.signal});
+                if (destroyed) return;
+                failures = 0;
+                if (data.truncated) state.textContent = 'Earlier activity was truncated; showing the available recent events.';
+                for (const event of data.events || []) {
+                    if (event.sequence > cursor) { show(event); cursor = event.sequence; }
+                }
+            } catch (error) {
+                if (!destroyed && ++failures >= 3) state.textContent = 'Activity feed temporarily unavailable. The answer request is still running.';
+            } finally {
+                clearTimeout(timeout);
+                inFlight = null;
+                if (!destroyed) timer = setTimeout(refresh, 1500);
+            }
+        })();
+        return inFlight;
+    }
+    const clock = setInterval(() => { elapsed.textContent = Math.floor((Date.now() - started) / 1000) + 's'; }, 1000);
+    refresh();
+    return {
+        element,
+        snapshot() { return events.slice(); },
+        finish() { show({kind: 'client_result', message: 'Answer received.', elapsed_ms: Date.now() - started, details: {}}); },
+        destroy() { destroyed = true; clearInterval(clock); clearTimeout(timer); controller?.abort(); }
     };
-
-    function schedule(callback, delay) {
-        const timeout = setTimeout(() => {
-            gameState.timeouts.delete(timeout);
-            if (!gameState.destroyed) callback();
-        }, delay);
-        gameState.timeouts.add(timeout);
-    }
-
-    function renderTabs() {
-        tabs.innerHTML = '';
-        [
-            ['bug', 'Bug Hunt'],
-            ['memory', 'COBOL Match'],
-            ['dino', 'Dino Run'],
-            ['snake', 'Snake'],
-        ].forEach(([game, label]) => {
-            const button = document.createElement('button');
-            const selected = gameState.activeGame === game;
-            button.type = 'button';
-            button.className = `waiting-game-tab${selected ? ' active' : ''}`;
-            button.textContent = label;
-            button.setAttribute('role', 'tab');
-            button.setAttribute('aria-selected', String(selected));
-            button.addEventListener('click', () => {
-                gameState.activeGame = game;
-                renderTabs();
-                renderGame();
-                if (game === 'dino' || game === 'snake') panel.focus();
-            });
-            tabs.appendChild(button);
-        });
-    }
-
-    function renderBugHunt() {
-        panel.innerHTML = '';
-        const status = document.createElement('div');
-        status.className = 'waiting-game-status';
-        status.innerHTML = `<span>Catch the moving bug.</span><strong>Score: ${gameState.bugScore}</strong>`;
-
-        const grid = document.createElement('div');
-        grid.className = 'bug-grid';
-        grid.setAttribute('aria-label', 'Bug hunt grid');
-        for (let index = 0; index < 12; index += 1) {
-            const cell = document.createElement('button');
-            const isTarget = index === gameState.bugTarget;
-            cell.type = 'button';
-            cell.className = `bug-cell${isTarget ? ' target' : ''}`;
-            cell.textContent = isTarget ? '◆' : '·';
-            cell.setAttribute('aria-label', isTarget ? 'Catch the bug' : 'Empty cell');
-            if (isTarget) {
-                cell.addEventListener('click', () => {
-                    gameState.bugScore += 1;
-                    moveBug();
-                });
-            }
-            grid.appendChild(cell);
-        }
-        panel.append(status, grid);
-    }
-
-    function moveBug() {
-        let nextTarget = Math.floor(Math.random() * 12);
-        if (nextTarget === gameState.bugTarget) {
-            nextTarget = (nextTarget + 1) % 12;
-        }
-        gameState.bugTarget = nextTarget;
-        if (gameState.activeGame === 'bug') renderBugHunt();
-    }
-
-    function renderMemory() {
-        panel.innerHTML = '';
-        const status = document.createElement('div');
-        status.className = 'waiting-game-status';
-        const pairs = gameState.memoryMatched.size / 2;
-        const message = pairs === 4 ? 'All pairs matched!' : 'Match the COBOL keywords.';
-        status.innerHTML = `<span>${message}</span><strong>${pairs}/4 pairs · ${gameState.memoryMoves} moves</strong>`;
-
-        const grid = document.createElement('div');
-        grid.className = 'memory-grid';
-        grid.setAttribute('aria-label', 'COBOL keyword memory cards');
-        gameState.memoryDeck.forEach((keyword, index) => {
-            const card = document.createElement('button');
-            const visible = gameState.memoryRevealed.has(index) || gameState.memoryMatched.has(index);
-            const matched = gameState.memoryMatched.has(index);
-            card.type = 'button';
-            card.className = `memory-card${visible ? ' revealed' : ''}${matched ? ' matched' : ''}`;
-            card.textContent = visible ? keyword : '?';
-            card.disabled = matched || gameState.memoryLocked;
-            card.setAttribute('aria-label', visible ? keyword : 'Hidden keyword card');
-            card.addEventListener('click', () => revealMemoryCard(index));
-            grid.appendChild(card);
-        });
-        panel.append(status, grid);
-    }
-
-    function revealMemoryCard(index) {
-        if (
-            gameState.memoryLocked ||
-            gameState.memoryMatched.has(index) ||
-            gameState.memoryRevealed.has(index)
-        ) return;
-
-        gameState.memoryRevealed.add(index);
-        const revealed = Array.from(gameState.memoryRevealed);
-        if (revealed.length === 2) {
-            gameState.memoryMoves += 1;
-            const [first, second] = revealed;
-            if (gameState.memoryDeck[first] === gameState.memoryDeck[second]) {
-                gameState.memoryMatched.add(first);
-                gameState.memoryMatched.add(second);
-                gameState.memoryRevealed.clear();
-            } else {
-                gameState.memoryLocked = true;
-                schedule(() => {
-                    gameState.memoryRevealed.clear();
-                    gameState.memoryLocked = false;
-                    if (gameState.activeGame === 'memory') renderMemory();
-                }, 700);
-            }
-        }
-        renderMemory();
-    }
-
-    function drawDino() {
-        const canvas = gameState.dinoCanvas;
-        if (!canvas?.isConnected || gameState.activeGame !== 'dino') return;
-        const ctx = canvas.getContext('2d');
-        const dino = gameState.dino;
-        ctx.fillStyle = '#f3f4f2';
-        ctx.fillRect(0, 0, 460, 160);
-        ctx.fillStyle = '#323b43';
-        ctx.fillRect(0, 125, 460, 2);
-        ctx.fillRect(51, 99 - dino.y, 23, 26);
-        ctx.fillRect(68, 103 - dino.y, 11, 6);
-        ctx.fillRect(45, 112 - dino.y, 8, 5);
-        ctx.fillRect(55, 125 - dino.y, 5, 8);
-        ctx.fillRect(68, 125 - dino.y, 5, 8);
-        ctx.fillStyle = '#f3f4f2';
-        ctx.fillRect(68, 104 - dino.y, 3, 3);
-        ctx.fillStyle = '#323b43';
-        for (const x of dino.obstacles) {
-            ctx.fillRect(x + 6, 99, 8, 26);
-            ctx.fillRect(x, 108, 7, 5);
-            ctx.fillRect(x + 17, 104, 6, 5);
-        }
-        ctx.font = 'bold 16px monospace';
-        ctx.fillText(`HI ${String(dino.score).padStart(5, '0')}`, 326, 25);
-        if (!dino.running) {
-            ctx.textAlign = 'center';
-            ctx.font = 'bold 19px monospace';
-            ctx.fillText(dino.over ? 'GAME OVER' : 'DINO RUN', 230, 75);
-            ctx.textAlign = 'left';
-        }
-    }
-
-    function jumpDino() {
-        const dino = gameState.dino;
-        if (dino.over) Object.assign(dino, {running: false, over: false, y: 0,
-            velocity: 0, obstacles: [420], score: 0});
-        dino.running = true;
-        if (dino.y === 0) dino.velocity = 11;
-        drawDino();
-    }
-
-    function renderDino() {
-        panel.innerHTML = '';
-        const status = document.createElement('div');
-        status.className = 'waiting-game-status';
-        status.innerHTML = '<span>Jump over the cacti · Space or ↑</span>';
-        const canvas = document.createElement('canvas');
-        canvas.className = 'dino-canvas';
-        canvas.width = 460;
-        canvas.height = 160;
-        canvas.setAttribute('aria-label', 'Dino runner game');
-        const jump = document.createElement('button');
-        jump.type = 'button';
-        jump.className = 'btn secondary-btn game-control';
-        jump.textContent = gameState.dino.over ? 'Restart Dino' : 'Jump';
-        jump.addEventListener('click', jumpDino);
-        gameState.dinoCanvas = canvas;
-        panel.append(status, canvas, jump);
-        drawDino();
-    }
-
-    function tickDino() {
-        const dino = gameState.dino;
-        if (gameState.activeGame !== 'dino' || !dino.running) return;
-        dino.y = Math.max(0, dino.y + dino.velocity);
-        dino.velocity = dino.y ? dino.velocity - 0.7 : 0;
-        dino.obstacles = dino.obstacles.map(x => x - 5);
-        if (dino.obstacles[0] < -24) {
-            dino.obstacles.shift();
-            dino.score += 1;
-        }
-        if (!dino.obstacles.length || dino.obstacles[dino.obstacles.length - 1] < 230) {
-            dino.obstacles.push(460 + Math.floor(Math.random() * 90));
-        }
-        if (dino.obstacles.some(x => x < 79 && x + 23 > 51 && dino.y < 27)) {
-            dino.running = false;
-            dino.over = true;
-            renderDino();
-        } else {
-            drawDino();
-        }
-    }
-
-    function drawSnake() {
-        const canvas = gameState.snakeCanvas;
-        if (!canvas?.isConnected || gameState.activeGame !== 'snake') return;
-        const ctx = canvas.getContext('2d');
-        const snake = gameState.snake;
-        ctx.fillStyle = '#f3f4f2';
-        ctx.fillRect(0, 0, 400, 200);
-        ctx.fillStyle = '#4b8b78';
-        snake.body.forEach(({x, y}) => ctx.fillRect(x * 20 + 1, y * 20 + 1, 18, 18));
-        ctx.fillStyle = '#c75858';
-        ctx.fillRect(snake.food.x * 20 + 2, snake.food.y * 20 + 2, 16, 16);
-        if (!snake.running) {
-            ctx.fillStyle = '#27313a';
-            ctx.font = 'bold 18px monospace';
-            ctx.textAlign = 'center';
-            ctx.fillText(snake.over ? 'GAME OVER' : 'SNAKE', 200, 94);
-            ctx.textAlign = 'left';
-        }
-    }
-
-    function steerSnake(x, y) {
-        const snake = gameState.snake;
-        if (snake.over) return;
-        if (x === -snake.direction.x && y === -snake.direction.y) return;
-        snake.nextDirection = {x, y};
-        snake.running = true;
-        drawSnake();
-    }
-
-    function renderSnake() {
-        panel.innerHTML = '';
-        const status = document.createElement('div');
-        status.className = 'waiting-game-status';
-        status.innerHTML = `<span>Collect the red squares · arrow keys</span><strong>Score: ${gameState.snake.score}</strong>`;
-        const canvas = document.createElement('canvas');
-        canvas.className = 'snake-canvas';
-        canvas.width = 400;
-        canvas.height = 200;
-        canvas.setAttribute('aria-label', 'Snake game board');
-        const controls = document.createElement('div');
-        controls.className = 'snake-controls';
-        [['↑', 0, -1], ['←', -1, 0], ['↓', 0, 1], ['→', 1, 0]].forEach(([label, x, y]) => {
-            const button = document.createElement('button');
-            button.type = 'button';
-            button.className = 'btn secondary-btn game-control';
-            button.textContent = label;
-            button.setAttribute('aria-label', `Move ${label}`);
-            button.addEventListener('click', () => steerSnake(x, y));
-            controls.appendChild(button);
-        });
-        if (gameState.snake.over) {
-            const restart = document.createElement('button');
-            restart.type = 'button';
-            restart.className = 'btn secondary-btn game-control snake-restart';
-            restart.textContent = 'Restart';
-            restart.addEventListener('click', () => {
-                gameState.snake = {running: false, over: false, body: [{x: 5, y: 5}, {x: 4, y: 5}],
-                    direction: {x: 1, y: 0}, nextDirection: {x: 1, y: 0}, food: {x: 12, y: 5}, score: 0};
-                renderSnake();
-            });
-            controls.appendChild(restart);
-        }
-        gameState.snakeCanvas = canvas;
-        panel.append(status, canvas, controls);
-        drawSnake();
-    }
-
-    function tickSnake() {
-        const snake = gameState.snake;
-        if (gameState.activeGame !== 'snake' || !snake.running) return;
-        snake.direction = snake.nextDirection;
-        const head = {x: snake.body[0].x + snake.direction.x, y: snake.body[0].y + snake.direction.y};
-        const eating = head.x === snake.food.x && head.y === snake.food.y;
-        const occupied = eating ? snake.body : snake.body.slice(0, -1);
-        if (head.x < 0 || head.x >= 20 || head.y < 0 || head.y >= 10 ||
-            occupied.some(part => part.x === head.x && part.y === head.y)) {
-            snake.running = false;
-            snake.over = true;
-            renderSnake();
-            return;
-        }
-        snake.body.unshift(head);
-        if (eating) {
-            snake.score += 1;
-            const free = [];
-            for (let y = 0; y < 10; y += 1) for (let x = 0; x < 20; x += 1) {
-                if (!snake.body.some(part => part.x === x && part.y === y)) free.push({x, y});
-            }
-            if (free.length) snake.food = free[Math.floor(Math.random() * free.length)];
-            else { snake.running = false; snake.over = true; }
-            renderSnake();
-        } else {
-            snake.body.pop();
-            drawSnake();
-        }
-    }
-
-    panel.tabIndex = 0;
-    panel.addEventListener('keydown', event => {
-        if (gameState.activeGame === 'dino' && (event.key === ' ' || event.key === 'ArrowUp')) {
-            event.preventDefault();
-            jumpDino();
-        }
-        if (gameState.activeGame === 'snake') {
-            const direction = {ArrowUp: [0, -1], ArrowDown: [0, 1],
-                ArrowLeft: [-1, 0], ArrowRight: [1, 0]}[event.key];
-            if (direction) { event.preventDefault(); steerSnake(...direction); }
-        }
-    });
-
-    function renderGame() {
-        if (gameState.activeGame === 'memory') renderMemory();
-        else if (gameState.activeGame === 'dino') renderDino();
-        else if (gameState.activeGame === 'snake') renderSnake();
-        else renderBugHunt();
-    }
-
-    renderTabs();
-    renderGame();
-
-    let seconds = 0;
-    const elapsedInterval = setInterval(() => {
-        seconds += 1;
-        elapsed.textContent = `${seconds}s`;
-    }, 1000);
-    const bugInterval = setInterval(() => {
-        if (!element.isConnected && seconds > 0) {
-            destroy();
-            return;
-        }
-        moveBug();
-    }, 1350);
-    const dinoInterval = setInterval(tickDino, 40);
-    const snakeInterval = setInterval(tickSnake, 145);
-
-    function destroy() {
-        if (gameState.destroyed) return;
-        gameState.destroyed = true;
-        clearInterval(elapsedInterval);
-        clearInterval(bugInterval);
-        clearInterval(dinoInterval);
-        clearInterval(snakeInterval);
-        gameState.timeouts.forEach(timeout => clearTimeout(timeout));
-        gameState.timeouts.clear();
-    }
-
-    return { element, destroy };
 }
 
 // Questions waiting to be asked, and the controller for the one in flight.
@@ -909,7 +598,8 @@ function setRunning(isRunning) {
 
 async function askOne(text) {
     appendMessage('user', text);
-    const waiting = createWaitingExperience();
+    const requestId = newConversationId();
+    const waiting = createWaitingExperience(requestId);
     chatHistory.appendChild(waiting.element);
     scrollChatToBottom();
 
@@ -918,7 +608,7 @@ async function askOne(text) {
         const data = await apiFetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: text }),
+            body: JSON.stringify({ message: text, request_id: requestId }),
             signal: runningRequest.signal,
         });
         observeConversationContext(data.session_context);
@@ -926,6 +616,8 @@ async function askOne(text) {
             appendMessage('assistant', 'Stopped. This answer was discarded and is not part of the chat memory.');
             return false;
         }
+        waiting.finish?.();
+        data.live_progress = waiting.snapshot?.() || [];
         appendMessage('assistant', data.answer, data.sources, data);
         return true;
     } catch (error) {
@@ -933,7 +625,7 @@ async function askOne(text) {
             appendMessage('assistant', 'Stopped. This answer was discarded and is not part of the chat memory.');
             return false;
         }
-        appendMessage('assistant', `**Error:** ${error.message}`);
+        appendMessage('assistant', `**Error:** ${error.message}`, [], {live_progress: waiting.snapshot?.() || []});
         return true;
     } finally {
         runningRequest = null;

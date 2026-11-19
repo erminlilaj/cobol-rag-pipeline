@@ -758,6 +758,7 @@ def review_answer(budget, instructions, payload, trace):
                          'and outgoing scopes; do not call them incidental to bypass direction checks.')
     for attempt in range(2):
         review_started = time.monotonic()
+        missing = []
         try:
             scoped_instructions = instructions
             if payload.get('paragraph_flow'):
@@ -823,9 +824,11 @@ def review_answer(budget, instructions, payload, trace):
                         if role != subject and relation.get(role) == []:
                             relation.pop(role)
             errors = [e.message for e in validator.iter_errors(review)]
-            if not errors and semantic_checks and not set(semantic_checks) <= {
-                    check['check'] for check in review.get('source_claim_checks', [])}:
-                errors.append('source_claim_checks must cover every requested analysis_check.')
+            if not errors and semantic_checks:
+                covered = {check['check'] for check in review.get('source_claim_checks', [])}
+                missing = [check for check in semantic_checks if check not in covered]
+                if missing:
+                    errors.append('Missing reviewer source checks: ' + ', '.join(missing) + '.')
             if not errors and any(not check['supported'] for check in review.get('source_claim_checks', [])):
                 review = {**review, 'passed': False, 'repair': 'answer',
                           'issues': [*review['issues'], *[check['reason'] for check in review['source_claim_checks']
@@ -847,6 +850,41 @@ def review_answer(budget, instructions, payload, trace):
             continue
         if attempt or budget.calls >= budget.maximum - budget.output_reserve or time.monotonic() >= budget.deadline:
             raise ReviewProtocolError('review_protocol_invalid: ' + '; '.join(errors))
+        if missing and review['passed'] and not review['issues'] and all(
+                check['supported'] for check in review['source_claim_checks']):
+            # The first review's typed findings and verdict remain intact. Ask
+            # for only the absent dimensions; do not repeat the full review.
+            item = deepcopy(properties['source_claim_checks']['items'])
+            item['properties']['check']['enum'] = missing
+            supplement_schema = {'type': 'object', 'additionalProperties': False,
+                'required': ['source_claim_checks'], 'properties': {'source_claim_checks': {
+                    'type': 'array', 'minItems': len(missing), 'maxItems': 20, 'items': item}}}
+            supplement_payload = {key: payload[key] for key in ('original_question', 'question', 'candidate',
+                'evidence', 'source_context', 'paragraph_flow') if key in payload}
+            supplement_payload['missing_analysis_checks'] = missing
+            supplement_started = time.monotonic()
+            try:
+                supplement = budget.call(
+                    'Review ONLY the listed missing analysis checks for the unchanged candidate. '
+                    'Return source_claim_checks covering each missing category. Compare the exact claims '
+                    'against the evidence; report supported=false when a claim is contradicted or unverified. '
+                    'If the candidate makes no claim in a category, identify the explicit gap or absence '
+                    'of such a claim; do not approve an unsupported assertion. Never rewrite the answer.',
+                    supplement_payload, supplement_schema, reserve=budget.output_reserve, phase='review')
+                supplemental_errors = [e.message for e in Draft202012Validator(supplement_schema).iter_errors(supplement)]
+            except (ToolError, ValueError, TypeError) as exc:
+                supplement, supplemental_errors = None, [str(exc)]
+            if not supplemental_errors and not set(missing) <= {c['check'] for c in supplement['source_claim_checks']}:
+                supplemental_errors.append('Missing reviewer source checks: ' + ', '.join(missing) + '.')
+            trace.append({'review_response': supplement, 'review_protocol_errors': supplemental_errors,
+                          'review_scope': missing, 'duration_ms': round((time.monotonic() - supplement_started) * 1000, 2)})
+            if supplemental_errors:
+                raise ReviewProtocolError('review_protocol_invalid: missing-check review for '
+                                          + ', '.join(missing) + ' failed: ' + '; '.join(supplemental_errors))
+            checks = [*review['source_claim_checks'], *supplement['source_claim_checks']]
+            rejected = [check['reason'] for check in checks if not check['supported']]
+            return {**review, 'source_claim_checks': checks, **(
+                {'passed': False, 'repair': 'answer', 'issues': rejected} if rejected else {})}
         request = {**payload, 'response_schema': contract, 'previous_review': review,
                    'protocol_errors': errors,
                    'instruction': 'Repair your review JSON, not the candidate answer. Interpret the original question and fill every required field; do not infer approval from the previous malformed review.'}
@@ -1461,7 +1499,7 @@ def synthesize_partial(question, request, requirements, tools, observations, err
     except Exception as exc:
         # This is optional recovery. Transport/model failures must leave the
         # normal explicit failure response intact, not turn it into an API 500.
-        trace.append({'status': 'partial_synthesis_rejected', 'error': str(exc)[:1000]})
+        trace.append({'status': 'partial_synthesis_rejected', 'error': (str(exc) or type(exc).__name__)[:1000]})
         return None
 
 
@@ -1848,6 +1886,8 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
             if not isinstance(calls, list) or not 1 <= len(calls) <= 6:
                 raise ToolError('Request one to six read-only tool calls.')
             errors = []
+            executed_non_source = False
+            source_tools = {'source_outline', 'source', 'source_range', 'search'}
             for call in calls:
                 broad_files = False
                 # Only an unambiguous, explicitly named owner can supply local
@@ -1904,6 +1944,8 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     continue
                 seen.add(key)
                 tool_calls += 1
+                if call['tool'] not in source_tools:
+                    executed_non_source = True
                 tool_started = time.monotonic()
                 visible_args = {key: value for key, value in call.get('args', {}).items() if key in {
                     'program', 'programs', 'table', 'paragraph', 'source_file', 'start', 'end', 'spans',
@@ -1967,7 +2009,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     trace.append({'tool': call.get('tool'), 'status': 'error', 'error': str(exc),
                                   'args': deepcopy(call.get('args', {})),
                                   'duration_ms': round((time.monotonic() - tool_started) * 1000, 2)})
-            source_only = all(call['tool'] in {'source_outline', 'source', 'source_range', 'search'} for call in calls)
+            source_only = not executed_non_source and any(call['tool'] in source_tools for call in calls)
             has_source = bool(source_at_attempt)
             new_physical = any(source_row(row) and source_address(row) not in source_at_attempt for row in tools.evidence.values())
             progressed = (new_physical if source_only and has_source else evidence_progress(tools) != evidence_at_attempt)
@@ -2067,7 +2109,19 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
         emit_progress('recovery', 'Preparing a supported partial answer from available evidence.')
         candidate = synthesize_partial(question, request, requirements, tools, observations,
                                        errors, budget, trace, known_entities)
+        if candidate is None and trace and trace[-1].get('status') == 'partial_synthesis_rejected':
+            reason = trace[-1]['error']
+            if (reason.startswith(('review_protocol_invalid:', 'Partial synthesis review rejected:'))
+                    and budget.calls + 2 <= budget.maximum - budget.output_reserve
+                    and time.monotonic() < budget.deadline):
+                emit_progress('recovery', 'Narrowing the partial answer to facts that can be reviewed.')
+                candidate = synthesize_partial(question, request, requirements, tools, observations,
+                    [reason, 'Omit claims that cannot be independently verified. Keep supported findings and '
+                     'explicitly identify gaps, without dropping required checks or original scope.'],
+                    budget, trace, known_entities)
     if candidate is None:
+        if trace and trace[-1].get('status') == 'partial_synthesis_rejected':
+            errors = [trace[-1]['error']]
         stopped = any(step.get('status') == 'stopped_repeated_answer' for step in trace)
         return {'answer': ('I could not verify this answer because the same unsupported response failed validation twice.'
                            if stopped else 'I could not verify a complete answer within the investigation budget. '

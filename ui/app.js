@@ -130,7 +130,17 @@ async function apiFetch(url, options) {
     const requestOptions = options || {};
     const headers = new Headers(requestOptions.headers || {});
     headers.set('X-Session-ID', chatSessionId);
-    const response = await fetch(url, { ...requestOptions, headers });
+    let response;
+    try {
+        response = await fetch(url, { ...requestOptions, headers });
+    } catch (error) {
+        if (error instanceof TypeError) {
+            const connection = new Error('The browser could not reach the RAG API.', {cause: error});
+            connection.name = 'RagConnectionError';
+            throw connection;
+        }
+        throw error;
+    }
     const contentType = response.headers.get('content-type') || '';
     const payload = contentType.includes('application/json') ? await response.json() : await response.text();
     if (!response.ok) {
@@ -636,7 +646,10 @@ async function askOne(text) {
             appendMessage('assistant', 'Stopped. This answer was discarded and is not part of the chat memory.');
             return false;
         }
-        appendMessage('assistant', `**Error:** ${error.message}`, [], {live_progress: waiting.snapshot?.() || []});
+        const transportFailure = error.name === 'RagConnectionError';
+        appendMessage('assistant', transportFailure
+            ? '**Connection error:** The browser did not receive a response from the RAG API. The server may still be processing this question; check API health before retrying.'
+            : `**Error:** ${error.message}`, [], {live_progress: waiting.snapshot?.() || []});
         return true;
     } finally {
         runningRequest = null;

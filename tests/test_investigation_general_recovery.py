@@ -275,7 +275,9 @@ def test_scoped_literal_fallback_can_find_copybook_and_stops_repeat_exploration(
                     answer='A assigns fixed amounts; B has a copybook reference but its calculation is unverified.',
                     evidence_ids=[row['evidence_id'] for row in retained])
             return super().call(system, payload, *args, **kwargs)
-    budget = Replay([tools(a, b), tools(body), tools(body), tools(covered), tools(body), dict(passed=True, issues=[])])
+    cached_non_source = dict(tool='query', args=dict(programs=['B'], table='variables'))
+    budget = Replay([tools(a, b, cached_non_source), tools(body), tools(body, cached_non_source),
+                     tools(covered, cached_non_source), tools(body, cached_non_source), dict(passed=True, issues=[])])
     result = investigate('Explain the item rule in A and B', AppConfig(), budget=budget,
         resolved_request=dict(resolved_question='Explain the item rule in A and B', output='other', depth='detailed', limit=None))
     assert result['status'] == 'partial', result['trace']
@@ -302,3 +304,59 @@ def test_retained_preview_keeps_entry_bypass_and_late_rule_under_small_budget(ev
     preview = recovery_source_evidence(evidence, max_chars=2800)
     assert preview['truncated']
     assert {2, 3, 90, 91, 92} <= {row['line'] for row in preview['rows']}
+
+
+@pytest.mark.parametrize('supported', [True, False])
+def test_reviewer_repairs_only_missing_category_and_retains_original_verdict(supported):
+    from cobol_rag.investigation import review_answer
+    stored = dict(check='storage_effects', claim='A assigns 42.', supported=True, reason='Recorded MOVE.')
+    flow = dict(check='flow_destinations', claim='Mode D bypasses the assignment.',
+                supported=supported, reason='Checked against the recorded GO TO and its condition.')
+    class Reviewer(FakeBudget):
+        def call(self, system, payload, contract=None, **kwargs):
+            if self.calls == 1:
+                assert payload['missing_analysis_checks'] == ['flow_destinations']
+                assert 'previous_review' not in payload
+                assert contract['properties']['source_claim_checks']['items']['properties']['check']['enum'] == ['flow_destinations']
+                assert payload['candidate']['answer'] == 'Unchanged candidate.'
+            return super().call(system, payload, contract, **kwargs)
+    budget = Reviewer([dict(passed=True, issues=[], source_claim_checks=[stored]),
+                       dict(source_claim_checks=[flow])])
+    trace = []
+    verdict = review_answer(budget, 'Review', dict(candidate=dict(answer='Unchanged candidate.'),
+        evidence_contracts=[], resolved_request=dict(analysis_checks=['flow_destinations', 'storage_effects'])), trace)
+    assert verdict['passed'] is supported and budget.calls == 2
+    assert verdict['source_claim_checks'] == [stored, flow]
+    assert trace[-1]['review_scope'] == ['flow_destinations']
+
+
+@pytest.mark.parametrize('allow_rewrite', [False, True])
+def test_missing_review_check_not_replaced_by_stale_cached_lookup_failure(evidence, allow_rewrite):
+    stored = dict(check='storage_effects', claim='A records V1.', supported=True, reason='Recorded V1.')
+    candidate = dict(action='final', mode='technical', status='partial',
+        answer='A records V1; the flow remains unverified.', evidence_ids=['E1'])
+    lookup = dict(action='tools', calls=[dict(tool='query', args=dict(programs=['A'], table='variables'))])
+    class Replay(FakeBudget):
+        maximum = 9 if allow_rewrite else 8
+        synthesis_reserve = 2
+        config = AppConfig()
+        def call(self, system, payload, *args, **kwargs):
+            if self.calls == 7 and allow_rewrite:
+                assert any('Omit claims' in message for message in payload['feedback'])
+            return super().call(system, payload, *args, **kwargs)
+    complete_review = dict(passed=True, issues=[], source_claim_checks=[stored,
+        dict(check='flow_destinations', claim='No flow is asserted; it remains explicitly unverified.',
+             supported=True, reason='The answer states the coverage gap.')])
+    retry = [candidate, complete_review] if allow_rewrite else []
+    budget = Replay([lookup]*4 + [candidate, dict(passed=True, issues=[], source_claim_checks=[stored]),
+                                  dict(source_claim_checks=[])] + retry)
+    result = investigate('Explain A.', AppConfig(), budget=budget, resolved_request=dict(
+        resolved_question='Explain A.', output='other', limit=None, analysis_checks=['flow_destinations', 'storage_effects']))
+    if allow_rewrite:
+        assert result['status'] == 'partial', result['trace']
+        assert budget.calls == 9
+    else:
+        assert result['status'] == 'failed'
+        assert result['errors'][0].startswith('review_protocol_invalid:')
+        assert 'flow_destinations' in result['errors'][0]
+        assert 'cached result' not in result['errors'][0]

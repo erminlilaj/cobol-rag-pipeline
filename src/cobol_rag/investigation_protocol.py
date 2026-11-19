@@ -129,7 +129,7 @@ def decision_schema():
 
 
 def normalize_optional_nulls(value, schema):
-    """Omit optional null metadata only where null is not a valid value.
+    """Omit invalid optional null metadata and an empty optional role list.
 
     Required fields, explicit null predicates, empty filters and unknown keys
     remain untouched and must pass normal validation. Never invent defaults.
@@ -142,7 +142,11 @@ def normalize_optional_nulls(value, schema):
         for key, spec in schema.get('properties', {}).items():
             if key not in value:
                 continue
-            if value[key] is None and key not in required and not Draft202012Validator(spec).is_valid(None):
+            if key == 'call_relations' and key not in required and value[key] == [] and spec.get('minItems') == 1:
+                # No optional relationship dimensions is equivalent to omission.
+                # Never remove empty filters, required lists, or invalid roles.
+                del value[key]
+            elif value[key] is None and key not in required and not Draft202012Validator(spec).is_valid(None):
                 del value[key]
             else:
                 value[key] = normalize_optional_nulls(value[key], spec)
@@ -154,7 +158,13 @@ def normalize_optional_nulls(value, schema):
 def tool_help():
     lines = ['Read-only tools (use the tool name and an args object):']
     for name, schema in TOOL_SCHEMAS.items():
-        lines.append(name + '(' + ', '.join(schema['properties']) + ')')
+        fields = []
+        for key, spec in schema['properties'].items():
+            kind = '|'.join(spec['enum']) if 'enum' in spec else str(spec.get('type', 'value'))
+            if spec.get('type') == 'array' and spec.get('items', {}).get('type') == 'string':
+                kind = 'string[]'
+            fields.append(key + (':' if key in schema['required'] else '?:') + kind)
+        lines.append(name + '(' + ', '.join(fields) + ')')
     lines.extend(['inventory lists analyzed PROGRAMS, not files. For a corpus-wide count of analyzed source members, call files with limit=0 and omit programs. The unit is source members per program, including recorded copybook members; do not call it a distinct physical-file or program count.',
                   'connections reads the published corpus graph without guessing a program list. Each row has kind, source, target, program, evidence and source_artifact. Filter kind=program_call for cross-program call topology or kind=jcl_exec for job-step execution; DD edges are separate. Missing artifact coverage blocks global absence claims.',
                   'query reads a table for explicit programs; limit:0 counts, limit:N pages.',

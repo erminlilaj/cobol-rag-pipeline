@@ -885,7 +885,9 @@ class EvidenceTools:
                                       'last_recorded_line': max(row['line'] for row in source)},
                     'total_matches': len(rows), 'returned': len(rows[offset:offset + limit]),
                     'next_offset': offset + limit if limit and offset + limit < len(rows) else None,
-                    'limitation': 'Recorded paragraph/verb navigation and physical division headers, not a control-flow or business-rule proof. Read matching source and surrounding conditions before answering.'}
+                    'inspection_state': 'navigation_only',
+                    'next_action': 'Open matching paragraph bodies with source(program, paragraph) or source_range. For zero matches, search literal source or inspect generic processing and COPY members before an absence claim.',
+                    'limitation': 'Recorded paragraph/verb navigation and physical division headers, not a control-flow or business-rule proof. Zero matches do not prove behavior is absent. Read matching source and surrounding conditions before answering.'}
         if tool == 'group_context':
             program, group = args['program'].upper(), args['group'].upper()
             source_prefix = str(args.get('source_prefix') or '').upper().rstrip('-')

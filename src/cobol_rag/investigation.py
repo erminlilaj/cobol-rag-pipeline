@@ -18,6 +18,7 @@ from cobol_rag.progress import emit as emit_progress
 
 from cobol_rag.investigation_protocol import decision_schema, tool_help, TOOL_SCHEMAS, TABLE_INFO, REQUEST, normalize_optional_nulls
 from cobol_rag.conversation_memory import reference_context
+from cobol_rag.investigation_recovery import evidence_progress, recovery_source_evidence, outline_followups
 
 SYSTEM = '''You are a COBOL analysis assistant using read-only evidence tools.
 Interpret the original user's meaning, not memorized question wording. The resolved request
@@ -62,9 +63,10 @@ Read a paragraph with source(program,paragraph); linked paragraph_operations des
 expanded COPY behavior. COPY/INCLUDE are inclusion directives, EJECT/SKIP are listing
 directives, not runtime actions. Preserve exact statement text, operands and conditions.
 When the location is unknown, use source_outline(program, verbs or terms) to find
-actual procedure paragraphs, then read their source. For calculations, locate
-arithmetic verbs instead of matching an English business word against Italian
-identifiers. For parameter validation inspect IF/EVALUATE procedure locations,
+actual procedure paragraphs, then read their source. For calculations, inspect
+conditional MOVE assignments, initialization, tables and calls as well as arithmetic
+verbs; a fixed override is business logic even without COMPUTE. Do not require
+English business words in Italian identifiers. For parameter validation inspect IF/EVALUATE procedure locations,
 not only declarations. An unknown paragraph or an empty source window is a
 navigation failure, not proof the requested logic is absent. Keep describe and
 search scoped to the explicitly named program unless corpus scope was requested.
@@ -352,7 +354,11 @@ def normalize_decision(decision, tools):
     if decision.get('action') == 'final' and tools is not None and isinstance(decision.get('evidence_ids', []), list):
         # Inline citations already select evidence. Reconcile representations;
         # never fabricate or accept an unknown reference.
-        cited = re.findall(r'\[(E\d+)\]', str(decision.get('answer', '')))
+        from cobol_rag.citations import evidence_ids
+        try:
+            cited = evidence_ids(str(decision.get('answer', '')))
+        except ValueError:
+            cited = []  # The normal citation check rejects malformed ranges.
         decision['evidence_ids'] = list(dict.fromkeys(
             decision.get('evidence_ids', []) + [eid for eid in cited if eid in tools.evidence]))
     for call in decision.get('calls', []):
@@ -370,6 +376,13 @@ def normalize_decision(decision, tools):
                 raise ToolError('Conflicting table in tool request.')
             call.update(tool='query', args={**args, 'table': table})
         args = call.get('args', {})
+        if call.get('tool') == 'source_outline' and isinstance(args.get('terms'), str):
+            terms = args['terms']
+            # Repair only explicit comma-separated identifier tokens. Preserve
+            # phrases, quoted literals and punctuation-bearing searches intact.
+            args['terms'] = ([part.strip() for part in terms.split(',')]
+                             if re.fullmatch(r'[\w$#@-]+(?:\s*,\s*[\w$#@-]+)+', terms.strip())
+                             else [terms])
         if call.get('tool') == 'flow_edges' and args.get('direction') in {'to', 'from', 'in', 'out'}:
             args['direction'] = {'to': 'incoming', 'from': 'outgoing', 'in': 'incoming', 'out': 'outgoing'}[args['direction']]
         # An explicit command predicate has one lossless table representation.
@@ -1070,6 +1083,12 @@ def answer_checks(question, candidate, tools, requirements, request=None):
         reasons.append('program_claim_without_evidence')
     if ids and candidate.get('mode') != 'technical':
         reasons.append('evidence_based_answer_must_use_technical_mode')
+    if (ids and request and request.get('output') == 'other'
+            and (request.get('depth') == 'detailed' or request.get('collection_semantics') == 'narrative'
+                 or request.get('explanation_goals'))
+            and all(tools.evidence[eid].get('_artifact') == 'source.outline' for eid in ids)):
+        reasons.append('Source outlines are navigation only: open the relevant source bodies before explaining '
+                       'behavior or claiming its logic is unavailable. Preserve any verified per-program findings.')
     # In a large corpus, ordinary words in a social reply can also be indexed
     # identifiers. Token overlap is not a factual claim. The semantic reviewer
     # still checks that the reply actually answers the original social request
@@ -1357,11 +1376,17 @@ def synthesize_partial(question, request, requirements, tools, observations, err
         'remains unverified and label any interpretation as inference. Do not repeat a '
         'contradicted claim or disguise an unanswered request as an answer. If no substantive '
         'part is supported, say so; do not invent an answer. A protocol error is not evidence '
-        'that an entity or behavior is absent.')
+        'that an entity or behavior is absent. Preserve supported findings for EACH program '
+        'even when another program is unresolved. An outline or zero term matches cannot '
+        'establish missing computation logic. Conditional MOVE/initialization/table lookup '
+        'can implement business rules without an arithmetic formula. State what was not '
+        'inspected separately from what inspected source proves absent.')
     payload = {'original_question': question, 'resolved_request': request,
                'requirements': requirements or [question], 'feedback': errors,
                'observations': deepcopy(observations[-3:]),
-               'available_results': result_directory(tools)}
+               'available_results': result_directory(tools),
+               'retained_source_evidence': recovery_source_evidence(tools, max_chars=min(20000, max(2048,
+                   max(budget.config.investigation.context_window, budget.config.llm.context_window) // 2)))}
     try:
         payload = pack_observations(payload, instructions,
             max(budget.config.investigation.context_window, budget.config.llm.context_window))
@@ -1460,7 +1485,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
     attempts = 0
     while budget.calls < core_limit - 1 and attempts < config.investigation.max_model_calls + 2 and time.monotonic() < budget.deadline:
         attempts += 1
-        evidence_at_attempt = len(tools.evidence)
+        evidence_at_attempt = evidence_progress(tools)
         payload = {'question': request['resolved_question'] if request else question, 'original_question': question,
                    'default_program': target_program or getattr(state, 'current_program', None),
                    'known_entity_roles': known_entities[:30],
@@ -1469,6 +1494,8 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                    'resolved_request': request,
                    'recent_conversation': '' if request else (conversation_history or '')[-2500:],
                    'observations': deepcopy(observations[-3:]), 'feedback': errors,
+                   'retained_source_evidence': recovery_source_evidence(tools, max_chars=min(12000, max(2048,
+                       max(config.investigation.context_window, config.llm.context_window) // 2))) if len(observations) > 3 else {},
                    'available_results': result_directory(tools),
                    'remaining_model_calls': core_limit - budget.calls,
                    'instruction': 'Finalize now; no further tools.' if budget.calls >= core_limit - 2 else ''}
@@ -1569,7 +1596,8 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         must_retrieve = False
                     elif not tools.evidence and any(e in errors for e in ('unknown_evidence_reference', 'program_claim_without_evidence', 'corpus_entity_answer_requires_evidence')):
                         must_retrieve = True
-                    elif any(e.startswith(('Multiple input collections', 'Requested collection is incomplete')) for e in errors):
+                    elif any(e.startswith(('Multiple input collections', 'Requested collection is incomplete',
+                                           'Source outlines are navigation only')) for e in errors):
                         must_retrieve = True
                     elif any(e.startswith(('Whole-job claims require', 'JCL exec requires',
                                            'JCL parm requires', 'JCL dds requires', 'JCL sysout requires')) for e in errors):
@@ -1892,7 +1920,29 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     trace.append({'tool': call.get('tool'), 'status': 'error', 'error': str(exc),
                                   'args': deepcopy(call.get('args', {})),
                                   'duration_ms': round((time.monotonic() - tool_started) * 1000, 2)})
-            stagnant_rounds = stagnant_rounds + 1 if len(tools.evidence) == evidence_at_attempt else 0
+            stagnant_rounds = stagnant_rounds + 1 if evidence_progress(tools) == evidence_at_attempt else 0
+            if stagnant_rounds >= 2 and not (request and request.get('output') in {'list', 'count'}):
+                # A bounded navigation-to-body fallback, independent of question
+                # wording, model, language and business identifiers.
+                for followup in outline_followups(tools, seen):
+                    if tool_calls >= config.investigation.max_tool_calls or time.monotonic() >= budget.deadline:
+                        break
+                    seen.add(digest(followup))
+                    tool_calls += 1
+                    try:
+                        emit_progress('tool_start', 'Opening source behind an unread outline.',
+                                      tool=followup['tool'], scope=followup['args'])
+                        result = tools.execute(followup['tool'], followup['args'])
+                        observations.append({'call': followup, 'result': tool_view(result, config.investigation.preview_chars)})
+                        trace.append({'tool': followup['tool'], 'args': followup['args'], 'status': 'ok',
+                                      'recovery': 'unread_outline', 'returned': result.get('returned')})
+                        emit_progress('tool_end', 'Source body opened for recovery.', tool=followup['tool'], returned=result.get('returned'))
+                    except (ToolError, ValueError, KeyError, OSError) as exc:
+                        trace.append({'recovery': 'unread_outline', 'status': 'error', 'error': str(exc)[:500]})
+                if evidence_progress(tools) != evidence_at_attempt:
+                    stagnant_rounds = 0
+                    errors = ['New source bodies were opened behind the outlines. Explain their supported behavior; '
+                              'keep other programs unresolved rather than discard these facts.']
             if stagnant_rounds >= 3:
                 trace.append({'status': 'stopped_no_progress', 'rounds': stagnant_rounds})
                 break

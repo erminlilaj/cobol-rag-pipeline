@@ -55,7 +55,8 @@ def file_read(path, *, program=None, role='analysis artifact'):
         size = path.stat().st_size if path.is_file() else None
     except OSError:
         size = None
-    emit('file_open', 'Opening file.', path=str(path), program=program, role=role,
+    from cobol_rag.activity_context import file_purpose
+    emit('file_open', 'Opening file.', path=str(path), program=program, role=role, purpose=file_purpose(path, role),
          bytes=size)
     try:
         yield

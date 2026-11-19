@@ -192,7 +192,8 @@ class EvidenceTools:
             with file_read(path, program=program):
                 self._cache[key] = json.loads(path.read_text(encoding='utf-8'))
         else:
-            emit_progress('file_cached', 'Reusing file data already loaded for this question.', path=str(path), program=program)
+            emit_progress('file_cached', 'Reusing file data already loaded for this question.', path=str(path), program=program,
+                          purpose='No new file read: the same loaded analysis artifact is being reused.')
         return deepcopy(self._cache[key])
 
     def source_records(self, root, program):

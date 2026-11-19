@@ -44,7 +44,7 @@ function page() {
         progressResponse: {},
         setInterval(callback) { const id = ++nextTimer; timers.set(id, callback); return id; },
         clearInterval(id) { timers.delete(id); },
-        setTimeout(callback) { const id = ++nextTimer; timers.set(id, callback); return id; },
+        setTimeout(callback) { const id = ++nextTimer; timers.set(id, () => { timers.delete(id); callback(); }); return id; },
         clearTimeout(id) { timers.delete(id); },
         request(url, options) {
             if (url.startsWith('/api/chat/progress/')) {
@@ -107,10 +107,64 @@ test('detailed activity shows exact paths, expandable metadata and safe source p
     await tick();
     const list = activity.element.children[1].children.find(child => child.className === 'activity-list');
     assert.match(list.children[0].textContent, /\/workspace\/\.runs\/DEMO\/program.source_lines.jsonl/);
-    assert.ok(list.children[0].children.some(child => child.children[0].textContent.includes('Inspect parameters')));
+    assert.ok(list.children[0].children.some(child => child.children[0].textContent.includes('Technical details')));
     const preview = list.children[1].children.find(child => child.className === 'activity-source-preview');
     assert.match(preview.textContent, /DEMO.CBL:7.*<script>/);
     assert.equal(preview.innerHTML, undefined);
+    activity.destroy();
+});
+
+test('live model stage explains purpose, supplied files and waiting instead of inventing thoughts', async () => {
+    const chat = page();
+    chat.setProgress({events: [{sequence: 1, kind: 'model_start', message: 'Model request started.', elapsed_ms: 100,
+        details: {phase: 'tool_repair', model: 'Qwen', call: 4,
+            purpose: 'Correct a failed tool request against its argument schema.',
+            context_files: ['DEMO: DEMO.CBL'], context_chars: 12000, context_rows: 32, remaining_calls: 8}}]});
+    const activity = chat.activity();
+    await tick();
+    const content = activity.element.children[1];
+    assert.match(content.children.find(child => child.className === 'activity-purpose').textContent, /Correct a failed tool/);
+    assert.match(content.children.find(child => child.className === 'activity-target').textContent, /Source context supplied: DEMO: DEMO.CBL/);
+    const log = content.children.find(child => child.className === 'activity-list');
+    assert.match(log.children[0].textContent, /Correcting invalid tool arguments/);
+    assert.match(log.children[0].textContent, /12,000 characters \(not a token estimate\)/);
+    for (const callback of [...chat.timers.values()]) callback();
+    assert.match(content.children.find(child => child.className === 'activity-model-wait').textContent, /waiting for a complete provider response/);
+    await tick();
+    chat.setProgress({events: [{sequence: 2, kind: 'model_end', message: 'Model response received.', details: {phase: 'tool_repair'}}]});
+    for (const callback of [...chat.timers.values()]) callback();
+    await tick();
+    assert.equal(content.children.find(child => child.className === 'activity-model-wait').textContent, '');
+    activity.destroy();
+    assert.equal(chat.timers.size, 0);
+});
+
+test('zero matches and no-progress findings are visible without expanding raw details', async () => {
+    const chat = page();
+    chat.setProgress({events: [{sequence: 1, kind: 'tool_end', message: 'Evidence lookup completed.',
+        details: {tool: 'source_outline', returned: 0, outcome: 'No matching recorded procedure paragraphs. This does not prove behavior is absent.',
+            purpose: 'Locate matching paragraphs.', next_hint: 'Try literal source or a different member.'}},
+        {sequence: 2, kind: 'no_progress', message: 'This round added no new evidence facts.',
+            details: {purpose: 'Repeated or cached lookups are not new source evidence.'}}]});
+    const activity = chat.activity();
+    await tick();
+    const content = activity.element.children[1];
+    const list = content.children.find(child => child.className === 'activity-list');
+    assert.match(list.children[0].textContent, /does not prove behavior is absent/);
+    assert.match(list.children[0].textContent, /Try literal source/);
+    assert.match(list.children[1].textContent, /Repeated or cached lookups/);
+    activity.destroy();
+});
+
+test('bounded truncated scope lists render safely without HTML or join errors', async () => {
+    const chat = page();
+    chat.setProgress({events: [{sequence: 1, kind: 'tool_start', message: 'Reading evidence.',
+        details: {tool: 'query', scope: {programs: {preview: ['A', '<script>'], total: 30, truncated: true}, table: 'calls'}}}]});
+    const activity = chat.activity();
+    await tick();
+    const list = activity.element.children[1].children.find(child => child.className === 'activity-list');
+    assert.match(list.children[0].textContent, /A, <script>.*table calls/);
+    assert.equal(list.children[0].innerHTML, undefined);
     activity.destroy();
 });
 

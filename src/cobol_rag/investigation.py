@@ -19,6 +19,7 @@ from cobol_rag.progress import emit as emit_progress
 from cobol_rag.investigation_protocol import decision_schema, tool_help, TOOL_SCHEMAS, TABLE_INFO, REQUEST, normalize_optional_nulls
 from cobol_rag.conversation_memory import reference_context
 from cobol_rag.investigation_recovery import evidence_progress, recovery_source_evidence, outline_followups
+from cobol_rag.activity_context import model_context, tool_context, source_preview
 
 SYSTEM = '''You are a COBOL analysis assistant using read-only evidence tools.
 Interpret the original user's meaning, not memorized question wording. The resolved request
@@ -547,7 +548,11 @@ class Budget:
         started = time.monotonic()
         event = {'call': self.calls, 'phase': phase, 'status': 'started'}
         self.model_events.append(event)
-        emit_progress('model_start', 'Model request started.', phase=phase, call=self.calls)
+        emit_progress('model_start', 'Model request started.', phase=phase, call=self.calls,
+                      model=self.config.llm.model, **model_context(phase, payload),
+                      context_chars=len(system) + len(user), max_context_tokens=context_window,
+                      remaining_calls=self.maximum - reserve - self.calls,
+                      deadline_remaining_seconds=round(remaining, 1))
         config = replace(self.config, llm=replace(self.config.llm, context_window=context_window, request_timeout=max(1, min(remaining, self.config.llm.request_timeout))))
         # Final answers need room for both detailed prose and closing JSON fields.
         detailed = (payload.get('resolved_request') or {}).get('depth') == 'detailed'
@@ -595,6 +600,19 @@ class Budget:
                         failure.failed_call = result['calls'][path[1]]
                 raise failure from error
         event['status'] = 'ok'
+        if isinstance(result, dict) and result.get('action') == 'tools':
+            emit_progress('model_decision', 'Model selected the next read-only operations.',
+                          tools=[call.get('tool') for call in (result.get('calls') if isinstance(result.get('calls'), list) else []) if isinstance(call, dict)],
+                          call=self.calls)
+        elif isinstance(result, dict) and result.get('action') == 'final':
+            emit_progress('draft_ready', 'An answer draft is ready; it still needs evidence validation.',
+                          coverage=result.get('status'), cited_records=len(result.get('evidence_ids')) if isinstance(result.get('evidence_ids'), list) else None)
+        elif isinstance(result, dict) and phase == 'resolution':
+            emit_progress('request_resolved', 'Request scope and output requirements resolved.',
+                          scope=result.get('scope'), depth=result.get('depth'), output=result.get('output'))
+        elif isinstance(result, dict) and phase == 'review':
+            emit_progress('review_result', 'Independent answer review completed.',
+                          passed=result.get('passed'), issues=len(result.get('issues')) if isinstance(result.get('issues'), list) else None, repair=result.get('repair'))
         return result
 
 
@@ -1549,7 +1567,12 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                 payload['instruction'] = 'Retrieve evidence now. Return action=tools and calls; no answer.'
             payload = pack_observations(payload, instructions, context_window)
             decision_started = time.monotonic()
-            decision = normalize_decision(budget.call(instructions, payload, decision_contract, reserve=budget.maximum-core_limit+1), tools)
+            decision_phase = ('tool_repair' if pending_tool_repair else 'evidence_recovery' if must_retrieve
+                              else 'answer_repair' if previous_candidate is not None
+                              else 'final_synthesis' if decision_contract['properties']['action'].get('const') == 'final'
+                              else 'decision')
+            decision = normalize_decision(budget.call(instructions, payload, decision_contract,
+                                                     reserve=budget.maximum-core_limit+1, phase=decision_phase), tools)
             if must_retrieve and decision.get('action') != 'tools':
                 raise ToolError('Evidence review requires a new tool request before another final answer.')
             if request is None and not observations and decision.get('request_contract'):
@@ -1854,7 +1877,8 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         observations.append(deepcopy(cached))
                         errors = ['The identical request already succeeded. Use the cached result, including total_matches for a count.']
                         trace.append({'tool': call['tool'], 'status': 'cached', 'result_id': cached['result'].get('result_id')})
-                        emit_progress('tool_cached', 'Reusing an existing tool result.', tool=call['tool'])
+                        emit_progress('tool_cached', 'Reusing an existing tool result; no new lookup is being executed.',
+                                      tool=call['tool'], scope=call.get('args'), **tool_context(call['tool'], call['args'], cached['result']))
                         continue
                     raise ToolError('Identical tool request produced no new evidence; refine it or answer.')
                 seen.add(key)
@@ -1863,7 +1887,8 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                 visible_args = {key: value for key, value in call.get('args', {}).items() if key in {
                     'program', 'programs', 'table', 'paragraph', 'source_file', 'start', 'end', 'spans',
                     'identifier', 'variables', 'group', 'source_prefix', 'target', 'direction', 'verbs', 'terms', 'where', 'text'}}
-                emit_progress('tool_start', 'Reading evidence.', tool=call['tool'], scope=visible_args)
+                emit_progress('tool_start', 'Reading evidence.', tool=call['tool'], scope=visible_args,
+                              **tool_context(call['tool'], call['args']))
                 try:
                     evidence_before = set(tools.evidence)
                     result = tools.execute(call['tool'], call['args'])
@@ -1873,12 +1898,10 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     view = tool_view(result, config.investigation.preview_chars)
                     observations.append({'call': call, 'result': view})
                     emit_progress('tool_end', 'Evidence lookup completed.', tool=call['tool'],
+                                  **tool_context(call['tool'], call['args'], result),
                                   returned=result.get('returned'), total_matches=result.get('total_matches'),
                                   result_id=result.get('result_id'),
-                                  source_preview=[{key: row[key] for key in ('evidence_id', 'program', 'source_file', 'line',
-                                                  'line_start', 'paragraph', 'text') if key in row}
-                                                  for row in result.get('rows', [])[:3]
-                                                  if row.get('source_file') and isinstance(row.get('text'), str)],
+                                  source_preview=source_preview(result.get('rows', [])),
                                   artifacts=sorted({str(row.get('_artifact') or row.get('source_file'))
                                       for row in result.get('rows', []) if row.get('_artifact') or row.get('source_file')})[:8],
                                   duration_ms=round((time.monotonic() - tool_started) * 1000, 2))
@@ -1921,6 +1944,9 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                                   'args': deepcopy(call.get('args', {})),
                                   'duration_ms': round((time.monotonic() - tool_started) * 1000, 2)})
             stagnant_rounds = stagnant_rounds + 1 if evidence_progress(tools) == evidence_at_attempt else 0
+            if stagnant_rounds:
+                emit_progress('no_progress', 'This round added no new evidence facts.', repeated_rounds=stagnant_rounds,
+                              purpose='Repeated or cached lookups are not new source evidence; the bounded no-progress guard is active.')
             if stagnant_rounds >= 2 and not (request and request.get('output') in {'list', 'count'}):
                 # A bounded navigation-to-body fallback, independent of question
                 # wording, model, language and business identifiers.
@@ -1931,12 +1957,15 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     tool_calls += 1
                     try:
                         emit_progress('tool_start', 'Opening source behind an unread outline.',
-                                      tool=followup['tool'], scope=followup['args'])
+                                      tool=followup['tool'], scope=followup['args'],
+                                      **tool_context(followup['tool'], followup['args']))
                         result = tools.execute(followup['tool'], followup['args'])
                         observations.append({'call': followup, 'result': tool_view(result, config.investigation.preview_chars)})
                         trace.append({'tool': followup['tool'], 'args': followup['args'], 'status': 'ok',
                                       'recovery': 'unread_outline', 'returned': result.get('returned')})
-                        emit_progress('tool_end', 'Source body opened for recovery.', tool=followup['tool'], returned=result.get('returned'))
+                        emit_progress('tool_end', 'Source body opened for recovery.', tool=followup['tool'], returned=result.get('returned'),
+                                      source_preview=source_preview(result.get('rows', [])),
+                                      **tool_context(followup['tool'], followup['args'], result))
                     except (ToolError, ValueError, KeyError, OSError) as exc:
                         trace.append({'recovery': 'unread_outline', 'status': 'error', 'error': str(exc)[:500]})
                 if evidence_progress(tools) != evidence_at_attempt:
@@ -1945,6 +1974,8 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                               'keep other programs unresolved rather than discard these facts.']
             if stagnant_rounds >= 3:
                 trace.append({'status': 'stopped_no_progress', 'rounds': stagnant_rounds})
+                emit_progress('exploration_stopped', 'Stopping repeated evidence exploration; no new facts were found.',
+                              reason='no_progress', rounds=stagnant_rounds)
                 break
         except Exception as exc:
             candidate = None

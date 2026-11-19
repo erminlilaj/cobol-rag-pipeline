@@ -296,8 +296,37 @@ async function resetCollection() {
 function activityPhase(phase) {
     return ({resolution: 'Resolving the request and scope', decision: 'Selecting evidence tools or preparing the answer',
         review: 'Checking the answer against evidence', partial_synthesis: 'Preparing a supported partial answer',
+        tool_repair: 'Correcting invalid tool arguments', answer_repair: 'Repairing an answer after validation',
+        evidence_recovery: 'Retrieving missing evidence after validation', final_synthesis: 'Writing from existing evidence',
         input_translation: 'Translating the question', output_translation: 'Translating the answer',
         output_translation_repair: 'Repairing the answer translation'})[phase] || String(phase).replaceAll('_', ' ');
+}
+
+function activityValues(value) {
+    return Array.isArray(value) ? value : typeof value === 'string' ? [value] : Array.isArray(value?.preview) ? value.preview : [];
+}
+
+function activityScope(scope = {}) {
+    return [scope.program || activityValues(scope.programs).join(', '), scope.source_file,
+        scope.paragraph ? 'paragraph ' + scope.paragraph : scope.identifier,
+        scope.start != null ? 'lines ' + scope.start + '–' + (scope.end ?? scope.start) : '',
+        scope.table ? 'table ' + scope.table : '',
+        scope.terms ? 'terms ' + activityValues(scope.terms).join(', ') : '',
+        scope.target ? 'target ' + activityValues(scope.target).join(', ') : ''].filter(Boolean).join(' · ');
+}
+
+function activityMeaning(event) {
+    const d = event.details || {};
+    return d.purpose || ({
+        model_end: 'The provider returned a response; its format and requested action are checked next.',
+        model_decision: 'These are the next operations selected by the model, not a verified answer.',
+        draft_ready: 'The draft still needs citation, coverage and factual checks before it is accepted.',
+        source_selection: 'Inspecting indexed source-line evidence, not executing or reanalyzing the COBOL program.',
+        file_read: 'The file read has completed; this is separate from model inference time.',
+        file_cached: 'Previously loaded data is being reused; no new file was opened.',
+        tool_cached: 'An earlier result is being reused; this adds no new evidence.',
+        review_result: 'The independent reviewer has returned its verdict; failed findings may require another repair.',
+    })[event.kind] || '';
 }
 
 function activityRow(event) {
@@ -310,7 +339,18 @@ function activityRow(event) {
         + (d.path ? '\n' + d.path : '')
         + (d.source_file ? '\n' + d.source_file + (d.first_line != null ? ':' + d.first_line + '–' + d.last_line : '') : '')
         + (d.paragraph ? ' · paragraph ' + d.paragraph : '')
-        + (d.scope ? '\n' + JSON.stringify(d.scope) : '')
+        + (d.scope ? '\n' + activityScope(d.scope) : '')
+        + (d.model ? '\nModel: ' + d.model + ' · call ' + d.call : '')
+        + (d.programs?.length ? '\nPrograms in supplied scope: ' + activityValues(d.programs).join(', ') : '')
+        + (activityMeaning(event) ? '\nWhy: ' + activityMeaning(event) : '')
+        + (d.context_files?.length ? '\nSource context supplied: ' + d.context_files.join(', ') : '')
+        + (d.context_chars != null ? '\nInput payload: ' + d.context_chars.toLocaleString('en-US') + ' characters (not a token estimate)' : '')
+        + (d.context_rows != null ? ' · ' + d.context_rows + ' evidence rows in the supplied preview' : '')
+        + (d.remaining_calls != null ? '\nRemaining model calls in this stage budget: ' + d.remaining_calls : '')
+        + (d.outcome ? '\nResult: ' + d.outcome : '')
+        + (d.next_hint ? '\nMeaning: ' + d.next_hint : '')
+        + (d.tools?.length ? '\nNext tools: ' + d.tools.join(', ') : '')
+        + (d.matches?.length ? '\nLocations: ' + d.matches.map(m => m.paragraph + ' (' + m.start + '–' + m.end + ')').join(', ') : '')
         + (d.returned != null ? ' · ' + d.returned + ' rows' : '')
         + (d.checks?.length ? '\nValidation findings: ' + JSON.stringify(d.checks) : '')
         + (d.duration_ms != null ? ' · ' + (d.duration_ms / 1000).toFixed(2) + 's' : '')
@@ -318,7 +358,7 @@ function activityRow(event) {
     if (Object.keys(d).length) {
         const details = document.createElement('details');
         const summary = document.createElement('summary');
-        summary.textContent = 'Inspect parameters, file details and evidence';
+        summary.textContent = 'Technical details';
         const raw = document.createElement('pre');
         raw.textContent = JSON.stringify(d, null, 2);
         details.append(summary, raw);
@@ -438,18 +478,25 @@ function createWaitingExperience(requestId) {
     state.className = 'activity-state';
     state.setAttribute('role', 'status');
     state.textContent = 'Waiting for the server to receive this question…';
+    const purpose = document.createElement('p');
+    purpose.className = 'activity-purpose';
+    const target = document.createElement('p');
+    target.className = 'activity-target';
+    const modelWait = document.createElement('p');
+    modelWait.className = 'activity-model-wait';
     const list = document.createElement('ol');
     list.className = 'activity-list';
     const stats = document.createElement('div');
     stats.className = 'activity-stats';
     stats.textContent = 'Observed: 0 files read · 0 tool calls · 0 model calls';
-    content.append(header, note, state, stats, list);
+    content.append(header, note, state, purpose, target, modelWait, stats, list);
     element.append(avatar, content);
     let destroyed = false, cursor = 0, timer = null, controller = null, inFlight = null;
     let failures = 0;
     const events = [];
     const files = new Set();
     let toolCalls = 0, modelCalls = 0, truncated = false;
+    let activeModel = null;
     const started = Date.now();
     function show(event) {
         events.push(event);
@@ -457,7 +504,14 @@ function createWaitingExperience(requestId) {
         const details = event.details || {};
         if (event.kind === 'file_read' && details.path) files.add(details.path);
         if (event.kind === 'tool_start') toolCalls++;
-        if (event.kind === 'model_start') modelCalls++;
+        if (event.kind === 'model_start') {
+            modelCalls++;
+            activeModel = {started: Date.now(), phase: details.phase, call: details.call};
+        }
+        if (event.kind === 'model_end' || event.kind === 'model_error' || event.kind === 'finished' || event.kind === 'error') {
+            activeModel = null;
+            modelWait.textContent = '';
+        }
         stats.textContent = 'Observed: ' + files.size + ' files read · ' + toolCalls + ' tool calls · ' + modelCalls + ' model calls';
         const follow = !Number.isFinite(list.clientHeight) || list.scrollHeight - list.scrollTop - list.clientHeight < 60;
         list.appendChild(activityRow(event));
@@ -465,6 +519,12 @@ function createWaitingExperience(requestId) {
         state.textContent = details.phase ? activityPhase(details.phase) + ' · ' + event.message
             : event.message + (details.path ? ' ' + details.path : '')
                 + (details.source_file ? ' ' + details.source_file : '');
+        purpose.textContent = activityMeaning(event);
+        target.textContent = details.path ? 'File: ' + details.path
+            : details.context_files?.length ? 'Source context supplied: ' + details.context_files.join(', ')
+            : details.scope ? activityScope(details.scope)
+            : details.source_file ? details.source_file + (details.first_line != null ? ':' + details.first_line + '–' + details.last_line : '')
+            : details.outcome || (details.tools?.length ? 'Next tools: ' + details.tools.join(', ') : '');
         if (follow) list.scrollTop = list.scrollHeight;
     }
     function refresh() {
@@ -494,7 +554,14 @@ function createWaitingExperience(requestId) {
         })();
         return inFlight;
     }
-    const clock = setInterval(() => { elapsed.textContent = Math.floor((Date.now() - started) / 1000) + 's'; }, 1000);
+    const clock = setInterval(() => {
+        elapsed.textContent = Math.floor((Date.now() - started) / 1000) + 's';
+        if (activeModel) {
+            const seconds = Math.floor((Date.now() - activeModel.started) / 1000);
+            modelWait.textContent = 'Last reported: model call ' + (activeModel.call ?? '') + ' · waiting for a complete provider response (' + seconds
+                + 's observed). No new file-read event is reported while the model is generating. Token counts arrive after the response; no ETA is available.';
+        }
+    }, 1000);
     refresh();
     return {
         element,

@@ -45,6 +45,29 @@ def emit(kind, message, **details):
 
 
 @contextmanager
+def file_read(path, *, program=None, role='analysis artifact'):
+    """Wrap an actual read only; cache reuse gets a different event."""
+    if path is None or _active.get() is None:
+        yield
+        return
+    started = time.monotonic()
+    try:
+        size = path.stat().st_size if path.is_file() else None
+    except OSError:
+        size = None
+    emit('file_open', 'Opening file.', path=str(path), program=program, role=role,
+         bytes=size)
+    try:
+        yield
+    except Exception:
+        emit('file_error', 'File could not be read.', path=str(path), program=program)
+        raise
+    else:
+        emit('file_read', 'Finished reading file.', path=str(path), program=program, role=role,
+             duration_ms=round((time.monotonic() - started) * 1000, 2))
+
+
+@contextmanager
 def track(owner, request_id):
     if not request_id:
         yield

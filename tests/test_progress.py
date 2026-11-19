@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from types import SimpleNamespace
+import json
 
 import pytest
 
@@ -44,6 +45,32 @@ def test_errors_close_the_feed_and_records_are_expired(monkeypatch):
     assert 'PRIVATE' not in str(result)
     monkeypatch.setattr(progress, 'TTL', -1)
     assert progress.snapshot('owner', 'request') is None
+
+
+def test_file_events_distinguish_actual_reads_cache_and_indexed_source_views(tmp_path, monkeypatch):
+    from cobol_rag.investigation_tools import EvidenceTools
+    from cobol_rag.config import AppConfig
+    monkeypatch.setattr('cobol_rag.investigation_tools.artifacts.analyzed_programs', lambda: ('DEMO',))
+    monkeypatch.setattr(EvidenceTools, 'root', lambda self, p: tmp_path)
+    artifact = tmp_path / 'program.summary.json'
+    artifact.write_text(json.dumps({'content': 'overview'}))
+    source = tmp_path / 'program.source_lines.jsonl'
+    source.write_text(json.dumps(dict(program='DEMO', source_file='DEMO.CBL', line=7,
+                                      paragraph='MAIN', text="CALL 'SERVICE'.")) + '\n')
+    with progress.track('owner', 'files'):
+        tools = EvidenceTools(AppConfig())
+        tools.load('DEMO', 'program.summary.json')
+        tools.load('DEMO', 'program.summary.json')
+        result = tools.execute('source', dict(program='DEMO', paragraph='MAIN'))
+    events = progress.snapshot('owner', 'files')['events']
+    assert result['rows'][0]['text'] == "CALL 'SERVICE'."
+    assert sum(e['kind'] == 'file_open' and e['details']['path'] == str(artifact) for e in events) == 1
+    assert any(e['kind'] == 'file_cached' and e['details']['path'] == str(artifact) for e in events)
+    assert any(e['kind'] == 'file_open' and e['details']['path'] == str(source) for e in events)
+    view = next(e for e in events if e['kind'] == 'source_selection')
+    assert view['details']['source_file'] == 'DEMO.CBL' and view['details']['first_line'] == 7
+    assert 'not a fresh read' in view['details']['storage']
+    assert not any(e['kind'] == 'file_open' and e['details']['path'].endswith('DEMO.CBL') for e in events)
 
 
 def test_real_api_exposes_activity_while_the_answer_is_still_running(monkeypatch):

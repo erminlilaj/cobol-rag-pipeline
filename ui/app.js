@@ -394,6 +394,47 @@ async function resetCollection() {
     }
 }
 
+function activityPhase(phase) {
+    return ({resolution: 'Resolving the request and scope', decision: 'Selecting evidence tools or preparing the answer',
+        review: 'Checking the answer against evidence', partial_synthesis: 'Preparing a supported partial answer',
+        input_translation: 'Translating the question', output_translation: 'Translating the answer',
+        output_translation_repair: 'Repairing the answer translation'})[phase] || String(phase).replaceAll('_', ' ');
+}
+
+function activityRow(event) {
+    const row = document.createElement('li');
+    row.className = 'activity-event activity-' + String(event.kind || 'action').replace(/[^a-z_]/g, '');
+    const d = event.details || {};
+    row.textContent = '[' + ((event.elapsed_ms || 0) / 1000).toFixed(1) + 's] ' + event.message
+        + (d.phase ? ' · ' + activityPhase(d.phase) : '')
+        + (d.tool ? ' · ' + d.tool : '')
+        + (d.path ? '\n' + d.path : '')
+        + (d.source_file ? '\n' + d.source_file + (d.first_line != null ? ':' + d.first_line + '–' + d.last_line : '') : '')
+        + (d.paragraph ? ' · paragraph ' + d.paragraph : '')
+        + (d.scope ? '\n' + JSON.stringify(d.scope) : '')
+        + (d.returned != null ? ' · ' + d.returned + ' rows' : '')
+        + (d.checks?.length ? '\nValidation findings: ' + JSON.stringify(d.checks) : '')
+        + (d.duration_ms != null ? ' · ' + (d.duration_ms / 1000).toFixed(2) + 's' : '')
+        + (d.token_usage ? ' · in ' + d.token_usage.input_tokens + ' / out ' + d.token_usage.output_tokens + ' tokens' : '');
+    if (Object.keys(d).length) {
+        const details = document.createElement('details');
+        const summary = document.createElement('summary');
+        summary.textContent = 'Inspect parameters, file details and evidence';
+        const raw = document.createElement('pre');
+        raw.textContent = JSON.stringify(d, null, 2);
+        details.append(summary, raw);
+        row.appendChild(details);
+    }
+    if (Array.isArray(d.source_preview) && d.source_preview.length) {
+        const source = document.createElement('pre');
+        source.className = 'activity-source-preview';
+        source.textContent = 'Recorded source excerpt (not a verified answer):\n' + d.source_preview.map(r =>
+            (r.source_file || '') + ':' + (r.line ?? r.line_start ?? '?') + '  ' + (r.text || '')).join('\n');
+        row.appendChild(source);
+    }
+    return row;
+}
+
 function appendMessage(role, content, sources = [], metadata = null) {
     transcript.push({role, content, sources, metadata, timestamp: new Date().toISOString()});
     const msgDiv = document.createElement('div');
@@ -436,14 +477,10 @@ function appendMessage(role, content, sources = [], metadata = null) {
         const activity = document.createElement('details');
         activity.className = 'answer-activity';
         const summary = document.createElement('summary');
-        summary.textContent = 'Recorded activity · ' + metadata.live_progress.length + ' events';
+        summary.textContent = 'Recorded activity · ' + metadata.live_progress.length + (metadata.live_progress_truncated ? ' recent events (earlier events omitted)' : ' events');
         const log = document.createElement('ol');
         for (const event of metadata.live_progress) {
-            const row = document.createElement('li');
-            row.textContent = ((event.elapsed_ms || 0) / 1000).toFixed(1) + 's · ' + event.message
-                + (event.details?.tool ? ' · ' + event.details.tool : '')
-                + (event.details?.scope ? ' · ' + JSON.stringify(event.details.scope) : '');
-            log.appendChild(row);
+            log.appendChild(activityRow(event));
         }
         activity.append(summary, log);
         contentDiv.appendChild(activity);
@@ -491,7 +528,7 @@ function createWaitingExperience(requestId) {
     const header = document.createElement('div');
     header.className = 'waiting-header';
     const title = document.createElement('strong');
-    title.textContent = 'Live RAG activity';
+    title.textContent = 'Live RAG activity · detailed execution log';
     const elapsed = document.createElement('span');
     elapsed.className = 'waiting-elapsed';
     header.append(title, elapsed);
@@ -504,29 +541,32 @@ function createWaitingExperience(requestId) {
     state.textContent = 'Waiting for the server to receive this question…';
     const list = document.createElement('ol');
     list.className = 'activity-list';
-    content.append(header, note, state, list);
+    const stats = document.createElement('div');
+    stats.className = 'activity-stats';
+    stats.textContent = 'Observed: 0 files read · 0 tool calls · 0 model calls';
+    content.append(header, note, state, stats, list);
     element.append(avatar, content);
     let destroyed = false, cursor = 0, timer = null, controller = null, inFlight = null;
     let failures = 0;
     const events = [];
+    const files = new Set();
+    let toolCalls = 0, modelCalls = 0, truncated = false;
     const started = Date.now();
     function show(event) {
         events.push(event);
-        if (events.length > 200) events.shift();
-        const row = document.createElement('li');
+        if (events.length > 200) { events.shift(); truncated = true; }
         const details = event.details || {};
-        row.textContent = '[' + ((event.elapsed_ms || 0) / 1000).toFixed(1) + 's] ' + event.message
-            + (details.phase ? ' · ' + details.phase.replaceAll('_', ' ') : '')
-            + (details.tool ? ' · ' + details.tool : '')
-            + (details.scope ? ' · ' + JSON.stringify(details.scope) : '')
-            + (details.returned != null ? ' · ' + details.returned + ' rows' : '')
-            + (details.artifacts?.length ? ' · ' + details.artifacts.join(', ') : '')
-            + (details.duration_ms != null ? ' · ' + (details.duration_ms / 1000).toFixed(1) + 's' : '')
-            + (details.token_usage ? ' · in ' + details.token_usage.input_tokens + ' / out ' + details.token_usage.output_tokens + ' tokens' : '');
-        list.appendChild(row);
+        if (event.kind === 'file_read' && details.path) files.add(details.path);
+        if (event.kind === 'tool_start') toolCalls++;
+        if (event.kind === 'model_start') modelCalls++;
+        stats.textContent = 'Observed: ' + files.size + ' files read · ' + toolCalls + ' tool calls · ' + modelCalls + ' model calls';
+        const follow = !Number.isFinite(list.clientHeight) || list.scrollHeight - list.scrollTop - list.clientHeight < 60;
+        list.appendChild(activityRow(event));
         while (list.childElementCount > 200) list.firstElementChild.remove();
-        state.textContent = event.message;
-        list.scrollTop = list.scrollHeight;
+        state.textContent = details.phase ? activityPhase(details.phase) + ' · ' + event.message
+            : event.message + (details.path ? ' ' + details.path : '')
+                + (details.source_file ? ' ' + details.source_file : '');
+        if (follow) list.scrollTop = list.scrollHeight;
     }
     function refresh() {
         if (destroyed || inFlight) return inFlight;
@@ -538,7 +578,10 @@ function createWaitingExperience(requestId) {
                     {signal: controller.signal});
                 if (destroyed) return;
                 failures = 0;
-                if (data.truncated) state.textContent = 'Earlier activity was truncated; showing the available recent events.';
+                if (data.truncated) {
+                    truncated = true;
+                    note.textContent = 'Earlier events were omitted; showing recent recorded activity, not private model reasoning. Indexed source views are distinguished from original-file reads.';
+                }
                 for (const event of data.events || []) {
                     if (event.sequence > cursor) { show(event); cursor = event.sequence; }
                 }
@@ -557,6 +600,7 @@ function createWaitingExperience(requestId) {
     return {
         element,
         snapshot() { return events.slice(); },
+        truncated() { return truncated; },
         finish() { show({kind: 'client_result', message: 'Answer received.', elapsed_ms: Date.now() - started, details: {}}); },
         destroy() { destroyed = true; clearInterval(clock); clearTimeout(timer); controller?.abort(); }
     };
@@ -618,6 +662,7 @@ async function askOne(text) {
         }
         waiting.finish?.();
         data.live_progress = waiting.snapshot?.() || [];
+        data.live_progress_truncated = waiting.truncated?.() || false;
         appendMessage('assistant', data.answer, data.sources, data);
         return true;
     } catch (error) {

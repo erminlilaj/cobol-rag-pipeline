@@ -1557,6 +1557,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         candidate['result_id'] = referenced.pop()
                 errors = answer_checks(question, candidate, tools, requirements, request)
                 if errors:
+                    emit_progress('validation', 'Evidence checks require a revision.', checks=errors)
                     previous_candidate = deepcopy(candidate)
                     trace.append({'validation_errors': errors, 'candidate_excerpt': candidate['answer'][:800]})
                     if stopped_repeated_answer(candidate, errors):
@@ -1732,8 +1733,8 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         if enforce_targets and expected_targets and reviewed.get('direction') != 'not_requested' and {t.upper() for t in expected_targets} != {t.upper() for t in reviewed_targets}:
                             relation_errors.append('Requested callee changed during investigation; preserve the resolved target.')
                     if review.get('passed') is not True or relation_errors:
-                        emit_progress('validation', 'Answer review rejected the candidate; preparing a repair.')
                         errors = list(review.get('issues') or ([] if relation_errors else ['semantic_review_failed'])) + relation_errors
+                        emit_progress('validation', 'Answer review rejected the candidate; preparing a repair.', checks=errors)
                         trace.append({'review': 'rejected', 'issues': errors,
                                       'candidate_excerpt': str(candidate.get('answer', ''))[:4000],
                                       'candidate_excerpt_truncated': len(str(candidate.get('answer', ''))) > 4000})
@@ -1845,6 +1846,11 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     observations.append({'call': call, 'result': view})
                     emit_progress('tool_end', 'Evidence lookup completed.', tool=call['tool'],
                                   returned=result.get('returned'), total_matches=result.get('total_matches'),
+                                  result_id=result.get('result_id'),
+                                  source_preview=[{key: row[key] for key in ('evidence_id', 'program', 'source_file', 'line',
+                                                  'line_start', 'paragraph', 'text') if key in row}
+                                                  for row in result.get('rows', [])[:3]
+                                                  if row.get('source_file') and isinstance(row.get('text'), str)],
                                   artifacts=sorted({str(row.get('_artifact') or row.get('source_file'))
                                       for row in result.get('rows', []) if row.get('_artifact') or row.get('source_file')})[:8],
                                   duration_ms=round((time.monotonic() - tool_started) * 1000, 2))

@@ -33,6 +33,15 @@ bounded by the remaining budget; it is not a hard process cancellation timer.
 
 ### Live activity instead of waiting games (2026-11-19)
 
+The detailed execution view additionally instruments actual artifact/source-map,
+JCL and corpus-graph reads with full approved paths, file size, read timing and
+explicit cache reuse. Selected COBOL member/paragraph/line windows are separate
+events: reading indexed `program.source_lines.jsonl` is not represented as a
+fresh open of the original `.CBL` member. Short source excerpts are labelled as
+retrieved evidence, not verified answers. Expandable rows retain parameters,
+filters, result handles and validation findings after completion. File/tool/model
+counters describe observed events only, and truncated history is labelled.
+
 The waiting panel polls a session-owned request activity feed. It shows observable
 model-call phases, executed tools and bounded query/source scopes, returned rows,
 artifact names, timings, available provider token counts, review results and

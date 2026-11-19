@@ -87,12 +87,31 @@ test('live activity renders real events safely and stops every timer on cleanup'
     assert.match(chat.progressRequests[0], /test-request\?after=0/);
     const content = activity.element.children[1];
     const list = content.children.find(child => child.className === 'activity-list');
-    assert.match(list.children[0].textContent, /source.*DEMO.*<script>/);
+    assert.match(list.children[0].textContent, /source[\s\S]*DEMO.*<script>/);
     assert.equal(list.children[0].innerHTML, undefined);
     assert.equal(activity.snapshot().length, 1);
     assert.ok(chat.timers.size > 0);
     activity.destroy();
     assert.equal(chat.timers.size, 0);
+});
+
+test('detailed activity shows exact paths, expandable metadata and safe source previews', async () => {
+    const chat = page();
+    chat.setProgress({events: [
+        {sequence: 1, kind: 'file_open', message: 'Opening file.', elapsed_ms: 10,
+            details: {path: '/workspace/.runs/DEMO/program.source_lines.jsonl', bytes: 1000}},
+        {sequence: 2, kind: 'tool_end', message: 'Evidence lookup completed.', elapsed_ms: 20,
+            details: {tool: 'source', source_preview: [{source_file: 'DEMO.CBL', line: 7, text: "DISPLAY '<script>not html</script>'."}]}}
+    ]});
+    const activity = chat.activity();
+    await tick();
+    const list = activity.element.children[1].children.find(child => child.className === 'activity-list');
+    assert.match(list.children[0].textContent, /\/workspace\/\.runs\/DEMO\/program.source_lines.jsonl/);
+    assert.ok(list.children[0].children.some(child => child.children[0].textContent.includes('Inspect parameters')));
+    const preview = list.children[1].children.find(child => child.className === 'activity-source-preview');
+    assert.match(preview.textContent, /DEMO.CBL:7.*<script>/);
+    assert.equal(preview.innerHTML, undefined);
+    activity.destroy();
 });
 
 test('answer bubble displays metrics outside collapsed debug details', () => {

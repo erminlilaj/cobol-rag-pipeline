@@ -12,6 +12,7 @@ from cobol_rag import final_scripts_answers as artifacts
 from cobol_rag.investigation_protocol import TABLE_INFO, validate_tool
 from cobol_rag.call_targets import operand as call_operand, resolve_targets
 from cobol_rag.conversation_memory import reference_context, query_subject
+from cobol_rag.progress import emit as emit_progress, file_read
 
 
 class ToolError(ValueError):
@@ -188,8 +189,16 @@ class EvidenceTools:
         path = self.path(program, name)
         key = (str(path), path.stat().st_mtime_ns, path.stat().st_size)
         if key not in self._cache:
-            self._cache[key] = json.loads(path.read_text(encoding='utf-8'))
+            with file_read(path, program=program):
+                self._cache[key] = json.loads(path.read_text(encoding='utf-8'))
+        else:
+            emit_progress('file_cached', 'Reusing file data already loaded for this question.', path=str(path), program=program)
         return deepcopy(self._cache[key])
+
+    def source_records(self, root, program):
+        path = self.path(program, 'program.source_lines.jsonl')
+        with file_read(path, program=program, role='physical source-line evidence'):
+            return artifacts._read_source_lines(root, program)
 
     def resolved_calls(self, program):
         calls = self.load(program, 'architecture.call_parameters.json').get('calls', [])
@@ -230,7 +239,8 @@ class EvidenceTools:
             if not resolved.is_relative_to(jcl) or not resolved.is_file() or resolved.stat().st_size > 2_000_000:
                 raise ToolError(f'JCL artifact {member.name} is missing or outside the approved directory.')
             try:
-                value = json.loads(resolved.read_text(encoding='utf-8'))
+                with file_read(resolved, program=program, role='JCL step/job analysis'):
+                    value = json.loads(resolved.read_text(encoding='utf-8'))
             except (OSError, ValueError) as error:
                 raise ToolError(f'Cannot read JCL artifact {member.name}.') from error
             if not isinstance(value, dict) or value.get('type') != expected_type or value.get('job') != anchor['job']:
@@ -296,7 +306,8 @@ class EvidenceTools:
                     if (any(resolved.is_relative_to(directory) for directory in approved)
                             and resolved.is_file() and resolved.stat().st_size <= 2_000_000):
                         try:
-                            lines = resolved.read_text(encoding='utf-8').splitlines()
+                            with file_read(resolved, program=program, role='original JCL source'):
+                                lines = resolved.read_text(encoding='utf-8').splitlines()
                         except (OSError, UnicodeError):
                             lines = []
                         if last <= len(lines):
@@ -328,11 +339,11 @@ class EvidenceTools:
                 except (ToolError, OSError, ValueError):
                     counts = {}
                 if not counts:
-                    counts = Counter(r['source_file'] for r in artifacts._read_source_lines(root, program))
+                    counts = Counter(r['source_file'] for r in self.source_records(root, program))
                 raw = [{'name': name, 'source_file': name, 'extension': Path(name).suffix,
                         'recorded_lines': count} for name, count in sorted(counts.items())]
             else:
-                raw = source_semantics(artifacts._read_source_lines(root, program))
+                raw = source_semantics(self.source_records(root, program))
             if not raw:
                 raise ToolError('Analysis gap: physical source map unavailable.')
             if table == 'paragraphs':
@@ -481,7 +492,8 @@ class EvidenceTools:
             if path is None or not path.is_file():
                 raise ToolError('Corpus relationship analysis is unavailable; rerun the platform pipeline with the corpus graph builder.')
             try:
-                graph = json.loads(path.read_text(encoding='utf-8'))
+                with file_read(path, role='cross-program relationship graph'):
+                    graph = json.loads(path.read_text(encoding='utf-8'))
             except (OSError, ValueError) as error:
                 raise ToolError(f'Corpus relationship artifact cannot be read: {error}') from error
             if graph.get('schema_version') != 1 or not isinstance(graph.get('edges'), list):
@@ -1092,7 +1104,9 @@ class EvidenceTools:
                        'relation': relation, '_artifact': 'verified_collection_operation'}
             if tool == 'connections':
                 base = artifacts.find_final_scripts_root()
-                graph = json.loads((Path(base) / 'corpus.relationships.json').read_text(encoding='utf-8'))
+                graph_path = Path(base) / 'corpus.relationships.json'
+                with file_read(graph_path, role='cross-program relationship graph coverage'):
+                    graph = json.loads(graph_path.read_text(encoding='utf-8'))
                 summary['coverage'] = graph.get('coverage', {})
                 summary['limitations'] = graph.get('limitations', [])
                 summary['known_jcl_jobs'] = graph.get('known_jcl_jobs', [])
@@ -1237,6 +1251,11 @@ class EvidenceTools:
                 continuation_spans = [[rows[source_limit]['line'], rows[-1]['line']]]
                 rows = rows[:source_limit]
             missing = [n for n in requested if n not in {r['line'] for r in rows}]
+            emit_progress('source_selection', 'Inspecting recorded source lines.', program=args['program'],
+                          source_file=filename, paragraph=args.get('paragraph'), spans=args.get('spans'),
+                          first_line=rows[0]['line'] if rows else None, last_line=rows[-1]['line'] if rows else None,
+                          returned=len(rows), missing_lines=len(missing),
+                          storage='program.source_lines.jsonl (indexed evidence, not a fresh read of the original COBOL member)')
             return {'rows': [{'evidence_id': self.register(r), **r} for r in rows], 'returned': len(rows),
                     'paragraph_operations': self.paragraph_operations(args['program'], args['paragraph']) if args.get('paragraph') else [],
                     'paragraph_flow': self.paragraph_flow_context(args['program'], args['paragraph']) if args.get('paragraph') else {},

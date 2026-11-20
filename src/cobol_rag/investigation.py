@@ -1376,13 +1376,18 @@ def answer_checks(question, candidate, tools, requirements, request=None):
 
 
 def resolve_request(question, history, memory, budget):
-    """Interpret context once, without exposing new evidence or choosing tools."""
-    instructions = '''Resolve CURRENT QUESTION using previous context. Do not answer it or choose tools.
+    """Interpret context and optionally respond to purely social messages in one call."""
+    instructions = '''Resolve CURRENT QUESTION using previous context. Do not choose tools or answer technical or factual questions here.
 Return only JSON with resolved_question (standalone request), output (list/count/summary/other),
 limit (explicitly requested number of list items, otherwise null), offset (zero-based,
 default 0), order_by (when explicit), and scope
 (corpus for questions about available files/programs or their analyzed code,
 general for general knowledge, conversational for social conversation).
+For a purely social message with no factual or corpus request, set scope=conversational,
+output=other, and generate a short, natural conversational_reply in the message's
+language. Handle informal wording and typos by meaning. Do not assert facts, name
+corpus entities, or add citations in that reply. Omit conversational_reply whenever
+any part needs a factual answer, even if the message starts with a greeting.
 Also return depth (brief/standard/detailed) and explanation_goals (the aspects the user
 needs explained, otherwise []). Preserve explicit brevity or detail requests, including typos.
 For a detailed program explanation choose relevant behavioral aspects, not just size metrics.
@@ -1448,12 +1453,33 @@ Your resolution will be checked against the original request.'''
                      'offset, limit and next_offset, not a prose count or a sampled preview. Count-only replies '
                      'do not establish a displayed subset. CURRENT QUESTION overrides previous scope when explicit.')
     contract = deepcopy(REQUEST)
+    contract['properties']['conversational_reply'] = {'type': 'string', 'minLength': 1, 'maxLength': 500}
     contract['required'] = [*contract['required'], 'scope']
     focus = reference_context(memory)
     return usable_request(budget.call(instructions, {'recent_conversation': history or '',
                        'conversation_focus': focus,
                        'previous_verified_query': focus.get('result', {}).get('recipe') or None,
                        'CURRENT QUESTION': question}, contract, reserve=3, phase='resolution'))
+
+
+def resolved_conversation(question, request, config):
+    """Accept model-written social prose, not an ungrounded technical answer."""
+    if not request or request.get('scope') != 'conversational' or request.get('output') != 'other':
+        return None
+    reply = request.get('conversational_reply')
+    if not isinstance(reply, str) or not reply.strip() or len(reply) > 500:
+        return None
+    if any(request.get(key) for key in ('limit', 'offset', 'analysis_checks', 'explanation_goals',
+                                       'call_relation', 'call_relations', 'jcl_scope', 'jcl_detail', 'job_inventory')):
+        return None
+    tools = EvidenceTools(config)
+    if tools.mentioned_entities(question + '\n' + reply):
+        return None
+    candidate = {'answer': reply.strip(), 'mode': 'conversational', 'status': 'complete', 'evidence_ids': []}
+    if answer_checks(question, candidate, tools, [], request):
+        return None
+    return {**candidate, 'tools': tools, 'trace': [{'resolved_request': request},
+            {'status': 'model_conversational_reply'}], 'tool_calls': 0, 'requirements': [], 'errors': []}
 
 
 def synthesize_partial(question, request, requirements, tools, observations, errors, budget, trace, entities=()):
@@ -2207,17 +2233,6 @@ def answer_with_investigation(question, config, state=None, target_program=None,
     from cobol_rag.query_plan import QueryPlan, detect_message_language, resolve_response_language, parse_response_contract
     from cobol_rag.scope import QueryScope
     from cobol_rag.retrieve import RetrievalResult
-    # Whole-message matches only: a greeting prefixed to a technical question
-    # must still reach normal investigation, with or without prior context.
-    if not config.investigation.memory_enabled and re.fullmatch(
-            r'\s*(?:hi|hello|hey|ciao|salve|buongiorno|buonasera)[.!]*\s*', question, re.I):
-        italian = question.strip().rstrip('.!').casefold() in {'ciao', 'salve', 'buongiorno', 'buonasera'}
-        greeting = 'Ciao! Come posso aiutarti?' if italian else 'Hello! How can I help you?'
-        emit_progress('routing', 'Plain greeting answered without retrieval or a model call.')
-        return legacy.QueryAnswer(question=question, answer=greeting, sources=[], route='conversational',
-            guard_status='not_applicable', execution_mode='conversational',
-            debug={'status': 'accepted', 'answer_status': 'complete', 'execution_strategy': 'direct_greeting',
-                   'investigation': {'model_calls': 0, 'tool_calls': 0}})
     language, language_source = resolve_response_language(question, state)
     translate = config.investigation.italian_adapter_enabled
     budget = Budget(config, italian=translate and language == 'it')
@@ -2243,7 +2258,15 @@ def answer_with_investigation(question, config, state=None, target_program=None,
     except Exception as exc:
         # Metadata failure must not prevent an otherwise valid evidence request.
         resolved, resolution_error = None, str(exc)
-    result = investigate(question, config, state, target_program, budget, conversation_history, resolved)
+    result = resolved_conversation(original, resolved, config)
+    strategy = 'model_led_investigation'
+    if result:
+        strategy = 'model_conversation'
+        emit_progress('routing', 'The model answered this conversational message without evidence retrieval.')
+    else:
+        if resolved:
+            resolved.pop('conversational_reply', None)
+        result = investigate(question, config, state, target_program, budget, conversation_history, resolved)
     if resolution_error:
         result['trace'].insert(0, {'resolution_error': resolution_error})
     tools = result['tools']
@@ -2289,11 +2312,11 @@ def answer_with_investigation(question, config, state=None, target_program=None,
     plan = QueryPlan(route='unclear' if not delivery_passed else 'technical' if technical else 'conversational' if result['mode'] in {'general','conversational'} else 'unclear',
                      program=scope.program, programs=scope.programs, intent='investigation',
                      response_language=language, response_language_source=language_source,
-                     response_contract=response_contract(question), planner_source='model_led_investigation',
+                     response_contract=response_contract(question), planner_source=strategy,
                      investigation_memory=memory)
     debug = {'status': 'accepted' if successful else 'rejected', 'answer_status': result['status'] if delivery_passed else 'failed',
-             'execution_strategy': 'model_led_investigation',
-             'plan': {'route': plan.route, 'planner_source': 'model_led_investigation',
+             'execution_strategy': strategy,
+             'plan': {'route': plan.route, 'planner_source': strategy,
                       'resolved_request': next((s['resolved_request'] for s in result['trace'] if 'resolved_request' in s), None),
                       'requirements': result['requirements'], 'steps': result['trace']},
              'retrieval': {'evidence': [dict(source_id=eid, source_file=row.get('source_file') or row.get('_artifact'),

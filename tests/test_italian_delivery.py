@@ -194,13 +194,37 @@ def test_italian_adapter_is_off_by_default_and_no_translation_calls_run(adapter)
     assert answer.answer == 'The program DEMO returns 0.'
 
 
-def test_plain_greeting_skips_budget_but_greeting_with_question_does_not(adapter):
+@pytest.mark.parametrize('question,generated', [
+    ('Hi!', 'Good to see you!'), ('helloooo', 'Hey there! What are we working on?'),
+    ('Thanks for helping!', 'Happy to help.'), ('ciaooo', 'Ehi! Dimmi pure.')])
+def test_social_reply_is_generated_in_one_resolution_call(monkeypatch, question, generated):
+    from cobol_rag import investigation
+    from cobol_rag.config import AppConfig
+    from test_investigation import FakeBudget
+    budget = FakeBudget([dict(resolved_question=question, output='other', limit=None,
+                              scope='conversational', conversational_reply=generated)])
+    monkeypatch.setattr(investigation, 'Budget', lambda *a, **kw: budget)
+    monkeypatch.setattr(investigation.EvidenceTools, 'mentioned_entities', lambda *a: [])
+    def no_investigation(*a, **kw):
+        pytest.fail('Purely social message entered technical investigation')
+    monkeypatch.setattr(investigation, 'investigate', no_investigation)
+    answer = investigation.answer_with_investigation(question, AppConfig())
+    assert answer.answer == generated and answer.execution_mode == 'conversational'
+    assert answer.sources == []
+    assert answer.debug['execution_strategy'] == 'model_conversation'
+    assert answer.debug['investigation']['model_calls'] == budget.calls == 1
+
+
+def test_social_reply_cannot_bypass_a_known_program_question(adapter, monkeypatch):
+    from cobol_rag import investigation
     run, _ = adapter
-    answer, budget = run([], question='Hi!', enabled=False)
-    assert answer.execution_mode == 'conversational'
-    assert answer.debug['investigation']['model_calls'] == budget.calls == 0
-    technical, _ = run([], question='Hi! What does DEMO return?', enabled=False)
-    assert technical.execution_mode == 'investigation'
+    question = 'Helloooo, what does DEMO return?'
+    monkeypatch.setattr(investigation, 'resolve_request', lambda *a: dict(resolved_question=question,
+        output='other', limit=None, scope='conversational', conversational_reply='DEMO always returns 4.'))
+    monkeypatch.setattr(investigation.EvidenceTools, 'mentioned_entities', lambda *a: [dict(name='DEMO')])
+    answer, _ = run([], question=question, enabled=False)
+    assert answer.execution_mode == 'investigation'
+    assert answer.answer == 'The program DEMO returns 0.'
 
 
 def test_italian_adapter_can_be_restored_by_configuration(monkeypatch):

@@ -174,11 +174,39 @@ def adapter(monkeypatch):
     monkeypatch.setattr(investigation, 'investigate', lambda *a: result)
     monkeypatch.setattr(legacy, 'write_answer_trace', lambda *a: 'test-trace')
     monkeypatch.setattr(legacy, '_trace_payload', lambda **kw: kw)
-    def run(replies, question='Spiega DEMO.'):
+    def run(replies, question='Spiega DEMO.', enabled=True):
+        from dataclasses import replace
         budget = AdapterBudget(replies)
         monkeypatch.setattr(investigation, 'Budget', lambda *a, **kw: budget)
-        return investigation.answer_with_investigation(question, AppConfig()), budget
+        config = AppConfig()
+        config = replace(config, investigation=replace(config.investigation, italian_adapter_enabled=enabled))
+        return investigation.answer_with_investigation(question, config), budget
     return run, result
+
+
+def test_italian_adapter_is_off_by_default_and_no_translation_calls_run(adapter):
+    from cobol_rag.config import AppConfig
+    run, _ = adapter
+    assert AppConfig().investigation.italian_adapter_enabled is False
+    answer, budget = run([], enabled=False)
+    assert budget.calls == 0
+    assert answer.debug['language_adapter'] == {'input': 'disabled', 'output': 'disabled'}
+    assert answer.answer == 'The program DEMO returns 0.'
+
+
+def test_plain_greeting_skips_budget_but_greeting_with_question_does_not(adapter):
+    run, _ = adapter
+    answer, budget = run([], question='Hi!', enabled=False)
+    assert answer.execution_mode == 'conversational'
+    assert answer.debug['investigation']['model_calls'] == budget.calls == 0
+    technical, _ = run([], question='Hi! What does DEMO return?', enabled=False)
+    assert technical.execution_mode == 'investigation'
+
+
+def test_italian_adapter_can_be_restored_by_configuration(monkeypatch):
+    from cobol_rag.config import load_config
+    monkeypatch.setenv('COBOL_RAG_ITALIAN_ADAPTER_ENABLED', 'true')
+    assert load_config().investigation.italian_adapter_enabled
 
 
 def test_adapter_does_not_promote_localization_failure_to_verified_answer(adapter):

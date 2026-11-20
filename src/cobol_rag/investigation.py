@@ -325,6 +325,44 @@ def pack_observations(payload, instructions, context_window):
     return payload
 
 
+def compact_source_packet(payload, tools, context_window):
+    """Send one bounded source preview, not copies of overlapping tool windows."""
+    observations = payload.get('observations', [])
+    source_tools = {'source', 'source_range', 'search'}
+    source_rows = sum(sum(bool(source_row(row)) for row in obs.get('result', {}).get('rows', []))
+                      for obs in observations if obs.get('call', {}).get('tool') in source_tools)
+    retained = payload.get('retained_source_evidence', {})
+    if not source_rows or (source_rows < 24 and not retained.get('rows')):
+        return payload
+    # Prefer the same bounded context used for review recovery: paragraph entry
+    # branches and contiguous windows around actual search hits. Full rows and
+    # original tool results remain available through the executor and debug.
+    selected = recovery_source_evidence(tools, max_chars=min(10000, max(3500, context_window // 2)))
+    if not selected['rows']:
+        return payload
+    focused = set()
+    for obs in reversed(observations):
+        if obs.get('call', {}).get('tool') not in source_tools:
+            continue
+        result = obs.get('result', {})
+        if not result.get('rows'):
+            continue
+        physical = [row for row in result['rows'] if source_row(row)]
+        # Keep a location the model just explicitly requested in view even
+        # when the cached source packet is already full of older evidence.
+        fresh = physical[:20] if not focused else []
+        focused.update(source_address(row) for row in fresh)
+        remaining = [row for row in result['rows'] if not source_row(row)] + fresh
+        if len(remaining) != len(result['rows']):
+            result['rows'] = remaining
+            result['preview_incomplete'] = True
+            result['instruction'] = ('Additional physical lines are in retained_source_evidence. This packet is a preview, '
+                                     'not an absence or coverage claim; ask for a narrow missing span if needed.')
+    selected['rows'] = [row for row in selected['rows'] if source_address(row) not in focused]
+    payload['retained_source_evidence'] = selected
+    return payload
+
+
 def normalize_decision(decision, tools):
     """Accept equivalent tool-call envelopes without changing query semantics."""
     if not isinstance(decision, dict):
@@ -544,14 +582,15 @@ class Budget:
         # The tool registry already documents the decision schema. Repeating
         # its large union per step crowds actual evidence out of small contexts.
         include_schema = output_schema and 'action' not in output_schema.get('properties', {})
-        user = json.dumps({**payload, **({'response_schema': output_schema} if include_schema else {})}, ensure_ascii=False)
+        user = json.dumps({**payload, **({'response_schema': output_schema} if include_schema else {})},
+                          ensure_ascii=False, separators=(',', ':'))
         # Conservative character budget; no silent clipping of instructions or request.
         context_window = max(self.config.investigation.context_window, self.config.llm.context_window)
         if len(system) + len(user) > context_window * 3 - 3000:
             raise ToolError('Context budget exceeded; narrow evidence pages or request scope.')
         self.calls += 1
         started = time.monotonic()
-        event = {'call': self.calls, 'phase': phase, 'status': 'started'}
+        event = {'call': self.calls, 'phase': phase, 'status': 'started', 'context_chars': len(system) + len(user)}
         self.model_events.append(event)
         emit_progress('model_start', 'Model request started.', phase=phase, call=self.calls,
                       model=self.config.llm.model, **model_context(phase, payload),
@@ -1451,8 +1490,8 @@ def synthesize_partial(question, request, requirements, tools, observations, err
                'retained_source_evidence': recovery_source_evidence(tools, max_chars=min(20000, max(2048,
                    max(budget.config.investigation.context_window, budget.config.llm.context_window) // 2)))}
     try:
-        payload = pack_observations(payload, instructions,
-            max(budget.config.investigation.context_window, budget.config.llm.context_window))
+        window = max(budget.config.investigation.context_window, budget.config.llm.context_window)
+        payload = pack_observations(compact_source_packet(payload, tools, window), instructions, window)
         candidate = normalize_decision(budget.call(instructions, payload, contract,
                                                   reserve=budget.output_reserve + 1, phase='partial_synthesis'), tools)
         if candidate.get('action') != 'final' or candidate.get('status') != 'partial' or not candidate.get('evidence_ids'):
@@ -1528,6 +1567,8 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
     stagnant_rounds = 0
     scoped_search_used = False
     scoped_search_round = None
+    scoped_followup_rounds = 2
+    outline_recovery_used = False
     previous_protocol_error = None
     repeated_answer = {'signature': None, 'count': 0}
     def stopped_repeated_answer(reply, issues):
@@ -1617,7 +1658,7 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                 decision_contract['properties']['action'] = {'const': 'tools'}
                 instructions += '\nRECOVERY: The answer failed evidence review. Your next response MUST request tools addressing the review feedback, not rephrase the same answer. Retrieve the missing relationship, filter, source locations or members. Do not reuse previous citation identifiers.'
                 payload['instruction'] = 'Retrieve evidence now. Return action=tools and calls; no answer.'
-            payload = pack_observations(payload, instructions, context_window)
+            payload = pack_observations(compact_source_packet(payload, tools, context_window), instructions, context_window)
             decision_started = time.monotonic()
             decision_phase = ('tool_repair' if pending_tool_repair else 'evidence_recovery' if must_retrieve
                               else 'answer_repair' if previous_candidate is not None
@@ -1928,10 +1969,8 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                 if key in seen:
                     cached = next((o for o in observations if o.get('call') == call and 'result' in o), None)
                     if cached and not must_retrieve:
-                        # Refresh the result's recency without replaying duplicate rows.
-                        observations.remove(cached)
-                        observations.append(cached)
-                        errors = ['The identical request already succeeded. Use the cached result, including total_matches for a count.']
+                        # Do not let a replay push fresher evidence out of the prompt.
+                        errors = ['The identical request already succeeded. Use its existing evidence, or request a genuinely different location.']
                         trace.append({'tool': call['tool'], 'status': 'cached', 'result_id': cached['result'].get('result_id')})
                         emit_progress('tool_cached', 'Reusing an existing tool result; no new lookup is being executed.',
                                       tool=call['tool'], scope=call.get('args'), **tool_context(call['tool'], call['args'], cached['result']))
@@ -2014,12 +2053,13 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
             new_physical = any(source_row(row) and source_address(row) not in source_at_attempt for row in tools.evidence.values())
             progressed = (new_physical if source_only and has_source else evidence_progress(tools) != evidence_at_attempt)
             stagnant_rounds = 0 if progressed else stagnant_rounds + 1
-            if (has_source and len(named_programs) > 1 and not scoped_search_used and source_only
+            if ((has_source or new_physical) and len(named_programs) > 1 and not scoped_search_used and source_only
                     and not (request and request.get('output') in {'count', 'list'})):
                 lookups = unresolved_source_searches(observations, tools.evidence, named_programs)
                 if lookups:
                     scoped_search_used = True
                     scoped_search_round = attempts
+                    searches_ran = matches = 0
                     for lookup in lookups:
                         if digest(lookup) in seen or tool_calls >= config.investigation.max_tool_calls or time.monotonic() >= budget.deadline:
                             continue
@@ -2028,6 +2068,8 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                         emit_progress('tool_start', 'Checking unresolved program with a bounded literal source search.', tool='search', scope=lookup['args'])
                         try:
                             found = tools.execute('search', lookup['args'])
+                            searches_ran += 1
+                            matches += found.get('returned', 0) or 0
                             observations.append({'call': lookup, 'result': tool_view(found, 5000)})
                             trace.append({'tool': 'search', 'args': lookup['args'], 'returned': found.get('returned'), 'recovery': 'unresolved_program'})
                             emit_progress('tool_end', 'Scoped literal search finished.', tool='search', returned=found.get('returned'), **tool_context('search', lookup['args'], found))
@@ -2035,8 +2077,10 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                             trace.append({'tool': 'search', 'status': 'error', 'recovery': 'unresolved_program', 'error': str(exc)[:500]})
                     errors = ['A bounded literal search was attempted for each unresolved source scope selected. '
                               'Use supported findings; a zero match leaves behavior unverified.']
+                    if searches_ran == len(lookups) and not matches:
+                        scoped_followup_rounds = 1
                     stagnant_rounds = 0
-            if (scoped_search_round is not None and attempts >= scoped_search_round + 2 and source_only
+            if (scoped_search_round is not None and attempts >= scoped_search_round + scoped_followup_rounds and source_only
                     and getattr(budget, 'synthesis_reserve', 0)):
                 trace.append({'status': 'stopped_bounded_source_exploration'})
                 emit_progress('exploration_stopped', 'Bounded cross-program source exploration finished; preparing supported findings.')
@@ -2044,13 +2088,14 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
             if stagnant_rounds:
                 emit_progress('no_progress', 'This round added no new evidence facts.', repeated_rounds=stagnant_rounds,
                               purpose='Repeated or cached lookups are not new source evidence; the bounded no-progress guard is active.')
-            if stagnant_rounds >= 2 and not (request and request.get('output') in {'list', 'count'}):
+            if stagnant_rounds >= 2 and not outline_recovery_used and not (request and request.get('output') in {'list', 'count'}):
                 # A bounded navigation-to-body fallback, independent of question
                 # wording, model, language and business identifiers.
                 for followup in outline_followups(tools, seen):
                     if tool_calls >= config.investigation.max_tool_calls or time.monotonic() >= budget.deadline:
                         break
                     seen.add(digest(followup))
+                    outline_recovery_used = True
                     tool_calls += 1
                     try:
                         emit_progress('tool_start', 'Opening source behind an unread outline.',
@@ -2069,7 +2114,9 @@ def investigate(question, config, state=None, target_program=None, budget=None, 
                     stagnant_rounds = 0
                     errors = ['New source bodies were opened behind the outlines. Explain their supported behavior; '
                               'keep other programs unresolved rather than discard these facts.']
-            if stagnant_rounds >= 3:
+            stop_rounds = 2 if (has_source and getattr(budget, 'synthesis_reserve', 0)
+                                and not (request and request.get('output') in {'list', 'count'})) else 3
+            if stagnant_rounds >= stop_rounds:
                 trace.append({'status': 'stopped_no_progress', 'rounds': stagnant_rounds})
                 emit_progress('exploration_stopped', 'Stopping repeated evidence exploration; no new facts were found.',
                               reason='no_progress', rounds=stagnant_rounds)
@@ -2160,11 +2207,23 @@ def answer_with_investigation(question, config, state=None, target_program=None,
     from cobol_rag.query_plan import QueryPlan, detect_message_language, resolve_response_language, parse_response_contract
     from cobol_rag.scope import QueryScope
     from cobol_rag.retrieve import RetrievalResult
+    # Whole-message matches only: a greeting prefixed to a technical question
+    # must still reach normal investigation, with or without prior context.
+    if not config.investigation.memory_enabled and re.fullmatch(
+            r'\s*(?:hi|hello|hey|ciao|salve|buongiorno|buonasera)[.!]*\s*', question, re.I):
+        italian = question.strip().rstrip('.!').casefold() in {'ciao', 'salve', 'buongiorno', 'buonasera'}
+        greeting = 'Ciao! Come posso aiutarti?' if italian else 'Hello! How can I help you?'
+        emit_progress('routing', 'Plain greeting answered without retrieval or a model call.')
+        return legacy.QueryAnswer(question=question, answer=greeting, sources=[], route='conversational',
+            guard_status='not_applicable', execution_mode='conversational',
+            debug={'status': 'accepted', 'answer_status': 'complete', 'execution_strategy': 'direct_greeting',
+                   'investigation': {'model_calls': 0, 'tool_calls': 0}})
     language, language_source = resolve_response_language(question, state)
-    budget = Budget(config, italian=language == 'it')
+    translate = config.investigation.italian_adapter_enabled
+    budget = Budget(config, italian=translate and language == 'it')
     original = question
-    language_status = {'input': 'not_needed', 'output': 'not_needed'}
-    if detect_message_language(question) == 'it':
+    language_status = {'input': 'not_needed', 'output': 'not_needed'} if translate else {'input': 'disabled', 'output': 'disabled'}
+    if translate and detect_message_language(question) == 'it':
         try:
             translated = budget.call('Translate the request to English. Preserve identifiers, numbers and literals exactly. Return JSON {"text":string}.', {'text': question}, phase='input_translation')
             text = translated.get('text', '')
@@ -2201,7 +2260,7 @@ def answer_with_investigation(question, config, state=None, target_program=None,
     from cobol_rag.citations import render_citations
     answer = render_citations(answer, ids)
     delivery_passed = True
-    if language == 'it':
+    if translate and language == 'it':
         from cobol_rag.language_delivery import deliver_italian
         reviewed_original = answer
         answer, delivery = deliver_italian(answer, budget, legacy, failed=result['status'] == 'failed',

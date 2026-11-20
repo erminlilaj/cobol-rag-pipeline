@@ -970,7 +970,7 @@ def answer_query(
         original_question, session_state,
     )
     language_adapter_status = "not_needed"
-    if detect_message_language(original_question) == "it":
+    if config.investigation.italian_adapter_enabled and detect_message_language(original_question) == "it":
         question, language_adapter_status = _canonicalize_italian_question(
             original_question, config,
         )
@@ -1033,7 +1033,7 @@ def answer_query(
         )
         presented_answer = answer
         answer_adapter_status = "not_needed"
-        if requested_language == "it":
+        if requested_language == "it" and config.investigation.italian_adapter_enabled:
             presented_answer, answer_adapter_status = _render_verified_answer_in_italian(
                 answer, config,
             )
@@ -1043,7 +1043,7 @@ def answer_query(
                 "canonical_language": "en",
                 "requested_language": requested_language,
                 "query_status": language_adapter_status,
-                "answer_status": answer_adapter_status,
+                "answer_status": answer_adapter_status if config.investigation.italian_adapter_enabled else "disabled",
             }
         debug_payload = _answer_debug_payload(
             plan=presentation_plan,

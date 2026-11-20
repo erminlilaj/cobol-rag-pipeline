@@ -82,6 +82,7 @@ class ObservabilityConfig:
 class InvestigationConfig:
     enabled: bool = False
     memory_enabled: bool = False
+    italian_adapter_enabled: bool = False
     profile: str = "standard"
     max_model_calls: int = 16
     max_tool_calls: int = 20
@@ -162,6 +163,8 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         _set_nested(result, ("investigation", "enabled"), investigation.lower() in {"1", "true", "yes", "on"})
     if memory := os.getenv("COBOL_RAG_MEMORY_ENABLED"):
         _set_nested(result, ("investigation", "memory_enabled"), memory.lower() in {"1", "true", "yes", "on"})
+    if italian := os.getenv("COBOL_RAG_ITALIAN_ADAPTER_ENABLED"):
+        _set_nested(result, ("investigation", "italian_adapter_enabled"), italian.strip().lower() in {"1", "true", "yes", "on"})
     if profile := os.getenv("COBOL_RAG_INVESTIGATION_PROFILE"):
         profile = profile.strip().lower()
         if profile == "large":

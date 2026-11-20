@@ -130,6 +130,7 @@ def health() -> Any:
         "embedding": settings.embedding.model,
         "investigation_enabled": settings.investigation.enabled,
         "investigation_profile": settings.investigation.profile,
+        "italian_adapter_enabled": settings.investigation.italian_adapter_enabled,
         "memory_enabled": settings.investigation.enabled and settings.investigation.memory_enabled,
     }
 
